@@ -1509,8 +1509,8 @@ private:
             });
 
         // Phase 7: head-touch (Si12T). Returns the latest debounced zone
-        // states plus the most recent gesture event. Polled by CC-nagi to
-        // notice TAP/STROKE on the head without holding open a stream.
+        // states plus the most recent gesture event. Polled by the MCP client
+        // to notice TAP/STROKE on the head without holding open a stream.
         mcp_server.AddTool(
             "self.touch.get_touch_state",
             "Get the current head-touch sensor state and last gesture event "
