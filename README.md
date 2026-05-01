@@ -1,6 +1,8 @@
 # stackchan-mcp
 
-[StackChan](https://github.com/mongonta0716/stack-chan) を任意の LLM クライアントから操作するための MCP (Model Context Protocol) ブリッジ。
+**M5Stack 公式 [StackChan](https://docs.m5stack.com/ja/StackChan)** (2025年 Kickstarter 出荷キット) を任意の LLM クライアントから操作するための MCP (Model Context Protocol) ブリッジ。
+
+> オリジナルの [stack-chan プロジェクト (タカヲさん)](https://github.com/mongonta0716/stack-chan) のコミュニティから生まれ、M5Stack 公式が製品化した StackChan キットを対象としています。
 
 ```
 ┌─────────────┐     stdio MCP      ┌──────────────┐    WebSocket MCP    ┌──────────────┐
@@ -23,13 +25,19 @@
 | `gateway/` | Python MCP ゲートウェイ。stdio MCP サーバー (LLM側) + WebSocket MCP クライアント (ESP32側) + HTTP capture サーバー |
 | `docs/` | [`architecture.md`](docs/architecture.md): 全体構成図・ツール名マッピング・写真フロー・認証・Phase ロードマップ |
 
-## ハードウェア
+## 想定ハードウェア
 
-- **本体**: M5Stack CoreS3 (ESP32-S3, 16MB Flash, 8MB PSRAM)
-- **首サーボ**: SCS0009 ×2 (yaw + pitch、シリアルバス、TX=GPIO6, RX=GPIO7)
-- **カメラ**: GC0308 (DVP, 320×240 YUV422)
-- **タッチ**: FT6336 / Si12T
-- **ディスプレイ**: ILI9342 (SPI, 320×240)
+**M5Stack 公式 [StackChan キット](https://docs.m5stack.com/ja/StackChan)** (Kickstarter 2025 出荷版)。公式ドキュメントの[出荷時ファームウェア](https://docs.m5stack.com/ja/StackChan#%E5%87%BA%E8%8D%B7%E6%99%82%E3%83%95%E3%82%A1%E3%83%BC%E3%83%A0%E3%82%A6%E3%82%A7%E3%82%A2)を本リポジトリの firmware で置き換える形で動作します。
+
+| 部品 | 仕様 |
+|---|---|
+| **本体** | M5Stack CoreS3 (ESP32-S3, 16MB Flash, 8MB PSRAM) |
+| **首サーボ** | SCS0009 ×2 (yaw + pitch、シリアルバス、TX=GPIO6, RX=GPIO7) |
+| **カメラ** | GC0308 (DVP, 320×240 YUV422) |
+| **タッチ** | FT6336 / Si12T |
+| **ディスプレイ** | ILI9342 (SPI, 320×240) |
+
+> 自作の stack-chan (タカヲさん版オリジナル設計) でも、上記のピンアサイン・I2C アドレスが一致していれば動く可能性があります。動作報告・修正 PR 歓迎です。
 
 ## ツール一覧 (gateway 経由で MCP クライアントが呼べる)
 
@@ -131,6 +139,7 @@ PNG → RGB565 配列の変換スクリプトは LVGL 公式の [Online Image Co
 
 ## 関連プロジェクト
 
+- [M5Stack 公式 StackChan ドキュメント](https://docs.m5stack.com/ja/StackChan) — 想定ハードウェアの公式ドキュメント (出荷時ファーム / 配線図 / API リファレンス等)
 - [xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) — ベースとなる ESP32 LLM クライアントファームウェア
 - [stack-chan](https://github.com/mongonta0716/stack-chan) — オリジナルの StackChan プロジェクト (タカヲさん)
 - [Model Context Protocol](https://modelcontextprotocol.io) — MCP プロトコル仕様
