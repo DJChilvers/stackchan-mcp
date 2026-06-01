@@ -37,6 +37,44 @@ documented-only.
   routing, a single-flight dispatcher loop, and a standardized queue-full
   error payload helper.
 
+- Added: #178 Phase B chunk 2 ownership lock diagnostics metadata
+  (`mode`, `http_endpoint`, `started_by`) while preserving #177-format
+  stdio lock files and existing-format `--check` output.
+
+- Added: #178 Phase B chunk 3 `stackchan-mcp serve` CLI with permanent
+  `--transport stdio` compatibility and a Streamable HTTP daemon
+  placeholder that releases ownership before the chunk 4 wiring lands.
+
+- Fixed: #178 Phase B chunk 2+3 ownership lock cleanup safety. The
+  streamable-http `serve` placeholder now guards its `finally` cleanup with
+  an `acquired` flag so an `OwnershipError` raised by an existing owner is
+  not followed by an erroneous `release_lock()` that would unlink the
+  existing owner's lock file. The shared `_acquire_startup_lock` helper
+  now wraps the post-claim ack-print plus `atexit.register` step in a
+  `try/except BaseException` that releases the just-claimed lock and
+  re-raises, so a stderr-write failure (or any other intermediate failure
+  between `acquire_lock` returning and the caller's own `try/finally`)
+  cannot strand a live-pid lock — this safety now covers both the stdio
+  gateway path and the streamable-http placeholder. `acquire_lock` itself
+  also now rejects `http_endpoint` and `started_by` metadata when
+  `mode="stdio"` so daemon-mode diagnostics cannot silently leak into
+  `#177`-baseline stdio lock files via public API misuse. `read_lock` now
+  treats invalid or unknown optional metadata (for example a future-mode
+  value or a non-string `http_endpoint`) as missing fields rather than as
+  a full read failure, so the four required `#177` base fields remain
+  authoritative for the claim/refuse decision and `acquire_lock` cannot
+  silently unlink a live owner's lock under schema drift. The shared
+  ownership-cleanup path is now owner-scoped via a new
+  `release_lock_if_owner(info)` helper that only unlinks the lock file
+  when `owner_id`, `pid`, and `start_ts` still match the caller's
+  claimed `LockInfo`. Both the `atexit.register` callback inside
+  `_acquire_startup_lock` and the explicit `finally` cleanup in the
+  stdio gateway and streamable-http placeholder now use this
+  owner-aware release, so a stale exit-callback from a previously-
+  released first process cannot unlink a successor process's live
+  lock. The legacy `release_lock()` primitive is kept for backward
+  compatibility but is no longer used by chunk 2+3 CLI cleanup paths.
+
 ### Firmware
 
 - Added `WriteHeadAngles(yaw, pitch, speed_dps)` overload for speed-based motion control on the user-driven `move_head` path. Existing duration-based overload preserved; boot-init path unchanged in this PR. Adds `MAX_SPEED_DPS=240` (SCS0009 datasheet ceiling) safety clamp and `MIN_SMOOTH_SPEED_DPS=72` documented smoothness floor (sub-floor speeds are permitted with an `ESP_LOGW` warning so the gateway `"low"` preset can deliver deliberately slow motion). (#129)
