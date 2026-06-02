@@ -86,6 +86,16 @@ class _AvatarStaging:
     created_at: float
 
 
+# Per-route upload cap for the JPEG capture endpoint. The PCM endpoint
+# intentionally streams arbitrarily long payloads (multi-minute TTS),
+# so the application-wide ``client_max_size`` is disabled and each
+# route enforces its own limit. JPEG captures from the ESP32 camera
+# top out around 200 KB at full resolution; 8 MiB is generous headroom
+# against a misbehaving / malicious uploader without inviting unbounded
+# disk consumption on the gateway host.
+CAPTURE_MAX_BYTES = 8 * 1024 * 1024
+
+
 def _is_authorized(auth_header: str, expected_token: str) -> bool:
     """Return whether the bearer auth header matches the expected token."""
     return auth_header == f"Bearer {expected_token}"
@@ -104,11 +114,31 @@ async def handle_capture(request: web.Request) -> web.Response:
             content_type="application/json",
         )
 
+    # Per-route body cap. The application-wide client_max_size is
+    # disabled because /pcm streams arbitrary-length audio, so
+    # /capture's defense lives here. Reject up front based on the
+    # advertised Content-Length when available, and enforce again
+    # while streaming so a misadvertised header cannot bypass the cap.
+    content_length = request.content_length
+    if content_length is not None and content_length > CAPTURE_MAX_BYTES:
+        logger.warning(
+            "Capture upload rejected: Content-Length %d exceeds %d",
+            content_length, CAPTURE_MAX_BYTES,
+        )
+        return web.Response(
+            text=json.dumps(
+                {"error": f"Upload exceeds {CAPTURE_MAX_BYTES} bytes"}
+            ),
+            status=413,
+            content_type="application/json",
+        )
+
     os.makedirs(CAPTURE_DIR, exist_ok=True)
 
     reader = await request.multipart()
     question = ""
     image_path = ""
+    bytes_written = 0
 
     async for part in reader:
         if part.name == "question":
@@ -122,6 +152,27 @@ async def handle_capture(request: web.Request) -> web.Response:
                     chunk = await part.read_chunk(8192)
                     if not chunk:
                         break
+                    bytes_written += len(chunk)
+                    if bytes_written > CAPTURE_MAX_BYTES:
+                        # Overran the cap mid-stream — delete the
+                        # partial file and bail out with 413 so the
+                        # gateway host disk does not fill up.
+                        f.close()
+                        try:
+                            os.remove(image_path)
+                        except OSError:
+                            pass
+                        logger.warning(
+                            "Capture upload truncated at %d bytes (cap %d)",
+                            bytes_written, CAPTURE_MAX_BYTES,
+                        )
+                        return web.Response(
+                            text=json.dumps(
+                                {"error": f"Upload exceeds {CAPTURE_MAX_BYTES} bytes"}
+                            ),
+                            status=413,
+                            content_type="application/json",
+                        )
                     f.write(chunk)
 
     if image_path and os.path.exists(image_path):
@@ -394,7 +445,19 @@ def create_capture_app(
     dispatches to. May be ``None`` for tests of /capture alone; /pcm
     will return 503 in that case.
     """
-    app = web.Application()
+    # ``client_max_size=0`` disables aiohttp's per-request body size
+    # cap (default 1 MiB). The /pcm endpoint legitimately streams
+    # arbitrarily long PCM utterances (multi-minute TTS, live audio
+    # mixes); a 1 MiB cap would silently cut a chunked-transfer
+    # producer off mid-stream once its cumulative body exceeded that
+    # limit — observed in practice with a 200-second TTS push, which
+    # aborted around 36 s in (~2 MiB of source-rate PCM through the
+    # transfer-encoding pipe). The handler itself enforces no separate
+    # cap; back-pressure comes from the device-side Opus push rate
+    # inside ``send_pcm_stream``, which is the right place for it.
+    # /capture only receives JPEG snapshots from the ESP32 (well under
+    # 1 MiB each) so removing the cap costs it nothing.
+    app = web.Application(client_max_size=0)
     app[CAPTURE_TOKEN_KEY] = capture_token
     app[AVATAR_SETS_KEY] = {}
     app[AVATAR_SETS_LOCK_KEY] = asyncio.Lock()
