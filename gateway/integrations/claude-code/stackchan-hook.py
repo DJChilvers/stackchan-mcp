@@ -35,9 +35,25 @@ import os
 import json
 import random
 import time
+import traceback
 import urllib.request
 
 GATEWAY_URL = "http://127.0.0.1:8767/mcp"
+
+# This script previously swallowed every exception silently with no record of
+# what mode/payload it ran with — made it impossible to tell why a given
+# notification did (or didn't) speak. Append-only log, one line per event.
+HOOK_LOG = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-hook.log"
+)
+
+
+def _log(line: str) -> None:
+    try:
+        with open(HOOK_LOG, "a", encoding="utf-8") as _lf:
+            _lf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+    except Exception:
+        pass
 
 # Mark "activity now" so the ambient idle-fidget loop (stackchan-idle.py)
 # holds still while Claude is actively working / speaking.
@@ -56,6 +72,34 @@ should_say = mode in ("say-done", "say-on-error", "urgent-say", "busy-start")
 BUSY_MARKER = os.path.join(
     os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-busy"
 )
+
+# Rate-limit the urgent head-wobble + red-blink flourish — user reported it's
+# annoying when several Notifications fire close together while they're
+# already working (permission prompts etc. can repeat quickly). The physical
+# motion is what's distracting; the SPOKEN message is what's actually useful
+# ("what does he want"), so only the wobble/blink gets throttled — speech
+# still fires on every notification, unconditionally, below.
+URGENT_MARKER = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-urgent-last"
+)
+URGENT_COOLDOWN_S = 30.0
+
+
+def _urgent_flourish_due() -> bool:
+    try:
+        with open(URGENT_MARKER) as _f:
+            last = float(_f.read().strip())
+    except Exception:
+        last = 0.0
+    return (time.time() - last) >= URGENT_COOLDOWN_S
+
+
+def _mark_urgent_flourish() -> None:
+    try:
+        with open(URGENT_MARKER, "w") as _f:
+            _f.write(str(time.time()))
+    except Exception:
+        pass
 
 # Short, varied phrases for the Stop hook so it doesn't feel robotic.
 DONE_PHRASES = [
@@ -137,6 +181,7 @@ if mode == "busy-continue":
 
 try:
     raw = sys.stdin.read().lstrip("﻿")
+    _log(f"invoked mode={mode} face={face} raw_len={len(raw)} raw_preview={raw[:300]!r}")
     if raw.strip():
         data = json.loads(raw)
         # Detect tool errors in PostToolUse
@@ -153,15 +198,23 @@ try:
             skip_avatar = False
             if mode == "say-on-error":
                 message_to_say = random.choice(ERROR_PHRASES)
-        # Extract Notification message for speech
+        # Extract Notification message for speech. Multiple Claude Code
+        # sessions/projects can share this one physical hook, so without an
+        # identifier the user has no way to tell which one is calling —
+        # cwd is present on every Notification payload, so name the project.
         if mode == "urgent-say":
             raw_message = (data.get("message") or "").strip()
+            cwd = (data.get("cwd") or "").rstrip("/\\")
+            project = os.path.basename(cwd) if cwd else "a project"
             prefix = random.choice(URGENT_PHRASES)
-            message_to_say = f"{prefix} {raw_message}".strip()
+            message_to_say = f"{prefix} This is {project}. {raw_message}".strip()
             if len(message_to_say) > 200:
                 message_to_say = message_to_say[:197] + "..."
+            _log(f"urgent-say parsed: project={project!r} message_to_say={message_to_say!r}")
+    else:
+        _log("stdin was empty/whitespace-only — nothing to parse")
 except Exception:
-    pass
+    _log("EXCEPTION parsing stdin:\n" + traceback.format_exc())
 
 
 class MCPSession:
@@ -365,20 +418,31 @@ try:
         session.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH + 6})
         _set_leds(session, IDLE_LED)
     if mode == "urgent-say":
-        run_head_moves(session, "urgent")
-        # Blink red a few times to catch the eye, then HOLD solid red —
-        # do not revert to idle blue here. A notification means work is
-        # genuinely paused waiting on the user; reverting to "calm" would
-        # misrepresent "still waiting on you" as "all clear". Stays red
-        # until the next busy-start/say-done changes it.
-        for _ in range(3):
-            _set_leds(session, URGENT_LED)
-            time.sleep(0.18)
-            _set_leds(session, (0, 0, 0))
-            time.sleep(0.12)
+        # The wobble + blink flourish is throttled to once per
+        # URGENT_COOLDOWN_S — repeated Notifications while the user is
+        # already working (e.g. back-to-back permission prompts) made it
+        # feel like nagging. Speech (below) still fires every time
+        # regardless, since that's what actually says what he wants.
+        flourish = _urgent_flourish_due()
+        _log(f"urgent-say: flourish_due={flourish} message_to_say={message_to_say!r}")
+        if flourish:
+            run_head_moves(session, "urgent")
+            # Blink red a few times to catch the eye, then HOLD solid red —
+            # do not revert to idle blue here. A notification means work is
+            # genuinely paused waiting on the user; reverting to "calm" would
+            # misrepresent "still waiting on you" as "all clear". Stays red
+            # until the next busy-start/say-done changes it.
+            for _ in range(3):
+                _set_leds(session, URGENT_LED)
+                time.sleep(0.18)
+                _set_leds(session, (0, 0, 0))
+                time.sleep(0.12)
+            _mark_urgent_flourish()
         _set_leds(session, URGENT_LED)
     if should_say and message_to_say:
         with TalkingBob():
             session.call_tool("say", {"text": message_to_say}, timeout=30)
+    elif should_say and not message_to_say:
+        _log(f"should_say=True but message_to_say is empty — nothing spoken (mode={mode})")
 except Exception:
-    pass
+    _log("EXCEPTION in main hook body:\n" + traceback.format_exc())

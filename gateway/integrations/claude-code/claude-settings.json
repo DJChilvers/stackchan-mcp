@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py idle"
+            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py idle say-done"
           }
         ]
       }

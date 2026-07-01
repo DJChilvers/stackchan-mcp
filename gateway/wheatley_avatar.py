@@ -1,20 +1,33 @@
 #!/usr/bin/env python3
-"""Generate a Wheatley (Portal 2) optic avatar set for StackChan (layered mode).
+"""Generate a Wheatley (Portal 2) optic avatar set for StackChan.
 
 Wheatley's eye is a glowing BLUE gradient optic (bright cyan core -> deep blue
 rim) inside a dark aperture housing, with metallic eyelid shutters that do the
 emoting (wide = shocked, angled = worried, half = his nervous blink). This is
-the GLaDOS optic treatment recoloured blue, plus mechanical lids — which the
-reference video confirms is correct (it is NOT a realistic eyeball).
+the GLaDOS optic treatment recoloured blue, plus mechanical lids.
 
 The iris becomes the Claude starburst for the "thinking" face; errors turn the
-optic red and snap the eye wide (panic). 14 frames (6 faces + 3 eyes +
-5 mouths), 160x120 RGB565 little-endian, 537,600 bytes total.
+optic red and snap the eye wide (panic).
 
-Frame order:
-    faces : idle, happy, thinking, sad, surprised, embarrassed
-    eyes  : eyes_open, eyes_half, eyes_closed
-    mouths: mouth_closed, mouth_half, mouth_open, mouth_e, mouth_u
+Two output modes, both built from the SAME three-axis model (face / eyes /
+mouth) so a look is always the composition of independent parts rather than
+14 mutually-exclusive whole-face pictures:
+
+  face  (6): horizontal gaze + expression identity (ox offset, scale, bright,
+             a lid-squint baseline for that expression)
+  eyes  (3): blink closure amount, ADDED on top of the face's lid baseline
+             (firmware auto-cycles this for real blinking)
+  mouth (5): closed/half/open drive real lip-sync (firmware auto-cycles these
+             during speech — near-neutral here); e/u are the vertical
+             "glance up" / kung-fu-flutter frames, carrying an oy (and small
+             ox) offset that composites on top of WHATEVER face is active
+
+--matrix (default): all 90 face x eyes x mouth combinations pre-composited,
+    so e.g. "thinking" (look left) + "mouth_e" (glance up) really renders as
+    looking up-and-left — genuine independent multi-axis gaze, not just 6
+    fixed poses. 160x120 RGB565, 3,456,000 bytes, idx = face*15 + eyes*5 + mouth.
+--layered: the original 14-frame set (one combo picked per name, see
+    LAYERED_COMBOS below) for devices/tests that still want the smaller set.
 """
 from __future__ import annotations
 import math
@@ -40,6 +53,11 @@ RED = dict(core=(255, 226, 208), bright=(255, 80, 50), mid=(206, 28, 18),
 LID = (26, 28, 34)
 LID_HI = (54, 58, 68)
 CLAUDE_HOT = (255, 156, 110)
+
+# A device sitting below the user's eyeline reads as more attentive if its
+# resting gaze is biased very slightly up — applied to every combo, not a
+# per-face choice.
+GLOBAL_OY_BIAS = -2 * SS
 
 
 def _circle(d, cx, cy, r, fill):
@@ -138,54 +156,6 @@ def _lids(d, top=0.0, bot=0.0, angle=0.0, worried=False):
         d.line([(0, yl), (CW, yl)], fill=LID_HI, width=int(2 * SS))
 
 
-# (mood) -> dict(pal, scale, bright, ox, oy, claude, top, bot, angle, worried)
-def _spec(mood):
-    S = SS
-    P = dict(pal=BLUE, scale=1.0, bright=1.0, ox=0, oy=0, claude=False,
-             top=0.0, bot=0.0, angle=0.0, worried=False)
-    if mood == "idle":
-        P.update(top=0.0, bot=0.0, oy=-2 * S)
-    # --- WANDER gaze frames (only ever set by the idle wander, never by hooks
-    #     or firmware touch reactions, so they can safely move the optic) ---
-    elif mood == "happy":        # WANDER: look RIGHT — optic darts toward the edge
-        P.update(ox=12 * S, scale=0.74, bright=1.06, top=0.15, bot=0.09)
-    elif mood == "thinking":     # WANDER: look LEFT — optic darts toward the edge
-        P.update(ox=-12 * S, scale=0.74, bright=1.06, top=0.15, bot=0.09)
-    elif mood == "sad":          # WANDER: EXAMINE — zoom in + squint (lids lowered)
-        P.update(scale=1.30, bright=1.12, top=0.30, bot=0.24)
-    # --- CENTERED frames (safe for firmware touch reactions + work hooks) ---
-    elif mood == "surprised":    # wide reaction, centered (touch-tap / notification)
-        P.update(scale=1.20, bright=1.28)
-    elif mood == "embarrassed":  # CENTERED mild reaction (firmware fires on head-stroke);
-        P.update(bright=1.0, top=0.20, bot=0.14)                   # MUST stay centered so phantom touches can't dart the eye
-    elif mood == "eyes_open":
-        P.update(top=0.0, bot=0.0, oy=-2 * S)
-    elif mood == "eyes_half":
-        P.update(top=0.44, bot=0.36)                               # nervous half-blink
-    elif mood == "eyes_closed":
-        P.update(top=0.54, bot=0.52)
-    elif mood == "mouth_closed":
-        P.update(top=0.0, bot=0.0, oy=-2 * S)
-    elif mood == "mouth_half":   # lip-sync: pulse via brightness/lids only (no ox dart)
-        P.update(bright=1.12, top=0.16, bot=0.10)
-    elif mood == "mouth_open":
-        P.update(bright=1.3, oy=-2 * S, top=0.06, bot=0.05)
-    elif mood == "mouth_e":      # KUNG-FU FLUTTER frame A (repurposed — see below)
-        P.update(scale=0.65, bright=1.3, oy=-15 * S, ox=6 * S, top=0.35, bot=0.05)
-    elif mood == "mouth_u":      # KUNG-FU FLUTTER frame B (repurposed — see below)
-        P.update(scale=0.70, bright=1.15, oy=-10 * S, ox=-6 * S, top=0.22, bot=0.08)
-    # mouth_e/mouth_u repurposed 2026-06-30: firmware's own lip-sync
-    # auto-cycle only ever walks closed -> half -> open -> half -> closed,
-    # so these two slots are never touched by real speech — free to reuse.
-    # Triggered via set_mouth_sequence (firmware-local step queue) on each
-    # completed tool call during busy/coding stretches: the optic rolls up
-    # and tucks toward the top lid, alternating A/B for a fast flutter —
-    # the "Neo learning kung fu" download-look. See stackchan-hook.py.
-    else:
-        raise ValueError(mood)
-    return P
-
-
 def _clamp_gaze(r: int, ox: int, oy: int, margin: int) -> tuple[int, int]:
     """Cap the optic's (ox, oy) offset so it never crosses the aperture mask
     — without this, a big enough gaze offset pushes the glowing disc past
@@ -199,19 +169,90 @@ def _clamp_gaze(r: int, ox: int, oy: int, margin: int) -> tuple[int, int]:
     return ox, oy
 
 
-def render(mood: str) -> Image.Image:
-    P = _spec(mood)
+# ── three independent axes ───────────────────────────────────────────────────
+# face: horizontal gaze/expression identity. lid_top/lid_bot are that
+# expression's OWN baseline squint — eyes axis adds blink closure on top.
+# tilt: a small fixed lid-cant (radians) baked per expression — reference
+# footage of the physical Wheatley prop shows he's almost never dead level;
+# the whole housing rides at a slight roll while swinging on his rail. Our
+# servos have no roll axis, so this fakes it by tilting the lid line instead
+# of the (rotationally-symmetric) optic — cheapest way to read as "canted".
+FACE_SPECS = {
+    "idle":        dict(ox=0,       scale=1.00, bright=1.00, claude=False, lid_top=0.00, lid_bot=0.00, tilt=0.00),
+    "happy":       dict(ox=12 * SS, scale=0.74, bright=1.06, claude=False, lid_top=0.15, lid_bot=0.09, tilt=0.08),   # look RIGHT, leans into it
+    "thinking":    dict(ox=-12 * SS, scale=0.74, bright=1.06, claude=False, lid_top=0.15, lid_bot=0.09, tilt=-0.08),  # look LEFT, leans into it
+    "sad":         dict(ox=0,       scale=1.30, bright=1.12, claude=False, lid_top=0.30, lid_bot=0.24, tilt=0.00),   # EXAMINE: zoom+squint
+    "surprised":   dict(ox=0,       scale=1.20, bright=1.28, claude=False, lid_top=0.00, lid_bot=0.00, tilt=0.00),   # WIDE
+    "embarrassed": dict(ox=0,       scale=1.00, bright=1.00, claude=False, lid_top=0.20, lid_bot=0.14, tilt=0.10),   # MILD, worried cant
+}
+
+# eyes: blink closure, additive on top of the face's lid baseline.
+EYES_SPECS = {
+    "eyes_open":   dict(dtop=0.00, dbot=0.00),
+    "eyes_half":   dict(dtop=0.30, dbot=0.24),   # nervous half-blink / downcast-thoughtful look
+    "eyes_closed": dict(dtop=0.50, dbot=0.48),
+}
+
+# mouth: closed/half/open are real lip-sync (firmware auto-cycles these
+# during speech) so they stay near-neutral; e/u are the vertical "glance
+# up"/kung-fu-flutter pair and carry the big oy offset — composited onto
+# whatever face is currently active, giving a genuine diagonal look
+# (e.g. thinking + mouth_e = look up-and-left) rather than a fixed pose.
+MOUTH_SPECS = {
+    "mouth_closed": dict(oy=0,        ox=0,       bright_mult=1.00, scale_mult=1.00),
+    "mouth_half":   dict(oy=0,        ox=0,       bright_mult=1.12, scale_mult=1.00),
+    "mouth_open":   dict(oy=0,        ox=0,       bright_mult=1.30, scale_mult=1.00),
+    "mouth_e":      dict(oy=-15 * SS, ox=6 * SS,  bright_mult=1.30, scale_mult=0.85),  # glance-up / flutter A
+    "mouth_u":      dict(oy=-10 * SS, ox=-6 * SS, bright_mult=1.15, scale_mult=0.90),  # glance-up / flutter B
+}
+
+FACES = ["idle", "happy", "thinking", "sad", "surprised", "embarrassed"]
+EYES = ["eyes_open", "eyes_half", "eyes_closed"]
+MOUTHS = ["mouth_closed", "mouth_half", "mouth_open", "mouth_e", "mouth_u"]
+
+# Legacy 14-frame layered set: one fixed (face, eyes, mouth) combo per name,
+# chosen to reproduce the original single-picture look for each slot.
+LAYERED_COMBOS = {
+    "idle":         ("idle", "eyes_open", "mouth_closed"),
+    "happy":        ("happy", "eyes_open", "mouth_closed"),
+    "thinking":     ("thinking", "eyes_open", "mouth_closed"),
+    "sad":          ("sad", "eyes_open", "mouth_closed"),
+    "surprised":    ("surprised", "eyes_open", "mouth_closed"),
+    "embarrassed":  ("embarrassed", "eyes_open", "mouth_closed"),
+    "eyes_open":    ("idle", "eyes_open", "mouth_closed"),
+    "eyes_half":    ("idle", "eyes_half", "mouth_closed"),
+    "eyes_closed":  ("idle", "eyes_closed", "mouth_closed"),
+    "mouth_closed": ("idle", "eyes_open", "mouth_closed"),
+    "mouth_half":   ("idle", "eyes_open", "mouth_half"),
+    "mouth_open":   ("idle", "eyes_open", "mouth_open"),
+    "mouth_e":      ("idle", "eyes_open", "mouth_e"),
+    "mouth_u":      ("idle", "eyes_open", "mouth_u"),
+}
+LAYERED_ORDER = FACES + EYES + MOUTHS
+
+
+def render_combo(face: str, eyes: str, mouth: str) -> Image.Image:
+    f = FACE_SPECS[face]
+    e = EYES_SPECS[eyes]
+    m = MOUTH_SPECS[mouth]
+
+    ox = f["ox"] + m["ox"]
+    oy = GLOBAL_OY_BIAS + m["oy"]
+    scale = f["scale"] * m["scale_mult"]
+    bright = f["bright"] * m["bright_mult"]
+    top = min(f["lid_top"] + e["dtop"], 0.62)
+    bot = min(f["lid_bot"] + e["dbot"], 0.62)
+    claude = f["claude"]
+
     base = Image.new("RGB", (CW, CH), (0, 0, 0))
     d = ImageDraw.Draw(base)
     _housing(d)
-    r = int((OPTIC_R * 0.92 if P["claude"] else OPTIC_R) * P["scale"])
-    P["ox"], P["oy"] = _clamp_gaze(r, P["ox"], P["oy"], margin=int(3 * SS))
-    optic = Image.fromarray(
-        _optic_layer(P["pal"], P["scale"], P["bright"], P["ox"], P["oy"],
-                     P["claude"]), "RGB")
+    r = int((OPTIC_R * 0.92 if claude else OPTIC_R) * scale)
+    ox, oy = _clamp_gaze(r, ox, oy, margin=int(3 * SS))
+    optic = Image.fromarray(_optic_layer(BLUE, scale, bright, ox, oy, claude), "RGB")
     base = Image.composite(optic, base, _aperture_mask())
     d = ImageDraw.Draw(base)
-    _lids(d, P["top"], P["bot"], P["angle"], P["worried"])
+    _lids(d, top, bot, angle=f["tilt"])
     return base.resize((W, H), Image.LANCZOS)
 
 
@@ -223,18 +264,29 @@ def to_rgb565(img: Image.Image) -> bytes:
     return (((r << 11) | (g << 5) | b).astype("<u2")).tobytes()
 
 
-FACES = ["idle", "happy", "thinking", "sad", "surprised", "embarrassed"]
-EYES = ["eyes_open", "eyes_half", "eyes_closed"]
-MOUTHS = ["mouth_closed", "mouth_half", "mouth_open", "mouth_e", "mouth_u"]
-ORDER = FACES + EYES + MOUTHS
-
-
-def main():
-    save_png = "--png" in sys.argv
+def build_matrix(save_png: bool = False) -> bytes:
     payload = bytearray()
-    preview = Image.new("RGB", (W * len(ORDER), H), (0, 0, 0))
-    for i, name in enumerate(ORDER):
-        img = render(name)
+    preview = Image.new("RGB", (W * 15, H * 6), (0, 0, 0))
+    for fi, face in enumerate(FACES):
+        for ei, eyes in enumerate(EYES):
+            for mi, mouth in enumerate(MOUTHS):
+                img = render_combo(face, eyes, mouth)
+                payload += to_rgb565(img)
+                col = ei * 5 + mi
+                preview.paste(img, (col * W, fi * H))
+                if save_png:
+                    img.save(OUT / f"wheatley_matrix_{face}_{eyes}_{mouth}.png")
+    assert len(payload) == 90 * 160 * 120 * 2, len(payload)
+    (OUT / "wheatley_avatar_matrix.bin").write_bytes(payload)
+    preview.save(OUT / "wheatley_matrix_preview.png")
+    return bytes(payload)
+
+
+def build_layered(save_png: bool = False) -> bytes:
+    payload = bytearray()
+    preview = Image.new("RGB", (W * len(LAYERED_ORDER), H), (0, 0, 0))
+    for i, name in enumerate(LAYERED_ORDER):
+        img = render_combo(*LAYERED_COMBOS[name])
         payload += to_rgb565(img)
         preview.paste(img, (i * W, 0))
         if save_png:
@@ -242,7 +294,18 @@ def main():
     assert len(payload) == 14 * 160 * 120 * 2, len(payload)
     (OUT / "wheatley_avatar.bin").write_bytes(payload)
     preview.save(OUT / "wheatley_preview.png")
-    print(f"OK: wheatley_avatar.bin = {len(payload)} bytes")
+    return bytes(payload)
+
+
+def main():
+    save_png = "--png" in sys.argv
+    layered_only = "--layered" in sys.argv
+    if layered_only:
+        build_layered(save_png)
+        print(f"OK: wheatley_avatar.bin = {14 * 160 * 120 * 2} bytes (layered)")
+    else:
+        build_matrix(save_png)
+        print(f"OK: wheatley_avatar_matrix.bin = {90 * 160 * 120 * 2} bytes (matrix)")
 
 
 if __name__ == "__main__":
