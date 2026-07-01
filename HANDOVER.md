@@ -142,6 +142,92 @@ See `firmware/TODO.md` for the full writeup of both. Short version:
 
 Both need the same rebuild+reflash window; batch them together.
 
+## Troubleshooting history — resolved problems, and how to avoid repeating them
+
+**Environment / infrastructure**
+- `uv`-managed Python interpreter periodically vanishes
+  (`~/AppData/Roaming/uv/python/` gets wiped, cause unknown), so the daemon
+  crash-loops with `No Python at ...`. Fix: `uv python install 3.12.13
+  --reinstall`, ignore the "Missing expected target directory" error it
+  prints, verify with `.venv\Scripts\python.exe --version` directly rather
+  than trusting uv's exit code.
+- `uv sync --extra X` silently REMOVES packages not declared in
+  `pyproject.toml` (wiped Pillow/edge-tts once, mid-project). Use `uv pip
+  install <pkg>` for one-off additions; only run `uv sync` after auditing
+  `pyproject.toml` to declare everything actually relied on.
+- Every background script (idle/led-chase/voice-bridge/daemon) shows as
+  TWO processes — a `.venv\Scripts\pythonw.exe` trampoline plus a
+  `uv`-managed child. Normal, not a duplicate instance; kill both PIDs
+  when restarting.
+- API keys pasted into `.env` via Notepad can silently wrap across two
+  lines (python-dotenv parses per-line), truncating the key and causing a
+  `401` that looks like a bad key rather than a formatting artifact.
+  Always verify the key is one unbroken line after pasting.
+- `faster-whisper`/PyTorch both segfaulting identically was NOT a Python
+  library bug — traced via Windows Event Viewer to `msvcp140.dll`
+  corruption, fixed by `sfc /scannow` + DISM + a mandatory restart. Lesson:
+  when two unrelated native-compiled libraries fail the same way, check
+  Event Viewer for the real faulting module before assuming a library bug.
+
+**Avatar / rendering**
+- Avatar doesn't survive a power-cycle (lives in PSRAM, not flash) — now
+  auto-restored on reconnect via `.env`'s `STACKCHAN_DEFAULT_AVATAR*`;
+  don't remove that without providing another restore path.
+- A gaze offset pushed far enough can visually overflow the aperture
+  ("eyeball leaving the screen") — guarded generically by `_clamp_gaze()`
+  in `wheatley_avatar.py` for any mood/offset, current or future.
+- Horizontal gaze was inverted at the rendering level for a long stretch,
+  masked by a compensating swap elsewhere (`stackchan-idle.py`'s
+  LOOK_LEFT/RIGHT pairing) that made head+eye agree with each other
+  without either being objectively correct. Root-caused via an eye-only
+  live test (face changes with NO head movement) — if a face ever looks
+  the "wrong" way again, test the eye alone before touching servo/pairing
+  code, so you fix the real sign instead of adding another compensating
+  swap on top.
+- Replacing an already-loaded matrix avatar set can OOM (firmware
+  allocates the new PSRAM buffer before freeing the old one) — expect to
+  need a power-cycle between iterations when actively tweaking matrix-mode
+  art.
+
+**Movement**
+- Big committed left-right-left swings as the DEFAULT idle behaviour were
+  explicitly, repeatedly rejected by the user ("hate it", "stupid
+  movement") — small varied vignettes are the standing design constraint,
+  not a stylistic preference to relitigate.
+- Vignettes computing an absolute target from a fixed neutral position
+  (instead of the current pose) silently reintroduced the same "return to
+  center" complaint even after vignette variety was added — any new
+  movement code should drift from `pose["y"]/["p"]`, never fixed
+  constants, unless it's deliberately a rare "big, committed" outlier like
+  `_v_big_examine`.
+
+**Hooks / multi-session**
+- A single missing command-line argument (`say-done` on the Stop hook)
+  silently broke an entire subsystem for a whole session — no error
+  visible anywhere, because the hook script had zero logging. Check
+  `%TEMP%\stackchan-hook.log` FIRST whenever something isn't
+  firing/speaking as expected, before assuming the underlying logic is
+  wrong.
+- One session's busy-start/say-done could silently erase a DIFFERENT
+  session's busy state or outstanding "needs you" alert when markers were
+  global — now per-session + priority-ordered (see above).
+- When another Claude Code session is working in this same repo
+  concurrently: never assume `git status`'s changes are all yours. Check
+  `git diff --stat` on exactly the files you touched, and `git add` by
+  explicit filename — never `-A`/`.` — so you don't sweep up or interfere
+  with another session's in-progress, possibly-incomplete work.
+
+**Hardware**
+- Charging-circuit electrical noise triggers phantom touch/stroke wobbles
+  (~1600 events/session logged, firing every ~7-8s) — confirmed by
+  watching events stop instantly on unplugging the charger. Don't charge
+  while interacting with the device; see firmware/TODO.md for the
+  longer-term fix.
+- The device's WS connection drops while WiFi stays up (Sleep Mode is ON
+  in firmware) and needs a screen tap or power-cycle to reconnect — check
+  `esp32_connected` in `GET /status` before assuming a network/AP-config
+  problem.
+
 ## Working alongside another agent/session
 
 This repo is sometimes being worked on by more than one Claude Code
