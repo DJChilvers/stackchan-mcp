@@ -22,11 +22,9 @@ busy must not be able to silently erase another session's still-outstanding
 so one session's say-done can't wrongly clear a DIFFERENT session's busy
 marker either.
 
-While NONE of these are active, this script does nothing — it leaves the
-LEDs exactly as stackchan-hook.py's static idle-blue / urgent-red left them.
-It only takes over rendering while one is present, and stops writing the
-instant it disappears (the owning script is responsible for setting the
-final static color, e.g. say-done sets idle blue).
+While NONE of these are active, this script mostly leaves the LEDs alone
+(stackchan-hook.py's static idle-blue / urgent-red), only periodically
+re-asserting idle-blue — see IDLE_REPAINT_S below for why.
 
 Run via stackchan-led-chase-start.vbs (hidden pythonw, same pattern as the
 ambient idle-fidget loop). Single-instance locked.
@@ -83,6 +81,22 @@ NEEDS_ATTENTION_STALE_S = 60 * 60
 
 NUM_LEDS = 12
 STEP_S = 0.12  # ~8 fps — smooth enough for a chase, light on the WS link
+
+# 2026-07-01: the firmware ITSELF autonomously drives the LEDs green while
+# touch-to-talk is actively recording, and off when recording stops — this
+# happens entirely on-device, with no marker file and no way for us to know
+# it's happening. Normally that's harmless (if our own chase is already
+# running, our next frame ~STEP_S later just paints over it) — but if the
+# user taps to talk while genuinely idle (no busy/thinking/attention marker
+# active) and then the recording TIMES OUT without ever completing (nothing
+# said, or tapped again too slowly), firmware turns the LEDs off and nothing
+# on our side ever gets triggered to restore idle-blue, since voice-bridge
+# only hears about a recording that actually finished and got POSTed to it.
+# Rather than trying to track the firmware's listening state directly (no
+# marker exists for it), just periodically re-assert idle-blue while
+# genuinely idle so any such gap self-heals within a bounded time.
+IDLE_LED = (0, 25, 90)
+IDLE_REPAINT_S = 4.0
 
 
 def _marker_active(path: str, stale_s: float) -> bool:
@@ -210,6 +224,7 @@ def main():
     pos = 0
     hue = 0.0
     pulse_phase = 0.0
+    last_idle_repaint = 0.0
 
     while True:
         time.sleep(STEP_S)
@@ -220,8 +235,13 @@ def main():
         attention = _needs_attention_active()
         thinking = _marker_active(VOICE_THINKING_MARKER, THINKING_STALE_S)
         busy = _any_busy()
-        if not (attention or thinking or busy):
-            have_session = False  # drop session while idle; re-init on resume
+        active = attention or thinking or busy
+
+        # Idle: only wake up to repaint every IDLE_REPAINT_S (see constant
+        # above for why this exists — self-heals any state the firmware's
+        # autonomous touch-to-talk LEDs left behind).
+        if not active and (time.time() - last_idle_repaint) < IDLE_REPAINT_S:
+            have_session = False  # drop session between repaints; re-init on resume
             continue
 
         if not device_connected():
@@ -238,9 +258,12 @@ def main():
             elif thinking:
                 hue = (hue + 30) % 360
                 session.set_leds(rainbow_chase_frame(hue))
-            else:
+            elif busy:
                 pos = (pos + 1) % NUM_LEDS
                 session.set_leds(amber_chase_frame(pos))
+            else:
+                session.set_leds([list(IDLE_LED)] * NUM_LEDS)
+                last_idle_repaint = time.time()
         except Exception:
             have_session = False  # re-init next tick
 
