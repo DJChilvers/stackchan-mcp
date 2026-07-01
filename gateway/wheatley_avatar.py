@@ -194,16 +194,34 @@ EYES_SPECS = {
 }
 
 # mouth: closed/half/open are real lip-sync (firmware auto-cycles these
-# during speech) so they stay near-neutral; e/u are the vertical "glance
-# up"/kung-fu-flutter pair and carry the big oy offset — composited onto
-# whatever face is currently active, giving a genuine diagonal look
-# (e.g. thinking + mouth_e = look up-and-left) rather than a fixed pose.
+# during speech) so they stay near-neutral. e/u are the two matrix-mode
+# vertical gaze cues, composited onto whatever face is currently active —
+# giving a genuine diagonal look (e.g. thinking + mouth_e = look
+# up-and-left) rather than a fixed pose.
+#
+# 2026-07-01: mouth_u used to be a SECOND "up" variant (paired with mouth_e
+# for the kung-fu flutter, both rolling upward). User wanted a real,
+# independently-controllable "look down" to pair with head pitch — the
+# matrix's 90 frames are a fixed 6x3x5 cross-product (firmware-hardcoded,
+# not expandable without a reflash), so there's no literal free slot to
+# add; the only slot not already committed to real lip-sync is this one.
+# Flipped mouth_u's oy sign so it's a genuine down-glance instead of a
+# second up-glance. The kung-fu flutter (stackchan-hook.py busy-continue)
+# was reworked to alternate mouth_e with mouth_closed instead of e/u, so it
+# still flutters using only the up cue, freeing this one for down.
+# clip_margin: how much of the optic is ALLOWED to clip against the
+# aperture edge (fed to _clamp_gaze as its margin). Real eyes don't shrink
+# when they roll up/down — the iris just partially disappears behind the
+# lid/socket rim. closed/half/open keep the protective default (never
+# clip — they're driven by real speech, need to stay legible); e/u use a
+# deliberately negative margin so the same-size optic is allowed to push
+# past the aperture boundary and clip naturally instead of shrinking.
 MOUTH_SPECS = {
-    "mouth_closed": dict(oy=0,        ox=0,       bright_mult=1.00, scale_mult=1.00),
-    "mouth_half":   dict(oy=0,        ox=0,       bright_mult=1.12, scale_mult=1.00),
-    "mouth_open":   dict(oy=0,        ox=0,       bright_mult=1.30, scale_mult=1.00),
-    "mouth_e":      dict(oy=-15 * SS, ox=6 * SS,  bright_mult=1.30, scale_mult=0.85),  # glance-up / flutter A
-    "mouth_u":      dict(oy=-10 * SS, ox=-6 * SS, bright_mult=1.15, scale_mult=0.90),  # glance-up / flutter B
+    "mouth_closed": dict(oy=0,        ox=0, bright_mult=1.00, scale_mult=1.00, clip_margin=3 * SS),
+    "mouth_half":   dict(oy=0,        ox=0, bright_mult=1.12, scale_mult=1.00, clip_margin=3 * SS),
+    "mouth_open":   dict(oy=0,        ox=0, bright_mult=1.30, scale_mult=1.00, clip_margin=3 * SS),
+    "mouth_e":      dict(oy=-24 * SS, ox=0, bright_mult=1.30, scale_mult=1.00, clip_margin=-14 * SS),  # glance UP
+    "mouth_u":      dict(oy=24 * SS,  ox=0, bright_mult=1.00, scale_mult=1.00, clip_margin=-14 * SS),  # glance DOWN
 }
 
 FACES = ["idle", "happy", "thinking", "sad", "surprised", "embarrassed"]
@@ -257,7 +275,7 @@ def render_combo(face: str, eyes: str, mouth: str) -> Image.Image:
     d = ImageDraw.Draw(base)
     _housing(d)
     r = int((OPTIC_R * 0.92 if claude else OPTIC_R) * scale)
-    ox, oy = _clamp_gaze(r, ox, oy, margin=int(3 * SS))
+    ox, oy = _clamp_gaze(r, ox, oy, margin=m["clip_margin"])
     optic = Image.fromarray(_optic_layer(BLUE, scale, bright, ox, oy, claude), "RGB")
     base = Image.composite(optic, base, _aperture_mask())
     d = ImageDraw.Draw(base)

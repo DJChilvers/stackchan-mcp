@@ -84,8 +84,12 @@ TICK_MIN_S, TICK_MAX_S = 4.0, 10.0
 # alternation — the dwell+sticky-side mechanism below is unchanged, this
 # only makes it check in sooner and act more often once truly idle).
 GLANCE_PROB = 0.85
-# Gentle envelope, biased to look UP (lower pitch = up; the user sits above
-# the desk bot, so idle/at-rest should read as "looking at you").
+# Gentle envelope. Pitch convention: HIGHER pitch = look UP, LOWER = look
+# DOWN (2026-07-01: confirmed via an isolated servo-only test — pitch=5,
+# the minimum, physically looked down; pitch=85, the maximum, looked up.
+# Previously documented backwards as "lower = up", which flipped the
+# direction of the two vignettes below that reference a specific up/down —
+# see _v_look_up_center / _v_ponder_down.)
 YAW_MIN, YAW_MAX = -24, 24
 PITCH_MIN, PITCH_MAX = 28, 46
 NEUTRAL_YAW, NEUTRAL_PITCH = 0, 36
@@ -194,6 +198,7 @@ REST       = "idle"          # centered resting gaze
 WIDE       = "surprised"     # wide-eyed reaction (centered)
 MILD       = "embarrassed"   # mild, unimpressed/worried reaction (centered, canted)
 MOUTH_UP   = "e"             # composites a vertical glance-up onto the current face
+MOUTH_DOWN = "u"             # composites a vertical glance-down onto the current face
 MOUTH_NEUTRAL = "closed"     # real lip-sync resting state — always reset back to this
 EYE_LEAD   = 0.07            # eye moves this long before the head follows
 
@@ -248,12 +253,13 @@ def _v_nudge(session, pose):
 
 def _v_look_up_center(session, pose):
     """Genuine "just thought of something" beat: head physically tilts up
-    (lower pitch) AND the eye glances up on top of that (MOUTH_UP composited
-    onto whatever face is centered) — two independent axes agreeing, not
-    just a head move alone. Drifts from wherever he currently is, not a
-    snap back to a fixed neutral yaw (see module note above VIGNETTES)."""
+    (higher pitch) AND the eye glances up on top of that (MOUTH_UP
+    composited onto whatever face is centered) — two independent axes
+    agreeing, not just a head move alone. Drifts from wherever he
+    currently is, not a snap back to a fixed neutral yaw (see module note
+    above VIGNETTES)."""
     ny  = _clamp(pose["y"] + random.randint(-8, 8), YAW_MIN, YAW_MAX)
-    np_ = _clamp(pose["p"] - random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "up"
+    np_ = _clamp(pose["p"] + random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "up"
     session.move(ny, np_)
     time.sleep(random.uniform(0.1, 0.2))
     _mouth(session, MOUTH_UP)
@@ -294,18 +300,23 @@ def _v_diagonal_peek(session, pose):
 
 def _v_ponder_down(session, pose):
     """Thoughtful downcast beat: head physically pitches DOWN and slightly to
-    a side, brief hold (sometimes squinting in as if examining something
-    close), then relaxes. The mirror-image of _v_look_up_center. Drifts from
-    wherever he currently is, not a snap back to fixed neutral (see module
-    note above VIGNETTES)."""
+    a side, the eye ALSO glances down on top of that (MOUTH_DOWN — genuine
+    matching gaze, not just a squint standing in for it), brief hold
+    (sometimes also squinting in as if examining something close), then
+    relaxes. The mirror-image of _v_look_up_center. Drifts from wherever he
+    currently is, not a snap back to fixed neutral (see module note above
+    VIGNETTES)."""
     dy  = random.choice([-1, 1]) * random.randint(4, 14)
     ny  = _clamp(pose["y"] + dy, YAW_MIN, YAW_MAX)
-    np_ = _clamp(pose["p"] + random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "down"
+    np_ = _clamp(pose["p"] - random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "down"
     session.move(ny, np_)
+    time.sleep(random.uniform(0.1, 0.2))
+    _mouth(session, MOUTH_DOWN)
     time.sleep(random.uniform(0.15, 0.3))
     _face(session, EXAMINE if random.random() < 0.5 else REST)
     time.sleep(random.uniform(0.5, 1.0))
     _face(session, REST)
+    _mouth(session, MOUTH_NEUTRAL)
     pose.update(y=ny, p=np_)
     return pose
 

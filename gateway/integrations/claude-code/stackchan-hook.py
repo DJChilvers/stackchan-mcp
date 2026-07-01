@@ -328,10 +328,15 @@ class MCPSession:
 # ("move", yaw, pitch) and ("sleep", seconds) steps. Neutral is ~yaw 0,
 # pitch 45; ranges are yaw -90..90, pitch 5..85. Kept small + gentle, with
 # pauses between reversals (firmware dislikes large rapid reversals).
-# Pitch convention: LOWER pitch = look UP (toward the user, who sits above
-# the desk bot), HIGHER pitch = look DOWN. Neutral ~45.
-LOOK_DOWN_PITCH = 60   # busy/concentrating — head down at the "work"
-LOOK_UP_PITCH = 34     # idle/need-you — looking up, engaged with the user
+# Pitch convention: HIGHER pitch = look UP, LOWER pitch = look DOWN. Neutral
+# ~45. (2026-07-01: this was previously documented backwards — "lower = up"
+# — and every constant below was set accordingly, so busy/idle read as the
+# OPPOSITE of intended. Confirmed via a clean isolated test: pitch=5 [the
+# servo minimum] physically looked DOWN, pitch=85 [the maximum] looked UP.
+# Fixed by swapping the two values below; every other reference in this
+# file uses these constants BY NAME, so nothing else needed to change.)
+LOOK_DOWN_PITCH = 34   # busy/concentrating — head down at the "work"
+LOOK_UP_PITCH = 60     # idle/need-you — looking up, engaged with the user
 
 # Persistent status LED colours (currently hidden inside the case, but
 # harmless to send — ready for when the new shell exposes them). Distinct
@@ -444,17 +449,23 @@ try:
         # Eye does a fast upward flutter into the top lid on each completed
         # tool call ("Neo learning kung fu" download-look) via
         # set_mouth_sequence — a firmware-local step queue, so this is one
-        # network call regardless of step count. mouth_e/mouth_u are
-        # repurposed for this (see wheatley_avatar.py) — firmware's own
-        # lip-sync auto-cycle never touches those two slots, so it can't
-        # collide with real speech. set_mouth_sequence returns immediately;
-        # sleep the queued duration before restoring the steady busy face,
-        # or the restore would interrupt the in-flight sequence early.
+        # network call regardless of step count. mouth_e is repurposed for
+        # this (see wheatley_avatar.py) — firmware's own lip-sync auto-cycle
+        # never touches it, so it can't collide with real speech.
+        # set_mouth_sequence returns immediately; sleep the queued duration
+        # before restoring the steady busy face, or the restore would
+        # interrupt the in-flight sequence early.
+        #
+        # 2026-07-01: this used to alternate mouth_e/mouth_u (both "up" —
+        # see wheatley_avatar.py's old comment). mouth_u is now a genuine
+        # "look down" cue instead of a second up-glance, so the flutter
+        # alternates mouth_e with mouth_closed instead — still a fluttering
+        # roll-up-and-settle motion, just using only the up slot.
         flutter_steps = [
             {"shape": "e", "duration_ms": 70},
-            {"shape": "u", "duration_ms": 60},
+            {"shape": "closed", "duration_ms": 60},
             {"shape": "e", "duration_ms": 70},
-            {"shape": "u", "duration_ms": 60},
+            {"shape": "closed", "duration_ms": 60},
         ]
         try:
             session.call_tool("set_mouth_sequence", {"steps": flutter_steps})
