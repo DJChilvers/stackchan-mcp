@@ -85,6 +85,20 @@ class EdgeTTSEngine(TTSEngine):
             return self._default_voice_override
         return os.getenv("STACKCHAN_EDGE_TTS_DEFAULT_VOICE") or DEFAULT_EDGE_TTS_VOICE
 
+    @property
+    def default_rate(self) -> str:
+        """edge-tts --rate value (e.g. "+12%"), read lazily like default_voice.
+
+        Lets a character voice (e.g. a chattier, faster-talking persona) be
+        tuned via .env without touching code. "+0%" (engine default) if unset.
+        """
+        return os.getenv("STACKCHAN_EDGE_TTS_RATE") or "+0%"
+
+    @property
+    def default_pitch(self) -> str:
+        """edge-tts --pitch value (e.g. "+8Hz"), read lazily like default_voice."""
+        return os.getenv("STACKCHAN_EDGE_TTS_PITCH") or "+0Hz"
+
     async def synthesize(self, text: str, **opts: Any) -> bytes:
         """Run edge-tts + ffmpeg, return 16 kHz mono signed-16-bit PCM.
 
@@ -114,6 +128,8 @@ class EdgeTTSEngine(TTSEngine):
             proc = await asyncio.create_subprocess_exec(
                 self._edge_tts_binary,
                 "--voice", voice,
+                "--rate", self.default_rate,
+                "--pitch", self.default_pitch,
                 "--text", text,
                 "--write-media", str(mp3_path),
                 stdin=asyncio.subprocess.DEVNULL,

@@ -1,0 +1,46 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py sad busy-start"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py sad busy-continue"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py surprised urgent-say"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:/Users/domin/tools/stackchan-mcp/gateway/.venv/Scripts/python.exe C:/Users/domin/tools/stackchan-hook.py idle"
+          }
+        ]
+      }
+    ]
+  }
+}

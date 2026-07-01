@@ -39,3 +39,4 @@ dist/
 # libopus and this path stays empty. `SOURCES.md` is tracked so the
 # bundling documentation lives alongside the code that consumes it.
 stackchan_mcp/_libs/opus.dll
+opus.dll

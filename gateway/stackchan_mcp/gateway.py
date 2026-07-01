@@ -15,6 +15,7 @@ from aiohttp import web
 from .capture_server import create_capture_app, stage_avatar_set
 from .esp32_client import ESP32Manager
 from .mdns_advertiser import MdnsAdvertiser
+from .sensor_reactor import SensorReactor
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class Gateway:
 
     def __init__(self):
         self.esp32 = ESP32Manager()
+        self.sensor_reactor = SensorReactor(self.esp32)
         self._running = False
         self._http_runner: web.AppRunner | None = None
         # Phase 4.5 avatar: kept so load_avatar_set can stage payloads
@@ -142,6 +144,9 @@ class Gateway:
             audio_hook_token=self.audio_hook_token,
         )
 
+        # Start the sensor reactor as a background async task.
+        await self.sensor_reactor.start()
+
         # Start HTTP capture server. Hosts /capture, /pcm, and the
         # Phase 4.5 avatar /avatar_set/{short_id} endpoint on the same
         # web.Application. The PCM endpoint forwards into
@@ -184,6 +189,8 @@ class Gateway:
             await stop_follow()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("follow_pose_stream shutdown failed: %s", exc)
+
+        await self.sensor_reactor.stop()
 
         self._running = False
         if self._mdns_advertiser:

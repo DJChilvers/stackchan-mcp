@@ -54,6 +54,30 @@ cp .env.example .env       # then edit .env (see below)
 uv sync
 ```
 
+### Windows source checkout: native `opus.dll` for TTS/STT
+
+The bundled `opus.dll` only ships inside the published `*-win_amd64` wheel
+(built by CI via vcpkg). A **source checkout** does not have it, so the
+`[tts]`/`[stt]` extras will install cleanly but fail at runtime with
+`Could not find Opus library` when `opuslib` tries to encode/decode.
+
+Fix it once by placing an x64 `opus.dll` at
+`stackchan_mcp/_libs/opus.dll` — the directory the package registers on the
+Windows DLL search path at import time (see
+[`stackchan_mcp/_libs/SOURCES.md`](stackchan_mcp/_libs/SOURCES.md)).
+
+> Put the DLL in `stackchan_mcp/_libs/`, **not** in `.venv/Scripts/`. The
+> `_libs/` directory is part of the source tree, so it survives `uv sync`
+> and venv rebuilds; anything copied into `.venv/` is silently lost on the
+> next rebuild and TTS/STT breaks again. `opus.dll` at this path is
+> gitignored, so it never sneaks into a commit.
+
+Any of these produces a suitable DLL:
+- `vcpkg install opus:x64-windows`, then copy the built `opus.dll` in
+- download `opus.dll` from a release artifact uploaded by the publish workflow
+- copy the x64 `opus.dll` bundled inside the `pyogg` wheel
+  (`.venv/Lib/site-packages/pyogg/opus.dll`)
+
 Edit `.env`:
 - `STACKCHAN_TOKEN`: Bearer token for ESP32 auth (must match firmware setting)
 - `VISION_URL`: full public capture URL for remote access tunnels, such as

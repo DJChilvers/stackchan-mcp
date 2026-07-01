@@ -427,6 +427,36 @@ async def handle_pcm(request: web.Request) -> web.Response:
     return web.Response(text=json.dumps(result), content_type="application/json")
 
 
+async def handle_react(request: web.Request) -> web.Response:
+    """/react/<behavior>[?direction=left&type=desk] — fire a Wheatley reaction.
+
+    Behaviors: panic, hacker, overtrack, tantrum
+    Query params forwarded to the behavior as kwargs:
+      direction  left|right|up|down   (overtrack)
+      type       desk|pickup           (tantrum)
+
+    Returns 200 {ok, behavior} if accepted, 409 if busy, 503 if no device.
+    """
+    gateway = request.app.get(GATEWAY_KEY)
+    if gateway is None:
+        return web.json_response({"ok": False, "error": "gateway not available"}, status=503)
+
+    behavior = request.match_info.get("behavior", "")
+    if behavior not in {"panic", "hacker", "overtrack", "tantrum"}:
+        return web.json_response({"ok": False, "error": f"unknown behavior: {behavior}"}, status=400)
+
+    kwargs: dict = {}
+    if "direction" in request.rel_url.query:
+        kwargs["direction"] = request.rel_url.query["direction"]
+    if "type" in request.rel_url.query:
+        kwargs["type"] = request.rel_url.query["type"]
+
+    accepted = await gateway.sensor_reactor.trigger(behavior, **kwargs)
+    if not accepted:
+        return web.json_response({"ok": False, "error": "busy"}, status=409)
+    return web.json_response({"ok": True, "behavior": behavior, "kwargs": kwargs})
+
+
 def create_capture_app(
     capture_token: str = "",
     pcm_token: str = "",
@@ -466,4 +496,6 @@ def create_capture_app(
     app.router.add_post("/capture", handle_capture)
     app.router.add_get("/avatar_set/{short_id}", handle_avatar_set_fetch)
     app.router.add_post("/pcm", handle_pcm)
+    app.router.add_post("/react/{behavior}", handle_react)
+    app.router.add_get("/react/{behavior}", handle_react)
     return app

@@ -737,8 +737,80 @@ class ESP32Manager:
                 device_id,
                 len(connection.tools),
             )
+            await self._restore_default_avatar(connection)
         else:
             logger.error("ESP32 MCP initialization failed")
+
+    async def _restore_default_avatar(self, connection: ESP32Connection) -> None:
+        """Re-push the configured default avatar set on every (re)connect.
+
+        The custom avatar lives in device PSRAM (loaded via load_avatar_set
+        over WebSocket) and does NOT survive a power-cycle/reboot — the
+        firmware falls back to its built-in default face until re-pushed.
+        Set STACKCHAN_DEFAULT_AVATAR (and optionally
+        STACKCHAN_DEFAULT_AVATAR_MODE, default "layered") in .env to make
+        this automatic instead of a manual load_avatar_set call.
+
+        Right after a power-cycle the device can take a few seconds before
+        it's actually ready to receive a ~537KB payload — an immediate push
+        can hit "device_timeout", and a same-device flaky double-reconnect
+        (seen after power-cycling) can leave a stale fetch in flight so the
+        next attempt gets "fetch_in_progress". Both are transient, so retry
+        with backoff instead of giving up after one try.
+        """
+        path = os.getenv("STACKCHAN_DEFAULT_AVATAR")
+        if not path:
+            return
+        mode = os.getenv("STACKCHAN_DEFAULT_AVATAR_MODE", "layered")
+        from .gateway import get_gateway
+
+        gw = get_gateway()
+        attempts = 4
+        retry_delay_s = 4.0
+        for attempt in range(1, attempts + 1):
+            if not connection.connected:
+                logger.info(
+                    "Default avatar re-push aborted: device disconnected "
+                    "(attempt %d/%d) — a fresh connect will retry",
+                    attempt,
+                    attempts,
+                )
+                return
+            try:
+                result = await gw.load_avatar_set(path, mode, timeout=20.0)
+            except Exception:
+                logger.exception(
+                    "Failed to re-push default avatar set: %s (attempt %d/%d)",
+                    path,
+                    attempt,
+                    attempts,
+                )
+                result = {"ok": False, "error": "exception"}
+            if result.get("ok"):
+                logger.info(
+                    "Default avatar set re-pushed: %s (%s) [attempt %d/%d]",
+                    path,
+                    mode,
+                    attempt,
+                    attempts,
+                )
+                await connection.call_tool("set_avatar", {"face": "idle"})
+                await connection.call_tool("set_blink", {"enabled": True})
+                return
+            logger.warning(
+                "Failed to re-push default avatar set %s: %s (attempt %d/%d)",
+                path,
+                result.get("error"),
+                attempt,
+                attempts,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(retry_delay_s)
+        logger.error(
+            "Giving up re-pushing default avatar set %s after %d attempts",
+            path,
+            attempts,
+        )
 
     async def _emit_stackchan_event(self, payload: dict[str, Any]) -> None:
         """Forward a firmware-originated stackchan event to the MCP client."""
@@ -747,6 +819,31 @@ class ESP32Manager:
         duration_ms = payload.get("duration_ms")
         ts = payload.get("ts")
         session_id = payload.get("session_id")
+
+        # Route sensor events to the gateway's SensorReactor when the
+        # firmware gains support for streaming IMU/proximity/audio data.
+        # The reactor's trigger() method is non-blocking (fire-and-forget
+        # async task), so it's safe to call here from the WS read loop.
+        if event_type == "proximity":
+            # LTR-553ALS: {"event_type":"proximity","subtype":"near"|"far",...}
+            from .gateway import get_gateway
+            gw = get_gateway()
+            if subtype == "near":
+                asyncio.create_task(gw.sensor_reactor.trigger("panic"))
+            return
+        if event_type == "imu":
+            # BMI270: {"event_type":"imu","subtype":"bump"|"tilt"|"pickup",...}
+            from .gateway import get_gateway
+            gw = get_gateway()
+            bump_type = "pickup" if subtype in {"pickup", "tilt"} else "desk"
+            asyncio.create_task(gw.sensor_reactor.trigger("tantrum", type=bump_type))
+            return
+        if event_type == "audio":
+            # ES7210: {"event_type":"audio","subtype":"loud",...}
+            from .gateway import get_gateway
+            gw = get_gateway()
+            asyncio.create_task(gw.sensor_reactor.trigger("hacker"))
+            return
 
         if event_type != "touch":
             logger.warning("Malformed stackchan-event frame: event_type=%r", event_type)
