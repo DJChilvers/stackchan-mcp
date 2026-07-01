@@ -287,11 +287,31 @@ def _extract_text(content_blocks: list) -> str:
     ).strip()
 
 
+PHOTO_CUE_PHRASES = [
+    "Right, let's have a look, hang on...",
+    "Ooh, let me see — hold that steady...",
+    "Right, activating my one remaining eyeball...",
+]
+
+
 def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
-    """Call the gateway's take_photo tool; return (base64_jpeg, media_type) or None."""
+    """Call the gateway's take_photo tool; return (base64_jpeg, media_type) or None.
+
+    The camera is on the same physical unit as the head/screen, so whatever
+    pose was showing during transcription (the down-left "thinking" squint)
+    is what the camera would otherwise still be pointed at. Snap to a
+    forward-facing pose and speak a short cue first — gives an audible
+    "hold it up now" signal and a beat of time to react. (NOT an LED flash:
+    stackchan-led-chase.py owns the LED ring for the whole voice-thinking
+    window, rendering a rainbow chase — writing LEDs directly here would
+    race it.)
+    """
     try:
         sess = MCPSession(GATEWAY_URL)
         sess.initialize()
+        sess.call_tool("set_avatar", {"face": "idle"})
+        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH})
+        sess.call_tool("say", {"text": random.choice(PHOTO_CUE_PHRASES)}, timeout=15)
         result = sess.call_tool("take_photo", {"question": question}, timeout=20)
         content = ((result or {}).get("result") or {}).get("content", [])
         if not content:
@@ -374,7 +394,15 @@ def _ask_claude(transcript: str) -> str:
 
 
 def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
-    """Runs in a background thread so the HTTP response isn't held up."""
+    """Runs in a background thread so the HTTP response isn't held up.
+
+    NOTE: a tap-free "listen for a follow-up if the reply ends in a
+    question" loop was built and reverted here 2026-07-01 — the gateway's
+    `listen` MCP tool hung indefinitely against the currently-flashed
+    firmware (source supports the wire message, flashed binary predates
+    it). See firmware/TODO.md "Tap-free follow-up listening" — re-add once
+    that's reflashed rather than rebuilding from scratch.
+    """
     _set_thinking_pose()
     _start_thinking_marker()
     tmp_path = None

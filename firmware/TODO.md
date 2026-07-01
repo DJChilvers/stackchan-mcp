@@ -63,3 +63,30 @@ To get "Hey Wheatley" working would need:
 No workaround needed for this one (voice control already works via
 touch-to-talk + the PC-side voice bridge — see [[project_stackchan_voice_bridge]]
 in memory) — this is a nice-to-have, not a bug.
+
+## Tap-free follow-up listening (gateway `listen` MCP tool)
+
+The gateway already exposes a `listen` tool (`stackchan_mcp/stt/orchestrator.py`
++ `stdio_server.py`) meant to put the device into listening mode remotely
+(no physical tap) by sending `{"type":"listen","state":"stop"}` etc. over
+the existing WebSocket — `main/application.cc` (~line 590) confirms this
+wire message IS handled in the current firmware *source*. Tested live
+2026-07-01 against the currently-flashed device: the call hung with zero
+response for the full 25s client timeout — consistent with the same
+source-vs-flashed-binary gap as `set_touch_sensor_enabled` above (the
+running firmware predates this feature).
+
+Wanted for: `stackchan-voice-bridge.py` speaking a reply that ends in "?"
+(e.g. asking the user to clarify a garbled/ambiguous request, including the
+take_photo clarification case) should be able to listen for a spoken
+follow-up immediately rather than requiring another screen tap. The
+voice-bridge-side code for this (conversational multi-turn loop, calls the
+`listen` tool with `language="en"`) was written and then reverted 2026-07-01
+specifically because of this gap — shipping it against the current firmware
+would mean a ~20+ second silent hang after every question-ending reply,
+which is worse than the current tap-required behavior. Once reflashed,
+re-add the follow-up loop (git history has the reverted version) and give
+it a much shorter timeout tuned to `duration_ms` rather than the generous
+one used for testing.
+
+Batch with the other two items above — same rebuild+reflash window.
