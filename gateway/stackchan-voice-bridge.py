@@ -142,7 +142,13 @@ VISION_TOOL = {
 # squint + look down — so listening/thinking reads consistently across both
 # voice and coding-work contexts.
 THINKING_FACE = "sad"
-LOOK_UP_PITCH = 34
+
+# Pitch convention (confirmed live 2026-07-01 by taking photos at various
+# values and checking what's actually in frame): LOW pitch is near-
+# horizontal, pointed at the user/table; HIGH pitch tilts up toward
+# vertical, pointed at the ceiling/sky. 8 is "looking at the user" — do
+# NOT increase this to "look up", that points at the sky instead.
+LOOK_AT_USER_PITCH = 8
 
 # While this marker exists, stackchan-led-chase.py renders a rotating
 # rainbow chase on the LED ring (takes priority over the amber busy chase).
@@ -213,7 +219,7 @@ class MCPSession:
 
 
 def _speak(text: str, face_before: str | None = None) -> None:
-    """Speak text through the gateway, reverting to a relaxed look-up pose."""
+    """Speak text through the gateway, reverting to a relaxed look-at-user pose."""
     try:
         sess = MCPSession(GATEWAY_URL)
         sess.initialize()
@@ -221,7 +227,7 @@ def _speak(text: str, face_before: str | None = None) -> None:
             sess.call_tool("set_avatar", {"face": face_before})
         sess.call_tool("say", {"text": text}, timeout=30)
         sess.call_tool("set_avatar", {"face": "idle"})
-        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH + 6})
+        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH + 6})
     except Exception:
         logger.exception("speak failed")
 
@@ -300,17 +306,35 @@ def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
     The camera is on the same physical unit as the head/screen, so whatever
     pose was showing during transcription (the down-left "thinking" squint)
     is what the camera would otherwise still be pointed at. Snap to a
-    forward-facing pose and speak a short cue first — gives an audible
-    "hold it up now" signal and a beat of time to react. (NOT an LED flash:
-    stackchan-led-chase.py owns the LED ring for the whole voice-thinking
-    window, rendering a rainbow chase — writing LEDs directly here would
-    race it.)
+    straight-ahead/eye-level pose and speak a short cue first — gives an
+    audible "hold it up now" signal and a beat of time to react. (NOT an LED
+    flash: stackchan-led-chase.py owns the LED ring for the whole
+    voice-thinking window, rendering a rainbow chase — writing LEDs
+    directly here would race it.)
+
+    Tilting down for a table/desk shot was tried and dropped 2026-07-01 —
+    at this device's current physical position/mounting, even the servo's
+    minimum pitch only reached chest height, never an actual table surface,
+    so "hold it up in front of the camera" is the only reliable framing
+    right now. Revisit if the device's physical placement changes.
+
+    Pitch convention (see LOOK_AT_USER_PITCH above): LOW pitch is
+    near-horizontal, pointed at the user; HIGH pitch tilts up toward the
+    ceiling/sky.
+
+    Also explicitly re-enables servo torque before moving: the firmware's
+    auto torque-release power-save feature (Issue #152) can silently leave
+    the head "holding via friction" — move_head then reports success and
+    the new angle, but nothing physically moves. Confirmed live 2026-07-01
+    (repeated photos showed the exact same framing across very different
+    reported pitch values) — cheap enough to just always re-assert.
     """
     try:
         sess = MCPSession(GATEWAY_URL)
         sess.initialize()
         sess.call_tool("set_avatar", {"face": "idle"})
-        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH})
+        sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
+        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
         sess.call_tool("say", {"text": random.choice(PHOTO_CUE_PHRASES)}, timeout=15)
         result = sess.call_tool("take_photo", {"question": question}, timeout=20)
         content = ((result or {}).get("result") or {}).get("content", [])
