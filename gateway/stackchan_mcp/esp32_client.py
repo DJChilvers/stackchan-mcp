@@ -737,9 +737,52 @@ class ESP32Manager:
                 device_id,
                 len(connection.tools),
             )
+            await self._disable_auto_torque_release(connection)
             await self._restore_default_avatar(connection)
         else:
             logger.error("ESP32 MCP initialization failed")
+
+    async def _disable_auto_torque_release(self, connection: ESP32Connection) -> None:
+        """Re-engage servo torque and disable firmware idle auto-release on every (re)connect.
+
+        The firmware's idle power-save auto torque release
+        (self.robot.set_auto_torque_release, Issue #152) does not survive
+        a power-cycle or a fresh WebSocket connection — it resets to the
+        firmware default, which auto-releases SCS0009 torque after motion
+        idle. Once torque has released, move_head / set_head_angles calls
+        still report success and get_head_angles still reports the
+        commanded angle, but the servo does not physically move, which
+        looks like unresponsive hardware with no error anywhere. This bit
+        both take_photo (stackchan-voice-bridge.py, previously worked
+        around per-call) and the idle wander/face-tracking loop
+        (stackchan-idle.py, which had no torque handling at all). Doing
+        this here — the same place :meth:`_restore_default_avatar` already
+        re-applies state lost across reconnects — makes the fix durable
+        instead of a manual one-off against the live device.
+        """
+        if not connection.connected:
+            return
+        _, torque_error = await connection.call_tool(
+            "self.robot.set_servo_torque",
+            {"yaw_enabled": True, "pitch_enabled": True},
+        )
+        if torque_error:
+            logger.warning(
+                "Failed to re-engage servo torque on connect: %s", torque_error
+            )
+        _, release_error = await connection.call_tool(
+            "self.robot.set_auto_torque_release",
+            {"enabled": False, "timeout_ms": 600000},
+        )
+        if release_error:
+            logger.warning(
+                "Failed to disable auto torque release on connect: %s",
+                release_error,
+            )
+        else:
+            logger.info(
+                "Auto torque release disabled: device=%s", connection.device_id
+            )
 
     async def _restore_default_avatar(self, connection: ESP32Connection) -> None:
         """Re-push the configured default avatar set on every (re)connect.

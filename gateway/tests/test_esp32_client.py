@@ -726,8 +726,17 @@ def test_connection_default_protocol_version_is_one():
 # ---------------------------------------------------------------------------
 
 
-async def _complete_handshake(ws, tools=None):
-    """Complete the full ESP32 handshake sequence."""
+async def _complete_handshake(ws, tools=None, drain_torque_calls=True):
+    """Complete the full ESP32 handshake sequence.
+
+    ``drain_torque_calls`` receives and acknowledges the two automatic
+    ``self.robot.set_servo_torque`` / ``self.robot.set_auto_torque_release``
+    calls that ``ESP32Manager._disable_auto_torque_release`` fires right
+    after ``tools/list`` on every (re)connect, so callers that read the
+    next message off the wire don't get one of those instead of their own
+    request. Pass ``False`` for tests that want to observe those calls
+    directly.
+    """
     if tools is None:
         tools = []
 
@@ -774,6 +783,20 @@ async def _complete_handshake(ws, tools=None):
         },
     }
     await ws.send(json.dumps(tools_resp))
+
+    if drain_torque_calls:
+        for _ in range(2):
+            req_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+            req_msg = json.loads(req_raw)
+            await ws.send(json.dumps({
+                "session_id": req_msg["session_id"],
+                "type": "mcp",
+                "payload": {
+                    "jsonrpc": "2.0",
+                    "id": req_msg["payload"]["id"],
+                    "result": {"content": [{"type": "text", "text": "true"}], "isError": False},
+                },
+            }))
 
 
 # --- Device-driven listen capture --------------------------------------------
