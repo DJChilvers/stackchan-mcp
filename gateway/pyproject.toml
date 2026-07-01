@@ -95,6 +95,16 @@ stt-openai = [
     "openai>=1.0",
 ]
 
+# Local, offline face-aware vision loop (stackchan-vision-loop.py) — see
+# docs/intent for the design writeup. opencv-python-headless ships YuNet
+# (face detection) and SFace (recognition/embeddings) in mainline cv2
+# (objdetect module), no opencv-contrib needed. Kept as its own extra so
+# the base install (and other extras) don't pull in an ~40MB wheel that
+# most deployments won't use.
+vision = [
+    "opencv-python-headless>=4.9",
+]
+
 [project.urls]
 Homepage = "https://github.com/kisaragi-mochi/stackchan-mcp"
 Repository = "https://github.com/kisaragi-mochi/stackchan-mcp"

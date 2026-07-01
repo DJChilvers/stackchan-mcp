@@ -31,6 +31,7 @@ added.
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -107,6 +108,35 @@ TRANSCRIBE_FAIL_PHRASES = [
     "Sorry, didn't quite catch that one.",
     "Hmm, couldn't make that out, try again?",
 ]
+CAMERA_FAIL_PHRASES = [
+    "Tried to have a look, but the camera's not cooperating. Typical.",
+    "Wanted to peek, but nothing came through from the camera. Sorry.",
+]
+
+# Given to Claude as an on-request tool — Claude decides whether a question
+# actually needs vision (per user preference: no manual keyword gate). Only
+# fires when Claude asks for it, so a plain spoken question costs exactly one
+# API call same as before; a "look at this" question costs two.
+VISION_TOOL = {
+    "name": "take_photo",
+    "description": (
+        "Capture a photo from StackChan's camera to see what's physically in "
+        "front of it right now. Use only when seeing would clearly help "
+        "answer — e.g. the user asks you to look at something, describe "
+        "what's on the desk, read something out, or similar. Don't use it "
+        "for questions that don't need vision."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "What you want to know from the photo.",
+            }
+        },
+        "required": ["question"],
+    },
+}
 
 # Reuse the same "concentrating" face/pose as the Claude Code busy hook —
 # squint + look down — so listening/thinking reads consistently across both
@@ -228,20 +258,18 @@ def _transcribe(ogg_path: str) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-def _ask_claude(transcript: str) -> str:
-    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
-    if not api_key:
-        return random.choice(NO_KEY_PHRASES)
-
-    body = json.dumps({
+def _call_claude_api(messages: list, api_key: str, tools: list | None = None) -> dict:
+    payload = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 300,
         "system": SYSTEM_PROMPT,
-        "messages": [{"role": "user", "content": transcript}],
-    }).encode()
+        "messages": messages,
+    }
+    if tools:
+        payload["tools"] = tools
     req = urllib.request.Request(
         ANTHROPIC_URL,
-        data=body,
+        data=json.dumps(payload).encode(),
         headers={
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
@@ -249,12 +277,47 @@ def _ask_claude(transcript: str) -> str:
         },
         method="POST",
     )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _extract_text(content_blocks: list) -> str:
+    return " ".join(
+        b.get("text", "") for b in content_blocks if b.get("type") == "text"
+    ).strip()
+
+
+def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
+    """Call the gateway's take_photo tool; return (base64_jpeg, media_type) or None."""
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-        parts = data.get("content", [])
-        text = " ".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
-        return text or "Er, got an empty answer back. Not sure what happened there."
+        sess = MCPSession(GATEWAY_URL)
+        sess.initialize()
+        result = sess.call_tool("take_photo", {"question": question}, timeout=20)
+        content = ((result or {}).get("result") or {}).get("content", [])
+        if not content:
+            logger.warning("take_photo returned no content: %r", result)
+            return None
+        info = json.loads(content[0].get("text", "") or "{}")
+        image_path = info.get("image_path")
+        if not image_path or not os.path.exists(image_path):
+            logger.warning("take_photo result missing image_path: %r", info)
+            return None
+        with open(image_path, "rb") as f:
+            data = f.read()
+        return base64.b64encode(data).decode("ascii"), "image/jpeg"
+    except Exception:
+        logger.exception("take_photo via MCP failed")
+        return None
+
+
+def _ask_claude(transcript: str) -> str:
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        return random.choice(NO_KEY_PHRASES)
+
+    messages = [{"role": "user", "content": transcript}]
+    try:
+        data = _call_claude_api(messages, api_key, tools=[VISION_TOOL])
     except urllib.error.HTTPError as exc:
         body_snippet = exc.read().decode(errors="replace")[:300]
         logger.warning("Claude API HTTP error %s: %s", exc.code, body_snippet)
@@ -262,6 +325,52 @@ def _ask_claude(transcript: str) -> str:
     except Exception:
         logger.exception("Claude API call failed")
         return "Couldn't reach Claude just now. Network's playing up, probably."
+
+    content = data.get("content", [])
+
+    # Claude decided it needs to look — round-trip through the camera once,
+    # then let it finish answering with the photo in hand. One photo per
+    # turn is enough for a spoken exchange; no further tool-use loop.
+    if data.get("stop_reason") == "tool_use":
+        tool_use = next((b for b in content if b.get("type") == "tool_use"), None)
+        if tool_use is not None:
+            question = (tool_use.get("input") or {}).get("question") or "What do you see?"
+            logger.info("Claude requested take_photo(question=%r)", question)
+            photo = _take_photo_via_mcp(question)
+            if photo is None:
+                tool_result_content = [
+                    {"type": "text", "text": "Camera unavailable right now."}
+                ]
+            else:
+                b64_data, media_type = photo
+                tool_result_content = [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64", "media_type": media_type, "data": b64_data,
+                    },
+                }]
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.get("id"),
+                    "content": tool_result_content,
+                }],
+            })
+            try:
+                data = _call_claude_api(messages, api_key)
+                content = data.get("content", [])
+            except urllib.error.HTTPError as exc:
+                body_snippet = exc.read().decode(errors="replace")[:300]
+                logger.warning("Claude API HTTP error %s: %s", exc.code, body_snippet)
+                return random.choice(CAMERA_FAIL_PHRASES)
+            except Exception:
+                logger.exception("Claude API follow-up call failed")
+                return random.choice(CAMERA_FAIL_PHRASES)
+
+    text = _extract_text(content)
+    return text or "Er, got an empty answer back. Not sure what happened there."
 
 
 def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:

@@ -430,10 +430,11 @@ async def handle_pcm(request: web.Request) -> web.Response:
 async def handle_react(request: web.Request) -> web.Response:
     """/react/<behavior>[?direction=left&type=desk] — fire a Wheatley reaction.
 
-    Behaviors: panic, hacker, overtrack, tantrum
+    Behaviors: panic, hacker, overtrack, tantrum, recognize
     Query params forwarded to the behavior as kwargs:
       direction  left|right|up|down   (overtrack)
       type       desk|pickup           (tantrum)
+      person     known|unknown         (recognize)
 
     Returns 200 {ok, behavior} if accepted, 409 if busy, 503 if no device.
     """
@@ -442,7 +443,7 @@ async def handle_react(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "gateway not available"}, status=503)
 
     behavior = request.match_info.get("behavior", "")
-    if behavior not in {"panic", "hacker", "overtrack", "tantrum"}:
+    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize"}:
         return web.json_response({"ok": False, "error": f"unknown behavior: {behavior}"}, status=400)
 
     kwargs: dict = {}
@@ -450,6 +451,8 @@ async def handle_react(request: web.Request) -> web.Response:
         kwargs["direction"] = request.rel_url.query["direction"]
     if "type" in request.rel_url.query:
         kwargs["type"] = request.rel_url.query["type"]
+    if "person" in request.rel_url.query:
+        kwargs["person"] = request.rel_url.query["person"]
 
     accepted = await gateway.sensor_reactor.trigger(behavior, **kwargs)
     if not accepted:

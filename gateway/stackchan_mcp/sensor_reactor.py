@@ -12,6 +12,7 @@ device sensors directly and fires characterful head/avatar reactions.
     hacker        loud ambient sound
     overtrack     camera over-correction (query ?direction=left|right|up|down)
     tantrum       bump/pickup       (query ?type=desk|pickup)
+    recognize     stackchan-vision-loop.py spotted a face (query ?person=known|unknown)
 
   FUTURE FIRMWARE EVENTS (when firmware exposes them via stackchan-event):
     event_type="proximity" → panic
@@ -229,6 +230,15 @@ class SensorReactor:
              "speed_dps": _SPD[speed]},
         )
 
+    async def _leds(self, r: int, g: int, b: int) -> None:
+        # NOTE: "self.robot.set_led_color" (from stackchan_mcp/tools.py's
+        # local test-stub registry) does not exist on the live firmware —
+        # verified 2026-07-01 against the connected device's actual tool
+        # list. The real tool is self.led.set_all (12-LED base ring).
+        await self._esp32.call_tool(
+            "self.led.set_all", {"r": r, "g": g, "b": b}
+        )
+
     async def _run(self, name: str, **kwargs: object) -> None:
         """Acquire the behaviour lock and run the named sequence."""
         async with self._behavior_lock:
@@ -389,3 +399,38 @@ class SensorReactor:
         # Settle back to completely normal idle
         await self._face("idle")
         await self._move(0, 45, "slow")
+
+    # ── 5. Face Recognized (local vision loop, no API cost) ───────────────
+    async def _behavior_recognize(self, person: str = "unknown", **_: object) -> None:
+        """stackchan-vision-loop.py spotted a face via fully-local detection.
+
+        Deliberately small/quiet compared to the other behaviours — this can
+        fire from an ambient polling loop rather than a deliberate touch/bump,
+        so it should read as "noticed", not "startled".
+        """
+        if person == "known":
+            # Eyes lead: brief warm look, soft green flash, small nod.
+            await self._face("happy")
+            await asyncio.sleep(EYE_LEAD)
+            await self._leds(0, 60, 20)
+            await self._move(0, 40, "mid")
+            await asyncio.sleep(0.22)
+            await self._move(0, 46, "mid")
+            await asyncio.sleep(0.35)
+            await self._face("idle")
+            # Matches stackchan-hook.py's IDLE_LED so the ring doesn't stay
+            # stuck on the acknowledgement colour.
+            await self._leds(0, 25, 90)
+            await self._move(0, 45, "slow")
+        else:
+            # Curious little side-to-side glance toward the unfamiliar face —
+            # wary, not alarmed (that's `panic`, a much bigger reaction).
+            await self._face("thinking")
+            await asyncio.sleep(EYE_LEAD)
+            await self._move(-6, 40, "mid")
+            await asyncio.sleep(0.3)
+            _mark_active()
+            await self._move(6, 40, "mid")
+            await asyncio.sleep(0.3)
+            await self._face("idle")
+            await self._move(0, 45, "slow")
