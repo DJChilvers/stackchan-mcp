@@ -21,7 +21,7 @@ def test_tools_list() -> None:
     names = [t["name"] for t in tools]
     assert "self.robot.get_head_angles" in names
     assert "self.robot.set_head_angles" in names
-    assert "self.robot.set_led_color" in names
+    assert "self.led.set_all" in names
     assert "self.audio_speaker.set_volume" in names
     assert "self.camera.take_photo" in names
     assert "self.get_device_status" in names
@@ -79,7 +79,7 @@ def test_set_led_color() -> None:
             "id": 6,
             "method": "tools/call",
             "params": {
-                "name": "self.robot.set_led_color",
+                "name": "self.led.set_all",
                 "arguments": {"r": 255, "g": 128, "b": 0},
             },
         }

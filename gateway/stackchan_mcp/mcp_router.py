@@ -60,12 +60,16 @@ def _get_tool_handlers() -> dict[str, Any]:
     global _TOOL_HANDLERS
     if _TOOL_HANDLERS is None:
         from .handlers.audio import set_volume
-        from .handlers.robot import get_head_angles, set_head_angles, set_led_color
+        from .handlers.led import clear, set_all, set_color, set_many
+        from .handlers.robot import get_head_angles, set_head_angles
 
         _TOOL_HANDLERS = {
             "self.robot.get_head_angles": get_head_angles,
             "self.robot.set_head_angles": set_head_angles,
-            "self.robot.set_led_color": set_led_color,
+            "self.led.set_color": set_color,
+            "self.led.set_all": set_all,
+            "self.led.set_many": set_many,
+            "self.led.clear": clear,
             "self.audio_speaker.set_volume": set_volume,
         }
     return _TOOL_HANDLERS

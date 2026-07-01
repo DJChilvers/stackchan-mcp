@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ..tools import SetHeadAnglesParams, SetLedColorParams
+from ..tools import SetHeadAnglesParams
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _head_angles: dict[str, int] = {"yaw": 0, "pitch": 0}
-_led_color: dict[str, int] = {"r": 0, "g": 0, "b": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -34,19 +33,9 @@ def set_head_angles(args: dict[str, Any]) -> bool:
     _head_angles["yaw"] = params.yaw
     _head_angles["pitch"] = params.pitch
     logger.info(
-        "set_head_angles yaw=%d pitch=%d speed=%d",
+        "set_head_angles yaw=%d pitch=%d speed_dps=%d",
         params.yaw,
         params.pitch,
-        params.speed,
+        params.speed_dps,
     )
-    return True
-
-
-def set_led_color(args: dict[str, Any]) -> bool:
-    """Set LED color (in-memory stub)."""
-    params = SetLedColorParams(**args)
-    _led_color["r"] = params.r
-    _led_color["g"] = params.g
-    _led_color["b"] = params.b
-    logger.info("set_led_color r=%d g=%d b=%d", params.r, params.g, params.b)
     return True

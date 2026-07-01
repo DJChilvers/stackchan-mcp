@@ -17,19 +17,38 @@ from pydantic import BaseModel, Field
 
 
 class SetHeadAnglesParams(BaseModel):
-    yaw: int = Field(description="Yaw angle in degrees")
-    pitch: int = Field(description="Pitch angle in degrees")
-    speed: int = Field(default=50, description="Movement speed (1-100)")
+    yaw: int = Field(default=0, ge=-90, le=90, description="Yaw angle in degrees (-90 to 90)")
+    pitch: int = Field(default=0, description="Pitch angle in degrees (clamped in firmware)")
+    speed_dps: int = Field(
+        default=0, description="Angular speed in degrees per second (0 = firmware default duration)"
+    )
 
 
-class SetLedColorParams(BaseModel):
+class SetVolumeParams(BaseModel):
+    volume: int = Field(ge=0, le=100, description="Volume level (0-100)")
+
+
+class TakePhotoParams(BaseModel):
+    question: str = Field(description="Question to ask about the captured photo")
+
+
+class LedSetColorParams(BaseModel):
+    index: int = Field(ge=0, le=11, description="LED index (0-11)")
     r: int = Field(ge=0, le=255, description="Red (0-255)")
     g: int = Field(ge=0, le=255, description="Green (0-255)")
     b: int = Field(ge=0, le=255, description="Blue (0-255)")
 
 
-class SetVolumeParams(BaseModel):
-    volume: int = Field(ge=0, le=100, description="Volume level (0-100)")
+class LedSetAllParams(BaseModel):
+    r: int = Field(ge=0, le=255, description="Red (0-255)")
+    g: int = Field(ge=0, le=255, description="Green (0-255)")
+    b: int = Field(ge=0, le=255, description="Blue (0-255)")
+
+
+class LedSetManyParams(BaseModel):
+    colors: str = Field(
+        description="JSON-encoded array of up to 12 [r,g,b] triples starting at index 0"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -52,9 +71,28 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "inputSchema": SetHeadAnglesParams.model_json_schema(),
     },
     {
-        "name": "self.robot.set_led_color",
-        "description": "Set LED color (RGB).",
-        "inputSchema": SetLedColorParams.model_json_schema(),
+        "name": "self.led.set_color",
+        "description": "Set a single RGB LED on the StackChan base (index 0-11).",
+        "inputSchema": LedSetColorParams.model_json_schema(),
+    },
+    {
+        "name": "self.led.set_all",
+        "description": "Set all 12 RGB LEDs on the StackChan base to the same color.",
+        "inputSchema": LedSetAllParams.model_json_schema(),
+    },
+    {
+        "name": "self.led.set_many",
+        "description": "Set multiple RGB LEDs in one shot from a JSON-encoded array of [r,g,b] triples.",
+        "inputSchema": LedSetManyParams.model_json_schema(),
+    },
+    {
+        "name": "self.led.clear",
+        "description": "Turn off all 12 RGB LEDs on the StackChan base.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
     },
     {
         "name": "self.audio_speaker.set_volume",
@@ -63,12 +101,8 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "self.camera.take_photo",
-        "description": "Take a photo with the device camera. Returns JPEG image.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-        },
+        "description": "Take a photo with the device camera and ask a question about it.",
+        "inputSchema": TakePhotoParams.model_json_schema(),
     },
     {
         "name": "self.get_device_status",
