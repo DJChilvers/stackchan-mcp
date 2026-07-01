@@ -13,12 +13,26 @@ counterpart to the on-request camera tool wired into stackchan-voice-bridge.py
 — that one costs a Claude API call because Claude decided to look; this one
 costs nothing per tick because it never leaves the LAN.
 
+PURE PERCEPTION, NO SERVO CONTROL (changed 2026-07-01): this script does
+NOT call move_head. It writes what it sees (face offset/identity, motion)
+to a shared JSON state file (VISION_STATE_PATH) every tick; stackchan-
+idle.py reads that file and does all the actual head movement (tracking,
+searching when no face has been seen in a while, glancing toward motion).
+Earlier this script drove the servo directly, which raced the sensor-
+reaction system's own head movement (confirmed live: tracking lost the
+face mid-loop right as a greeting reaction's nod animation was playing).
+Routing all movement through idle.py — which already respects the busy/
+activity markers that a reaction sets — removes the race structurally
+instead of papering over it with more ordering/locking here.
+
 "Teaching" a face:
     python stackchan-vision-loop.py --enroll "Dominic"
 Captures a few samples of whoever is in front of the camera, computes SFace
 embeddings, and stores them (averaged over however many samples exist so
 far) in known_faces.json next to this script. Re-running --enroll for the
-same name adds more samples rather than replacing them.
+same name adds more samples rather than replacing them. Also invoked as a
+subprocess by stackchan-voice-bridge.py to complete the "ask an unknown
+face's name" flow — see PENDING_ENROLLMENT_MARKER below.
 
 Run:  python stackchan-vision-loop.py            (loop forever)
       python stackchan-vision-loop.py --once      (one tick then exit)
@@ -89,9 +103,30 @@ KNOWN_FACES_PATH = os.environ.get(
 # SFace's documented default cosine-similarity threshold for "same person".
 MATCH_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MATCH_THRESHOLD", "0.363"))
 POLL_INTERVAL_S = float(os.environ.get("STACKCHAN_VISION_POLL_INTERVAL_S", "8"))
-# Debounce: don't re-fire a reaction for the same identity more often than
-# this, so someone sitting in view doesn't trigger it every tick.
-COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_COOLDOWN_S", "300"))
+# Debounce: don't re-fire the greet/notice reaction for the same identity
+# more often than this. 1 hour by default (user: "repeat if it hasn't seen
+# me for more than one hour") — long enough that sitting at the desk all
+# day only gets one welcome-back, short enough to re-greet after a real
+# absence (lunch, overnight, etc.).
+COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_COOLDOWN_S", str(60 * 60)))
+
+# Written every tick — stackchan-idle.py reads this to decide whether to
+# track a face, search for one, or glance toward motion. See the module
+# docstring for why movement lives there and not here.
+VISION_STATE_PATH = os.path.join(TEMP, "stackchan-vision-state.json")
+
+# Motion detection: cheap frame-differencing (grayscale, downscaled, mean
+# absolute difference) — no extra model needed. Only meaningful as a signal
+# when no face is in frame (a face already gives idle.py plenty to work
+# with); mainly for "something moved, glance over" when nobody recognizable
+# is currently visible.
+MOTION_DIFF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MOTION_THRESHOLD", "12.0"))
+
+# Set when an unrecognized face triggers the "who are you?" prompt (see
+# sensor_reactor.py's _behavior_recognize unknown branch); stackchan-voice-
+# bridge.py checks this to know a tap-to-answer transcript is probably a
+# name introduction rather than a normal question.
+PENDING_ENROLLMENT_MARKER = os.path.join(TEMP, "stackchan-pending-enrollment")
 
 # Shared with the idle loop / led-chase / voice bridge — skip a tick rather
 # than fight Claude Code's active work or an in-progress voice exchange.
@@ -206,6 +241,50 @@ def _fire_reaction(person: str) -> None:
         logger.exception("react/recognize?person=%s failed", person)
 
 
+def _write_vision_state(
+    face_visible: bool, person: str | None, name: str | None,
+    dx: float, dy: float, motion_detected: bool,
+) -> None:
+    state = {
+        "ts": time.time(),
+        "face_visible": face_visible,
+        "person": person,
+        "name": name,
+        "dx": dx,
+        "dy": dy,
+        "motion_detected": motion_detected,
+    }
+    try:
+        tmp = VISION_STATE_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, VISION_STATE_PATH)
+    except Exception:
+        logger.exception("failed to write vision state")
+
+
+def _write_pending_enrollment_marker() -> None:
+    try:
+        with open(PENDING_ENROLLMENT_MARKER, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _small_gray(img):
+    import cv2
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (80, 60))
+
+
+def _motion_score(prev_small, cur_small) -> float:
+    import numpy as np
+    if prev_small is None:
+        return 0.0
+    diff = np.abs(cur_small.astype(np.int16) - prev_small.astype(np.int16))
+    return float(diff.mean())
+
+
 # ─── face detection / recognition ──────────────────────────────────────────
 
 def _load_detector():
@@ -267,7 +346,16 @@ def _best_match(recognizer, embedding, known: dict) -> tuple[str | None, float]:
 
 # ─── main polling loop ──────────────────────────────────────────────────────
 
-def _tick(detector, recognizer, sess: MCPSession, known: dict, last_reaction_ts: dict) -> None:
+def _tick(
+    detector, recognizer, sess: MCPSession, known: dict,
+    last_reaction_ts: dict, prev_small_box: list,
+) -> None:
+    """One perception step: capture, detect/classify, write state, maybe react.
+
+    No servo calls here — see module docstring. `prev_small_box` is a
+    single-element list used as a mutable "out param" so motion-diff has
+    the previous tick's downscaled frame to compare against.
+    """
     import cv2
 
     path = _take_photo(sess, "ambient scan")
@@ -284,10 +372,30 @@ def _tick(detector, recognizer, sess: MCPSession, known: dict, last_reaction_ts:
         logger.warning("could not decode captured image at %s", path)
         return
 
+    small = _small_gray(img)
+    motion_score = _motion_score(prev_small_box[0], small)
+    prev_small_box[0] = small
+    motion_detected = motion_score > MOTION_DIFF_THRESHOLD
+
     face = _detect_largest_face(detector, img)
     if face is None:
-        logger.info("tick: no face in frame")
+        logger.info(
+            "tick: no face in frame%s", " (motion detected)" if motion_detected else ""
+        )
+        _write_vision_state(False, None, None, 0.0, 0.0, motion_detected)
         return
+
+    frame_h, frame_w = img.shape[:2]
+    fx = face[0] + face[2] / 2
+    fy = face[1] + face[3] / 2
+    # face[] is a numpy row (float32) — cast to native float, or json.dump
+    # in _write_vision_state throws "Object of type float32 is not JSON
+    # serializable" on every tick a face IS detected (confirmed live
+    # 2026-07-01: this silently broke tracking entirely, since the crash
+    # happened before _fire_reaction too — vision-state.json never updated
+    # past face_visible=false, so idle.py had nothing to track).
+    dx = float((fx - frame_w / 2) / (frame_w / 2))
+    dy = float((fy - frame_h / 2) / (frame_h / 2))
 
     embedding = _embed_face(recognizer, img, face)
     name, score = _best_match(recognizer, embedding, known)
@@ -297,19 +405,22 @@ def _tick(detector, recognizer, sess: MCPSession, known: dict, last_reaction_ts:
     else:
         person, key = "unknown", "unknown"
 
-    now = time.time()
-    if now - last_reaction_ts.get(key, 0.0) < COOLDOWN_S:
-        return
-    last_reaction_ts[key] = now
+    _write_vision_state(True, person, name if person == "known" else None, dx, dy, False)
 
-    logger.info("face detected: person=%s key=%s score=%.3f", person, key, score)
-    _fire_reaction(person)
+    now = time.time()
+    if now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S:
+        last_reaction_ts[key] = now
+        logger.info("face detected: person=%s key=%s score=%.3f", person, key, score)
+        _fire_reaction(person)
+        if person == "unknown":
+            _write_pending_enrollment_marker()
 
 
 def _loop(once: bool) -> None:
     detector = _load_detector()
     recognizer = _load_recognizer()
     last_reaction_ts: dict = {}
+    prev_small_box: list = [None]
     logger.info(
         "starting vision loop (poll=%.0fs cooldown=%.0fs threshold=%.3f)",
         POLL_INTERVAL_S, COOLDOWN_S, MATCH_THRESHOLD,
@@ -327,7 +438,7 @@ def _loop(once: bool) -> None:
         sess = MCPSession(GATEWAY_MCP)
         try:
             sess.initialize()
-            _tick(detector, recognizer, sess, known, last_reaction_ts)
+            _tick(detector, recognizer, sess, known, last_reaction_ts, prev_small_box)
         except Exception:
             logger.exception("tick failed")
         if once:

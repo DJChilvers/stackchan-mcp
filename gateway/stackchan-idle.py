@@ -94,6 +94,20 @@ YAW_MIN, YAW_MAX = -24, 24
 PITCH_MIN, PITCH_MAX = 28, 46
 NEUTRAL_YAW, NEUTRAL_PITCH = 0, 36
 
+# ── vision-driven behaviour tuning ──────────────────────────────────────────
+# Tracking stays within the same gentle YAW/PITCH range as everything else
+# above — this is ambient character, not a camera gimbal; a face far enough
+# off-center that tracking can't reach it is what the (wider-range) search
+# sweep is for.
+TRACK_PROB = 0.7          # of ticks where a face IS visible, fraction spent tracking vs. a normal vignette
+TRACK_YAW_GAIN = 14.0
+TRACK_PITCH_GAIN = 10.0
+TRACK_MAX_STEP = 6
+NOTICE_MOTION_PROB = 0.35  # of ticks with motion but no face, fraction that glance toward it
+SEARCH_AFTER_S = 25.0      # no face seen for this long before a search sweep becomes eligible
+SEARCH_PROB = 0.5          # of eligible ticks, fraction that actually sweep (avoid searching every single tick)
+SEARCH_YAW_POINTS = [-50, -25, 25, 50, 0]  # wider than the idle range — genuinely "looking around"
+
 
 class MCPSession:
     def __init__(self, url):
@@ -176,6 +190,30 @@ def needs_attention() -> bool:
         return (time.time() - float(d.get("ts", 0))) < NEEDS_ATTENTION_STALE_S
     except Exception:
         return False
+
+
+# ── vision integration (2026-07-01) ─────────────────────────────────────────
+# stackchan-vision-loop.py is a PURE PERCEPTION service — it captures/
+# detects/recognizes faces and writes what it sees here, but does NOT move
+# the servo itself (that used to race this script's own movement and the
+# sensor-reaction system's movement; see stackchan-vision-loop.py's module
+# docstring). This is the only place that actually calls move_head, so
+# there's one authority for the servo, not three.
+VISION_STATE_PATH = os.path.join(_TEMP, "stackchan-vision-state.json")
+# A bit under 2x the vision loop's own ~8s poll interval, so one slightly
+# late tick doesn't make state look stale.
+VISION_STATE_STALE_S = 15.0
+
+
+def read_vision_state() -> dict | None:
+    try:
+        with open(VISION_STATE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+        if time.time() - float(state.get("ts", 0)) > VISION_STATE_STALE_S:
+            return None
+        return state
+    except Exception:
+        return None
 
 
 def _clamp(v, lo, hi):
@@ -349,6 +387,64 @@ def _v_big_examine(session, pose):
     return pose
 
 
+# ── vision-driven vignettes (2026-07-01) ────────────────────────────────────
+# These read stackchan-vision-loop.py's state file rather than the camera
+# directly (idle.py has no cv2/camera code of its own — see that script's
+# module docstring for why movement was consolidated here). Not in the
+# VIGNETTES weighted-random pool below — wander() picks these explicitly
+# based on vision state, falling back to VIGNETTES otherwise.
+
+def _v_track_face(session, pose, vision_state):
+    """Nudge toward centering the last-seen face. Small proportional steps,
+    clamped to the same gentle range as everything else — this is ambient
+    attention, not a camera gimbal snapping to target."""
+    dx = vision_state.get("dx", 0.0) or 0.0
+    dy = vision_state.get("dy", 0.0) or 0.0
+    # Pitch convention (2026-07-01, confirmed live): HIGHER pitch = look UP,
+    # LOWER = look DOWN. A face in the upper half of frame (dy negative)
+    # needs MORE pitch to center it, hence the negation below.
+    yaw_delta = _clamp(dx * TRACK_YAW_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP)
+    pitch_delta = _clamp(-dy * TRACK_PITCH_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP)
+    ny = _clamp(pose["y"] + yaw_delta, YAW_MIN, YAW_MAX)
+    np_ = _clamp(pose["p"] + pitch_delta, PITCH_MIN, PITCH_MAX)
+    session.move(ny, np_)
+    pose.update(y=ny, p=np_)
+    return pose
+
+
+def _v_search_sweep(session, pose):
+    """Actively look for a face — wider excursions than normal wander,
+    framed as "searching" rather than ambient character motion. No camera
+    feedback mid-sweep (idle.py doesn't see frames); it just sweeps and
+    lets the next vision-loop tick (~8s cadence, independent of this) report
+    back whether it found anyone."""
+    _face(session, EXAMINE)
+    ny, np_ = pose["y"], pose["p"]
+    for yaw in SEARCH_YAW_POINTS:
+        ny = _clamp(yaw, -60, 60)
+        session.move(ny, NEUTRAL_PITCH)
+        time.sleep(random.uniform(0.5, 0.8))
+    np_ = NEUTRAL_PITCH
+    _face(session, REST)
+    pose.update(y=ny, p=np_)
+    return pose
+
+
+def _v_notice_motion(session, pose):
+    """Curious glance when motion was detected but no recognizable face —
+    frame-diff motion detection has no location, so this is a generic
+    "huh, something's there" beat, not a targeted look."""
+    dy_ = random.choice([-1, 1]) * random.randint(10, 20)
+    ny = _clamp(pose["y"] + dy_, YAW_MIN, YAW_MAX)
+    _face(session, LOOK_RIGHT if dy_ > 0 else LOOK_LEFT)
+    time.sleep(EYE_LEAD)
+    session.move(ny, pose["p"])
+    time.sleep(random.uniform(0.4, 0.7))
+    _face(session, REST)
+    pose.update(y=ny)
+    return pose
+
+
 # (function, weight) — weights are relative, don't need to sum to 1.
 VIGNETTES = [
     (_v_nudge,            0.25),
@@ -362,7 +458,13 @@ VIGNETTES = [
 def wander(session, pose):
     """Pick a small, differently-shaped idle gesture each time — never the
     same vignette twice in a row, no forced alternation or stickiness beyond
-    that. Between gestures he just dwells with tiny settle moves."""
+    that. Between gestures he just dwells with tiny settle moves.
+
+    Vision state (see read_vision_state()) takes priority when relevant: a
+    visible face mostly gets tracked, motion-without-a-face sometimes gets
+    a curious glance, and a long face-less stretch occasionally gets a
+    search sweep. Otherwise falls back to the original random vignette
+    pool, unchanged."""
     dwell = pose.get("dwell", 0)
 
     # ── still settled: tiny in-place jiggle only, no face change ────────────
@@ -374,6 +476,32 @@ def wander(session, pose):
             session.move(ny, np_)
             pose.update(y=ny, p=np_)
         return pose
+
+    # ── vision-driven choice, before falling back to random wander ─────────
+    vs = read_vision_state()
+    now = time.time()
+
+    if vs and vs.get("face_visible"):
+        pose["last_face_seen_ts"] = now
+        if random.random() < TRACK_PROB:
+            pose = _v_track_face(session, pose, vs)
+            pose["last_vignette"] = _v_track_face
+            pose["dwell"] = random.randint(1, 2)  # shorter — keep tracking responsive
+            return pose
+    elif vs and vs.get("motion_detected"):
+        if random.random() < NOTICE_MOTION_PROB:
+            pose = _v_notice_motion(session, pose)
+            pose["last_vignette"] = _v_notice_motion
+            pose["dwell"] = random.randint(2, 4)
+            return pose
+    else:
+        last_seen = pose.get("last_face_seen_ts", now)
+        if now - last_seen > SEARCH_AFTER_S and random.random() < SEARCH_PROB:
+            pose = _v_search_sweep(session, pose)
+            pose["last_vignette"] = _v_search_sweep
+            pose["dwell"] = random.randint(4, 8)
+            pose["last_face_seen_ts"] = now  # don't sweep again immediately
+            return pose
 
     last = pose.get("last_vignette")
     choices = [(f, w) for f, w in VIGNETTES if f is not last] or VIGNETTES
@@ -390,7 +518,10 @@ def main():
     _acquire_lock()
     once = "--once" in sys.argv
     session = MCPSession(GATEWAY_MCP)
-    pose = {"y": NEUTRAL_YAW, "p": NEUTRAL_PITCH, "side": random.choice([-1, 1]), "dwell": 0}
+    pose = {
+        "y": NEUTRAL_YAW, "p": NEUTRAL_PITCH, "side": random.choice([-1, 1]),
+        "dwell": 0, "last_face_seen_ts": time.time(),
+    }
     have_session = False
 
     while True:

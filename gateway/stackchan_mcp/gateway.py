@@ -31,7 +31,10 @@ class Gateway:
 
     def __init__(self):
         self.esp32 = ESP32Manager()
-        self.sensor_reactor = SensorReactor(self.esp32)
+        # gateway=self so SensorReactor can speak via synthesize_and_send
+        # (same TTS path as the `say` MCP tool) for reactions like the
+        # face-recognition greeting.
+        self.sensor_reactor = SensorReactor(self.esp32, gateway=self)
         self._running = False
         self._http_runner: web.AppRunner | None = None
         # Phase 4.5 avatar: kept so load_avatar_set can stage payloads

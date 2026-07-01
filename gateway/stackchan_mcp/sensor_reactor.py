@@ -80,8 +80,12 @@ class SensorReactor:
     start()/stop() with the gateway lifecycle.
     """
 
-    def __init__(self, esp32: object) -> None:
+    def __init__(self, esp32: object, gateway: object | None = None) -> None:
         self._esp32 = esp32
+        # Optional: needed only for behaviours that speak (e.g. the
+        # face-recognition greeting). None is fine for callers/tests that
+        # only exercise movement/LED behaviours.
+        self._gateway = gateway
         self._task: asyncio.Task | None = None
         self._behavior_lock = asyncio.Lock()
         self._running = False
@@ -238,6 +242,23 @@ class SensorReactor:
         await self._esp32.call_tool(
             "self.led.set_all", {"r": r, "g": g, "b": b}
         )
+
+    async def _say(self, text: str) -> None:
+        """Speak via the same TTS path as the `say` MCP tool.
+
+        Lazy import: synthesize_and_send pulls in the TTS stack (edge-tts/
+        opuslib etc., the `[tts]` extra), same reasoning as the lazy import
+        in capture_server.py's /pcm handler — behaviours that don't speak
+        (panic, overtrack, tantrum, hacker) shouldn't require it.
+        """
+        if self._gateway is None:
+            logger.warning("SensorReactor: no gateway ref, cannot speak %r", text)
+            return
+        try:
+            from .tts import synthesize_and_send
+            await synthesize_and_send({"text": text}, gateway=self._gateway)
+        except Exception as exc:
+            logger.warning("SensorReactor: speak failed: %s", exc)
 
     async def _run(self, name: str, **kwargs: object) -> None:
         """Acquire the behaviour lock and run the named sequence."""
@@ -400,6 +421,24 @@ class SensorReactor:
         await self._face("idle")
         await self._move(0, 45, "slow")
 
+    # Wheatley-flavoured welcome-back lines — fired on a "known" recognition
+    # that's cleared the (long) re-greet cooldown in stackchan-vision-loop.py
+    # (default 1 hour, so this doesn't repeat every few minutes of sitting
+    # at the desk, only after a genuine absence).
+    GREETING_PHRASES = [
+        "Oh, look who's back — are we fixing this code or what?",
+        "Ah, there you are! Good, good. Thought you'd abandoned me to the void.",
+        "Oh, it's you. Brilliant. Right, where were we?",
+    ]
+
+    # Fired for an unrecognized face. Tells them how to actually answer
+    # (tap the screen) since there's no hands-free listening yet.
+    ASK_NAME_PHRASES = [
+        "Oh, hello! Don't think we've met. Tap the screen and tell me your name?",
+        "Ah, someone new! Go on then, tap the screen, who are you?",
+        "Right, I don't recognize you — tap the screen and introduce yourself?",
+    ]
+
     # ── 5. Face Recognized (local vision loop, no API cost) ───────────────
     async def _behavior_recognize(self, person: str = "unknown", **_: object) -> None:
         """stackchan-vision-loop.py spotted a face via fully-local detection.
@@ -417,6 +456,7 @@ class SensorReactor:
             await asyncio.sleep(0.22)
             await self._move(0, 46, "mid")
             await asyncio.sleep(0.35)
+            await self._say(random.choice(self.GREETING_PHRASES))
             await self._face("idle")
             # Matches stackchan-hook.py's IDLE_LED so the ring doesn't stay
             # stuck on the acknowledgement colour.
@@ -424,7 +464,14 @@ class SensorReactor:
             await self._move(0, 45, "slow")
         else:
             # Curious little side-to-side glance toward the unfamiliar face —
-            # wary, not alarmed (that's `panic`, a much bigger reaction).
+            # wary, not alarmed (that's `panic`, a much bigger reaction) —
+            # then ask who they are. Tap-to-answer, not hands-free: the
+            # gateway's `listen` tool (remote mic capture) hangs against the
+            # currently-flashed firmware (see firmware/TODO.md), so this
+            # directs them to the touch-to-talk flow instead. stackchan-
+            # voice-bridge.py checks PENDING_ENROLLMENT_MARKER (written by
+            # stackchan-vision-loop.py right before firing this reaction) to
+            # know the next tap-to-talk transcript is probably a name.
             await self._face("thinking")
             await asyncio.sleep(EYE_LEAD)
             await self._move(-6, 40, "mid")
@@ -432,5 +479,6 @@ class SensorReactor:
             _mark_active()
             await self._move(6, 40, "mid")
             await asyncio.sleep(0.3)
+            await self._say(random.choice(self.ASK_NAME_PHRASES))
             await self._face("idle")
             await self._move(0, 45, "slow")

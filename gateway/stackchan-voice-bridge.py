@@ -36,6 +36,9 @@ import json
 import logging
 import os
 import random
+import re
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -172,6 +175,99 @@ def _clear_thinking_marker() -> None:
         os.remove(VOICE_THINKING_MARKER)
     except OSError:
         pass
+
+
+def _marker_active(path: str, stale_s: float) -> bool:
+    """Same staleness-checking pattern as stackchan-vision-loop.py/led-chase.py."""
+    try:
+        with open(path) as f:
+            written_at = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    if time.time() - written_at > stale_s:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+# Written by stackchan-vision-loop.py right before it speaks "who are you?"
+# to an unrecognized face (see sensor_reactor.py's _behavior_recognize).
+# Give the person a couple of minutes to notice and tap-to-answer.
+PENDING_ENROLLMENT_MARKER = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-pending-enrollment"
+)
+PENDING_ENROLLMENT_STALE_S = 120
+
+ENROLL_CONFIRM_PHRASES = [
+    "Nice to meet you, {name}! I'll remember you.",
+    "{name}, got it. Pleasure — I think.",
+    "Right, {name}. Filed away. Try not to make me regret it.",
+]
+ENROLL_FAIL_PHRASES = [
+    "Hmm, didn't quite catch a name there, and I couldn't get a clean look "
+    "at your face either. We'll try that again another time.",
+]
+
+_NAME_PATTERNS = [
+    re.compile(
+        r"\b(?:i'?m|i am|my name'?s|my name is|it'?s|call me|this is)\s+"
+        r"([a-zA-Z][a-zA-Z'\-]*)",
+        re.IGNORECASE,
+    ),
+]
+# Guards the short-transcript fallback below against filler/garbled
+# transcriptions being mistaken for a name (e.g. "uh what").
+_NAME_FILLER_WORDS = {
+    "uh", "um", "er", "hmm", "huh", "what", "hello", "hi", "hey",
+    "yes", "no", "okay", "ok", "sorry", "sure", "yeah", "nope",
+}
+
+
+def _extract_name(transcript: str) -> str | None:
+    """Best-effort name extraction from a tap-to-talk answer to "who are you?".
+
+    Tries a few common introduction phrasings first ("I'm X", "my name is
+    X"...); falls back to the raw transcript if it's short and looks like
+    just a name (1-3 alphabetic words) — good enough for this UX, same
+    tolerance-for-garble model as the rest of voice interaction here (if it
+    misfires, the person can just try again).
+    """
+    for pat in _NAME_PATTERNS:
+        m = pat.search(transcript)
+        if m:
+            return m.group(1).strip().capitalize()
+    words = transcript.strip().split()
+    if (
+        1 <= len(words) <= 3
+        and all(w.isalpha() for w in words)
+        and not any(w.lower() in _NAME_FILLER_WORDS for w in words)
+    ):
+        return " ".join(w.capitalize() for w in words)
+    return None
+
+
+def _complete_enrollment(name: str) -> bool:
+    """Shell out to stackchan-vision-loop.py --enroll rather than duplicating
+    its cv2 face-embedding logic here (voice-bridge has no cv2 dependency
+    otherwise, and this reuses the already-tested enrollment path exactly).
+    """
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stackchan-vision-loop.py")
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path, "--enroll", name, "--samples", "3", "--interval", "1.5"],
+            capture_output=True, text=True, timeout=60,
+        )
+        logger.info(
+            "enrollment subprocess name=%r exit=%s stdout=%r",
+            name, result.returncode, result.stdout[-500:],
+        )
+        return result.returncode == 0 and "Enrolled" in result.stdout
+    except Exception:
+        logger.exception("enrollment subprocess failed")
+        return False
 
 
 class MCPSession:
@@ -445,6 +541,25 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
         if not transcript or len(transcript) < 2:
             _clear_thinking_marker()
             _speak(random.choice(TRANSCRIBE_FAIL_PHRASES))
+            return
+
+        # An unrecognized face was just asked "who are you?" (see
+        # sensor_reactor.py's _behavior_recognize) — this tap-to-talk
+        # answer is almost certainly a name introduction, not a normal
+        # question. Handle it as enrollment instead of the usual Q&A path.
+        if _marker_active(PENDING_ENROLLMENT_MARKER, PENDING_ENROLLMENT_STALE_S):
+            try:
+                os.remove(PENDING_ENROLLMENT_MARKER)
+            except OSError:
+                pass
+            name = _extract_name(transcript)
+            logger.info("session=%s enrollment attempt, transcript=%r name=%r", session_id, transcript, name)
+            enrolled = _complete_enrollment(name) if name else False
+            _clear_thinking_marker()
+            if name and enrolled:
+                _speak(random.choice(ENROLL_CONFIRM_PHRASES).format(name=name))
+            else:
+                _speak(random.choice(ENROLL_FAIL_PHRASES))
             return
 
         t1 = time.time()
