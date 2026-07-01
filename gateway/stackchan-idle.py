@@ -16,6 +16,7 @@ Run:  python stackchan-idle.py            (loop forever)
 Stop: just kill the process.
 """
 from __future__ import annotations
+import glob
 import json
 import os
 import random
@@ -55,15 +56,23 @@ ACTIVITY_FILE = os.path.join(
 # during any single LONG tool call (e.g. a multi-minute background agent) —
 # no hook fires again until it finishes, so after IDLE_THRESHOLD_S wander
 # resumed even while the amber busy-chase LED was still legitimately showing
-# (user reported movement happening "in amber light"). BUSY_MARKER is set for
-# the whole turn regardless of how long any single tool call takes, so check
-# it too. Staleness fallback mirrors stackchan-led-chase.py's BUSY_STALE_S so
-# a marker orphaned by a crash (skips Python's finally) can't freeze wander
-# forever.
-BUSY_MARKER = os.path.join(
-    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-busy"
-)
+# (user reported movement happening "in amber light"). The busy marker is set
+# for the whole turn regardless of how long any single tool call takes, so
+# check it too. Staleness fallback mirrors stackchan-led-chase.py's
+# BUSY_STALE_S so a marker orphaned by a crash (skips Python's finally) can't
+# freeze wander forever.
+#
+# Later the same day: the busy marker became per-session (stackchan-busy-
+# <session_id>) so multiple Claude Code sessions sharing this device don't
+# clear each other's busy state — glob for any of them here rather than one
+# fixed filename. Also hold still while a needs-attention marker is active
+# (someone's waiting on the user) so wander doesn't visually compete with
+# that priority signal — see stackchan-hook.py / stackchan-led-chase.py.
+_TEMP = os.environ.get("TEMP", os.environ.get("TMP", "."))
+BUSY_MARKER_GLOB = os.path.join(_TEMP, "stackchan-busy-*")
+NEEDS_ATTENTION_MARKER = os.path.join(_TEMP, "stackchan-needs-attention")
 BUSY_STALE_S = 30 * 60
+NEEDS_ATTENTION_STALE_S = 60 * 60
 
 # Hold still until this many seconds have passed with no hook activity.
 IDLE_THRESHOLD_S = 8.0
@@ -145,12 +154,24 @@ def seconds_since_activity() -> float:
 
 
 def is_busy() -> bool:
+    for path in glob.glob(BUSY_MARKER_GLOB):
+        try:
+            with open(path) as f:
+                age = time.time() - float(f.read().strip())
+            if age < BUSY_STALE_S:
+                return True
+        except Exception:
+            continue
+    return False  # no active marker for any session => not busy
+
+
+def needs_attention() -> bool:
     try:
-        with open(BUSY_MARKER) as f:
-            age = time.time() - float(f.read().strip())
-        return age < BUSY_STALE_S
+        with open(NEEDS_ATTENTION_MARKER, encoding="utf-8") as f:
+            d = json.load(f)
+        return (time.time() - float(d.get("ts", 0))) < NEEDS_ATTENTION_STALE_S
     except Exception:
-        return False  # no marker => not busy
+        return False
 
 
 def _clamp(v, lo, hi):
@@ -254,7 +275,11 @@ def _v_diagonal_peek(session, pose):
     ny  = _clamp(pose["y"] + dy, YAW_MIN, YAW_MAX)
     np_ = _clamp(pose["p"] + dp, PITCH_MIN, PITCH_MAX)
     add_up = random.random() < 0.5
-    _face(session, LOOK_LEFT if dy > 0 else LOOK_RIGHT)
+    # 2026-07-01: reverted the earlier same-day LOOK_LEFT/RIGHT swap here —
+    # that swap was masking a real horizontal-sign bug in wheatley_avatar.py
+    # (confirmed via an eye-only live test), now fixed at the source. This
+    # naive pairing (positive yaw delta -> look right) is correct again.
+    _face(session, LOOK_RIGHT if dy > 0 else LOOK_LEFT)
     if add_up:
         _mouth(session, MOUTH_UP)
     time.sleep(EYE_LEAD)
@@ -292,7 +317,8 @@ def _v_big_examine(session, pose):
     side = random.choice([-1, 1])
     ty  = side * random.randint(9, abs(YAW_MAX))
     tp_ = random.randint(PITCH_MIN, PITCH_MAX)
-    _face(session, LOOK_LEFT if side > 0 else LOOK_RIGHT)
+    # 2026-07-01: reverted same-day LOOK_LEFT/RIGHT swap — see _v_diagonal_peek.
+    _face(session, LOOK_RIGHT if side > 0 else LOOK_LEFT)
     time.sleep(EYE_LEAD)
     session.move(ty, tp_)
     time.sleep(random.uniform(0.30, 0.50))
@@ -368,10 +394,13 @@ def main():
             time.sleep(10)
             continue
 
-        # Stay still while Claude is actively working / speaking — either
-        # recent hook activity, OR a still-active busy marker (covers long
-        # single tool calls where no hook fires again until it finishes).
-        if not once and (seconds_since_activity() < IDLE_THRESHOLD_S or is_busy()):
+        # Stay still while Claude is actively working/speaking (recent hook
+        # activity, or a still-active busy marker for any session — covers
+        # long single tool calls where no hook fires again until it
+        # finishes), or while a needs-attention signal is outstanding (don't
+        # visually compete with that priority alert — see stackchan-hook.py).
+        if not once and (seconds_since_activity() < IDLE_THRESHOLD_S
+                          or is_busy() or needs_attention()):
             continue
 
         if not once and random.random() > GLANCE_PROB:

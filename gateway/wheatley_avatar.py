@@ -236,7 +236,16 @@ def render_combo(face: str, eyes: str, mouth: str) -> Image.Image:
     e = EYES_SPECS[eyes]
     m = MOUTH_SPECS[mouth]
 
-    ox = f["ox"] + m["ox"]
+    # Horizontal sign is negated here — confirmed 2026-07-01 via an
+    # eye-only (no head movement) live test that FACE_SPECS's "thinking"
+    # (ox negative) rendered on the VIEWER'S right, not left. The spec
+    # values below are unchanged/self-consistent; only the direction they
+    # map to on screen was backwards. Vertical (oy) was confirmed correct
+    # by the same test (mouth_e rendered up, as intended) so it is NOT
+    # negated. Do not also compensate for this in wander()'s LOOK_LEFT/
+    # LOOK_RIGHT pairing — that earlier swap was masking this same bug
+    # and must be reverted now that the root cause is fixed here instead.
+    ox = -(f["ox"] + m["ox"])
     oy = GLOBAL_OY_BIAS + m["oy"]
     scale = f["scale"] * m["scale_mult"]
     bright = f["bright"] * m["bright_mult"]

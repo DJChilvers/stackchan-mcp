@@ -21,7 +21,7 @@ Usage: python stackchan-hook.py <default_face> [mode]
                      busy/done chatter.
     say-done      -> speak a short, randomly-chosen completion phrase aloud
                      (used by the Stop hook, which has no message to read);
-                     also clears the busy-turn marker.
+                     also clears this session's busy-turn marker.
 
 Reads Claude Code hook data from stdin, detects errors, posts the right
 expression to the stackchan-mcp daemon at http://127.0.0.1:8767/mcp.
@@ -29,6 +29,15 @@ expression to the stackchan-mcp daemon at http://127.0.0.1:8767/mcp.
 The daemon's MCP endpoint is stateful Streamable HTTP, so each call here does
 a full mini-handshake (initialize -> notifications/initialized -> tools/call)
 using a fresh session, then lets the session expire.
+
+MULTI-SESSION NOTE (2026-07-01): multiple Claude Code sessions/projects can
+share this one physical device and hook script. The busy marker is scoped
+per session_id (stackchan-busy-<id>) so one session finishing its turn can't
+wrongly clear another session's still-active busy state — earlier this was
+a single shared file and any session's say-done erased everyone's busy
+indicator. There's also a stackchan-needs-attention marker (see below) that
+gives "needs you" priority over any session's busy state, instead of
+whichever hook fires last silently overwriting the other's signal.
 """
 import sys
 import os
@@ -39,13 +48,12 @@ import traceback
 import urllib.request
 
 GATEWAY_URL = "http://127.0.0.1:8767/mcp"
+TEMP = os.environ.get("TEMP", os.environ.get("TMP", "."))
 
 # This script previously swallowed every exception silently with no record of
 # what mode/payload it ran with — made it impossible to tell why a given
 # notification did (or didn't) speak. Append-only log, one line per event.
-HOOK_LOG = os.path.join(
-    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-hook.log"
-)
+HOOK_LOG = os.path.join(TEMP, "stackchan-hook.log")
 
 
 def _log(line: str) -> None:
@@ -55,23 +63,54 @@ def _log(line: str) -> None:
     except Exception:
         pass
 
+
 # Mark "activity now" so the ambient idle-fidget loop (stackchan-idle.py)
 # holds still while Claude is actively working / speaking.
-ACTIVITY_FILE = os.path.join(
-    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-activity"
-)
+ACTIVITY_FILE = os.path.join(TEMP, "stackchan-activity")
 try:
     with open(ACTIVITY_FILE, "w") as _af:
         _af.write(str(time.time()))
 except Exception:
     pass
+
 face = sys.argv[1] if len(sys.argv) > 1 else "neutral"
 mode = sys.argv[2] if len(sys.argv) > 2 else None
 should_say = mode in ("say-done", "say-on-error", "urgent-say", "busy-start")
 
-BUSY_MARKER = os.path.join(
-    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-busy"
-)
+# ── read + parse stdin ONCE, early — session_id/cwd/project must be known
+# BEFORE the busy-marker logic below runs, since the marker is now per-session
+# (see module docstring). Previously this parsing happened after that logic,
+# which was fine when the marker was a single global file. ─────────────────
+data = {}
+error_detected = False
+try:
+    raw = sys.stdin.read().lstrip("﻿")
+    _log(f"invoked mode={mode} face={face} raw_len={len(raw)} raw_preview={raw[:300]!r}")
+    if raw.strip():
+        data = json.loads(raw)
+    else:
+        _log("stdin was empty/whitespace-only — nothing to parse")
+except Exception:
+    _log("EXCEPTION parsing stdin:\n" + traceback.format_exc())
+
+session_id = data.get("session_id") or "unknown-session"
+_cwd = (data.get("cwd") or "").rstrip("/\\")
+project = os.path.basename(_cwd) if _cwd else "a project"
+
+message_to_say = None
+skip_avatar = False
+
+# Detect tool errors in PostToolUse
+resp = data.get("tool_response", {})
+if isinstance(resp, dict) and resp.get("is_error"):
+    error_detected = True
+elif isinstance(resp, list):
+    for item in resp:
+        if isinstance(item, dict) and item.get("is_error"):
+            error_detected = True
+            break
+
+BUSY_MARKER = os.path.join(TEMP, f"stackchan-busy-{session_id}")
 
 # Rate-limit the urgent head-wobble + red-blink flourish — user reported it's
 # annoying when several Notifications fire close together while they're
@@ -79,9 +118,7 @@ BUSY_MARKER = os.path.join(
 # motion is what's distracting; the SPOKEN message is what's actually useful
 # ("what does he want"), so only the wobble/blink gets throttled — speech
 # still fires on every notification, unconditionally, below.
-URGENT_MARKER = os.path.join(
-    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-urgent-last"
-)
+URGENT_MARKER = os.path.join(TEMP, "stackchan-urgent-last")
 URGENT_COOLDOWN_S = 30.0
 
 
@@ -100,6 +137,38 @@ def _mark_urgent_flourish() -> None:
             _f.write(str(time.time()))
     except Exception:
         pass
+
+
+# ── "needs attention" priority marker ───────────────────────────────────────
+# One session finishing (say-done) or going busy (busy-start) must NOT be
+# able to silently erase another session's still-outstanding "I need you"
+# signal — that was possible when everything shared one busy marker and the
+# LED chase just watched it. This is a single marker (not per-session: only
+# one physical LED, so "someone needs you" is the signal, not which one —
+# the SPOKEN message already names the project). stackchan-led-chase.py gives
+# this priority over any busy chase. Cleared only when the SAME session_id
+# that raised it fires busy-start or say-done again — i.e. once the user has
+# actually gone back and engaged with that session.
+NEEDS_ATTENTION_MARKER = os.path.join(TEMP, "stackchan-needs-attention")
+
+
+def _write_needs_attention(sid: str, proj: str) -> None:
+    try:
+        with open(NEEDS_ATTENTION_MARKER, "w", encoding="utf-8") as _f:
+            json.dump({"session_id": sid, "project": proj, "ts": time.time()}, _f)
+    except Exception:
+        pass
+
+
+def _clear_needs_attention_if_mine(sid: str) -> None:
+    try:
+        with open(NEEDS_ATTENTION_MARKER, encoding="utf-8") as _f:
+            d = json.load(_f)
+        if d.get("session_id") == sid:
+            os.remove(NEEDS_ATTENTION_MARKER)
+    except Exception:
+        pass
+
 
 # Short, varied phrases for the Stop hook so it doesn't feel robotic.
 DONE_PHRASES = [
@@ -148,19 +217,25 @@ EASTER_EGG_PHRASES = [
 ]
 EASTER_EGG_PROB = 0.15
 
-message_to_say = None
-skip_avatar = False
-error_detected = False
+if error_detected:
+    face = "surprised"   # centered wide-eyed alarm
+    skip_avatar = False
+    if mode == "say-on-error":
+        message_to_say = random.choice(ERROR_PHRASES)
 
 if mode == "say-done":
     if random.random() < EASTER_EGG_PROB:
         message_to_say = random.choice(EASTER_EGG_PHRASES)
     else:
-        message_to_say = random.choice(DONE_PHRASES)
+        # Name the project — multiple sessions can share this device, so
+        # without an identifier there's no way to tell which one just
+        # finished (mirrors the same fix already applied to urgent-say).
+        message_to_say = f"{random.choice(DONE_PHRASES)} This is {project}."
     try:
         os.remove(BUSY_MARKER)
     except OSError:
         pass
+    _clear_needs_attention_if_mine(session_id)
 
 if mode == "busy-start":
     if os.path.exists(BUSY_MARKER):
@@ -172,6 +247,7 @@ if mode == "busy-start":
                 _bf.write(str(time.time()))
         except Exception:
             pass
+    _clear_needs_attention_if_mine(session_id)
 
 if mode == "busy-continue":
     # Success case: leave whatever face is already showing (the busy face
@@ -179,42 +255,18 @@ if mode == "busy-continue":
     # that per-call flicker was the original problem with always-on hooks.
     skip_avatar = True
 
-try:
-    raw = sys.stdin.read().lstrip("﻿")
-    _log(f"invoked mode={mode} face={face} raw_len={len(raw)} raw_preview={raw[:300]!r}")
-    if raw.strip():
-        data = json.loads(raw)
-        # Detect tool errors in PostToolUse
-        resp = data.get("tool_response", {})
-        if isinstance(resp, dict) and resp.get("is_error"):
-            error_detected = True
-        elif isinstance(resp, list):
-            for item in resp:
-                if isinstance(item, dict) and item.get("is_error"):
-                    error_detected = True
-                    break
-        if error_detected:
-            face = "surprised"   # centered wide-eyed alarm
-            skip_avatar = False
-            if mode == "say-on-error":
-                message_to_say = random.choice(ERROR_PHRASES)
-        # Extract Notification message for speech. Multiple Claude Code
-        # sessions/projects can share this one physical hook, so without an
-        # identifier the user has no way to tell which one is calling —
-        # cwd is present on every Notification payload, so name the project.
-        if mode == "urgent-say":
-            raw_message = (data.get("message") or "").strip()
-            cwd = (data.get("cwd") or "").rstrip("/\\")
-            project = os.path.basename(cwd) if cwd else "a project"
-            prefix = random.choice(URGENT_PHRASES)
-            message_to_say = f"{prefix} This is {project}. {raw_message}".strip()
-            if len(message_to_say) > 200:
-                message_to_say = message_to_say[:197] + "..."
-            _log(f"urgent-say parsed: project={project!r} message_to_say={message_to_say!r}")
-    else:
-        _log("stdin was empty/whitespace-only — nothing to parse")
-except Exception:
-    _log("EXCEPTION parsing stdin:\n" + traceback.format_exc())
+# Extract Notification message for speech. Multiple Claude Code
+# sessions/projects can share this one physical hook, so without an
+# identifier the user has no way to tell which one is calling —
+# cwd is present on every Notification payload, so name the project.
+if mode == "urgent-say":
+    raw_message = (data.get("message") or "").strip()
+    prefix = random.choice(URGENT_PHRASES)
+    message_to_say = f"{prefix} This is {project}. {raw_message}".strip()
+    if len(message_to_say) > 200:
+        message_to_say = message_to_say[:197] + "..."
+    _log(f"urgent-say parsed: project={project!r} message_to_say={message_to_say!r}")
+    _write_needs_attention(session_id, project)
 
 
 class MCPSession:
@@ -384,9 +436,10 @@ try:
         run_head_moves(session, face)
     # Note: the busy LED itself (amber Cylon-style chase) is owned by the
     # separate stackchan-led-chase.py background loop, which watches for
-    # BUSY_MARKER and animates continuously — that supersedes any static/
-    # blip LED set from this script while a turn is in progress. This hook
-    # only writes/clears the marker (above) and renders face/head/eye.
+    # any stackchan-busy-* marker and animates continuously — that
+    # supersedes any static/blip LED set from this script while a turn is
+    # in progress. This hook only writes/clears the marker (above) and
+    # renders face/head/eye.
     if mode == "busy-continue" and not error_detected:
         # Eye does a fast upward flutter into the top lid on each completed
         # tool call ("Neo learning kung fu" download-look) via
@@ -431,7 +484,10 @@ try:
             # do not revert to idle blue here. A notification means work is
             # genuinely paused waiting on the user; reverting to "calm" would
             # misrepresent "still waiting on you" as "all clear". Stays red
-            # until the next busy-start/say-done changes it.
+            # until the SAME session's next busy-start/say-done clears the
+            # needs-attention marker (see _clear_needs_attention_if_mine) —
+            # NOT superseded by some other session going busy in the
+            # meantime, since stackchan-led-chase.py now gives this priority.
             for _ in range(3):
                 _set_leds(session, URGENT_LED)
                 time.sleep(0.18)

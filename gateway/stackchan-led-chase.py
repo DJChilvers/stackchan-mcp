@@ -2,24 +2,40 @@
 """
 stackchan-led-chase.py — animated LED status chase for the 12-LED base ring.
 
-Watches two marker files written elsewhere:
-    %TEMP%\\stackchan-busy            -> stackchan-hook.py (busy-start writes,
-                                          say-done removes)            -> amber chase
-    %TEMP%\\stackchan-voice-thinking  -> stackchan-voice-bridge.py (set while
-                                          transcribing + asking Claude) -> rainbow chase
+Watches marker files written elsewhere:
+    %TEMP%\\stackchan-busy-<session_id>  -> stackchan-hook.py (busy-start
+                                             writes, say-done removes,
+                                             one file per Claude Code
+                                             session)                  -> amber chase
+    %TEMP%\\stackchan-voice-thinking     -> stackchan-voice-bridge.py (set
+                                             while transcribing + asking
+                                             Claude)                    -> rainbow chase
+    %TEMP%\\stackchan-needs-attention    -> stackchan-hook.py (urgent-say
+                                             writes, cleared by the SAME
+                                             session's next busy-start/
+                                             say-done)                  -> priority red pulse
 
-While NEITHER marker exists, this script does nothing — it leaves the LEDs
-exactly as stackchan-hook.py's static idle-blue / urgent-red left them. It
-only takes over rendering while one of the two markers is present, and stops
-writing the instant it disappears (the owning script is responsible for
-setting the final static color, e.g. say-done sets idle blue).
+needs-attention takes PRIORITY over busy/thinking — 2026-07-01: with multiple
+Claude Code sessions able to share one device, a session finishing or going
+busy must not be able to silently erase another session's still-outstanding
+"I need you" signal. Busy is now tracked per-session (glob stackchan-busy-*)
+so one session's say-done can't wrongly clear a DIFFERENT session's busy
+marker either.
+
+While NONE of these are active, this script does nothing — it leaves the
+LEDs exactly as stackchan-hook.py's static idle-blue / urgent-red left them.
+It only takes over rendering while one is present, and stops writing the
+instant it disappears (the owning script is responsible for setting the
+final static color, e.g. say-done sets idle blue).
 
 Run via stackchan-led-chase-start.vbs (hidden pythonw, same pattern as the
 ambient idle-fidget loop). Single-instance locked.
 """
 from __future__ import annotations
 import colorsys
+import glob
 import json
+import math
 import os
 import sys
 import time
@@ -49,8 +65,9 @@ atexit.register(lambda: _lock_fh.close() if _lock_fh else None)
 
 GATEWAY_HTTP = "http://127.0.0.1:8767"
 GATEWAY_MCP = GATEWAY_HTTP + "/mcp"
-BUSY_MARKER = os.path.join(TEMP, "stackchan-busy")
+BUSY_MARKER_GLOB = os.path.join(TEMP, "stackchan-busy-*")
 VOICE_THINKING_MARKER = os.path.join(TEMP, "stackchan-voice-thinking")
+NEEDS_ATTENTION_MARKER = os.path.join(TEMP, "stackchan-needs-attention")
 
 # A crashed owner process (e.g. a native segfault in the voice bridge's
 # Whisper call) skips its own Python `finally` cleanup entirely, so the
@@ -58,8 +75,11 @@ VOICE_THINKING_MARKER = os.path.join(TEMP, "stackchan-voice-thinking")
 # forever. Treat a marker older than its threshold as abandoned and ignore
 # (and delete) it. Busy gets a generous window since long Claude Code turns
 # are normal; voice interactions should always finish in well under a minute.
+# Needs-attention gets the longest window — it's meant to persist until the
+# user actually deals with it, but must still self-heal if orphaned.
 BUSY_STALE_S = 30 * 60
 THINKING_STALE_S = 90
+NEEDS_ATTENTION_STALE_S = 60 * 60
 
 NUM_LEDS = 12
 STEP_S = 0.12  # ~8 fps — smooth enough for a chase, light on the WS link
@@ -74,6 +94,33 @@ def _marker_active(path: str, stale_s: float) -> bool:
     if time.time() - written_at > stale_s:
         try:
             os.remove(path)  # self-heal: don't keep re-checking a dead marker
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def _any_busy() -> bool:
+    """True if ANY Claude Code session has an active (non-stale) busy
+    marker. One marker file per session_id — see module docstring."""
+    any_active = False
+    for path in glob.glob(BUSY_MARKER_GLOB):
+        if _marker_active(path, BUSY_STALE_S):
+            any_active = True
+        # _marker_active already self-heals (deletes) stale ones as it goes
+    return any_active
+
+
+def _needs_attention_active() -> bool:
+    try:
+        with open(NEEDS_ATTENTION_MARKER, encoding="utf-8") as f:
+            d = json.load(f)
+        written_at = float(d.get("ts", 0))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if time.time() - written_at > NEEDS_ATTENTION_STALE_S:
+        try:
+            os.remove(NEEDS_ATTENTION_MARKER)
         except OSError:
             pass
         return False
@@ -147,19 +194,33 @@ def rainbow_chase_frame(base_hue_deg: float) -> list[list[int]]:
     return colors
 
 
+def attention_pulse_frame(phase: float) -> list[list[int]]:
+    """Full ring, gentle red breathing pulse — deliberately NOT a chase
+    (chase motion reads as "busy/active"; a slow breathing pulse reads as
+    "waiting, come deal with me"). phase 0..1 maps to one full breath."""
+    level = 0.35 + 0.65 * (0.5 - 0.5 * math.cos(phase * 2 * math.pi))
+    r = int(255 * level)
+    return [[r, 0, 0] for _ in range(NUM_LEDS)]
+
+
 def main():
     _acquire_lock()
     session = MCPSession(GATEWAY_MCP)
     have_session = False
     pos = 0
     hue = 0.0
+    pulse_phase = 0.0
 
     while True:
         time.sleep(STEP_S)
 
-        busy = _marker_active(BUSY_MARKER, BUSY_STALE_S)
+        # Priority order: needs-attention > voice-thinking > busy. A session
+        # going busy or another session's chase must not be able to bury the
+        # "someone needs you" signal — see module docstring.
+        attention = _needs_attention_active()
         thinking = _marker_active(VOICE_THINKING_MARKER, THINKING_STALE_S)
-        if not (busy or thinking):
+        busy = _any_busy()
+        if not (attention or thinking or busy):
             have_session = False  # drop session while idle; re-init on resume
             continue
 
@@ -171,7 +232,10 @@ def main():
             if not have_session:
                 session.init()
                 have_session = True
-            if thinking:
+            if attention:
+                pulse_phase = (pulse_phase + STEP_S / 2.2) % 1.0  # ~2.2s per breath
+                session.set_leds(attention_pulse_frame(pulse_phase))
+            elif thinking:
                 hue = (hue + 30) % 360
                 session.set_leds(rainbow_chase_frame(hue))
             else:
