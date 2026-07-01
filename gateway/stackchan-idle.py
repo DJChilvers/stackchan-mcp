@@ -3,9 +3,18 @@
 
 Runs continuously in the background and gives StackChan small, gentle head
 glances when it is TRULY idle — making Wheatley feel alive at rest. It holds
-perfectly still while Claude is actively working or speaking (detected via the
-activity-timestamp file that stackchan-hook.py touches on every event), and
-only fidgets after a quiet stretch.
+perfectly still right after real hook activity or a needs-attention alert
+(detected via marker files stackchan-hook.py touches), and only fidgets
+after a quiet stretch.
+
+2026-07-01: a long-running BUSY session (e.g. a background task) no longer
+freezes movement solid for its whole duration — user feedback: sitting
+rigid in the concentrating squint for minutes on a background task read as
+"boring and static," especially once face-tracking existed to do something
+with. While busy, wander() still moves (tracks a visible face, or a small
+generic drift) but skips anything that would change the face away from the
+busy-squint stackchan-hook.py/sensor_reactor already set — see the `busy`
+param on wander() below.
 
 Design goals: tasteful, not twitchy. Small angles near neutral, long randomized
 gaps, no large rapid reversals (the firmware dislikes those), auto-pause during
@@ -455,7 +464,7 @@ VIGNETTES = [
 ]
 
 
-def wander(session, pose):
+def wander(session, pose, busy=False):
     """Pick a small, differently-shaped idle gesture each time — never the
     same vignette twice in a row, no forced alternation or stickiness beyond
     that. Between gestures he just dwells with tiny settle moves.
@@ -464,7 +473,15 @@ def wander(session, pose):
     visible face mostly gets tracked, motion-without-a-face sometimes gets
     a curious glance, and a long face-less stretch occasionally gets a
     search sweep. Otherwise falls back to the original random vignette
-    pool, unchanged."""
+    pool, unchanged.
+
+    `busy=True` (a long-running session, e.g. a background task, per
+    stackchan-hook.py's per-session busy marker) restricts this to
+    movement that never touches the face: _v_track_face is pure movement
+    already, so tracking a visible face still happens; everything else
+    that changes expression (search sweep, notice-motion, the whole
+    VIGNETTES pool) is skipped in favour of a small generic drift, so the
+    busy-squint face stays visible and uncontested."""
     dwell = pose.get("dwell", 0)
 
     # ── still settled: tiny in-place jiggle only, no face change ────────────
@@ -484,17 +501,17 @@ def wander(session, pose):
     if vs and vs.get("face_visible"):
         pose["last_face_seen_ts"] = now
         if random.random() < TRACK_PROB:
-            pose = _v_track_face(session, pose, vs)
+            pose = _v_track_face(session, pose, vs)  # pure movement, safe while busy
             pose["last_vignette"] = _v_track_face
             pose["dwell"] = random.randint(1, 2)  # shorter — keep tracking responsive
             return pose
-    elif vs and vs.get("motion_detected"):
+    elif not busy and vs and vs.get("motion_detected"):
         if random.random() < NOTICE_MOTION_PROB:
             pose = _v_notice_motion(session, pose)
             pose["last_vignette"] = _v_notice_motion
             pose["dwell"] = random.randint(2, 4)
             return pose
-    else:
+    elif not busy:
         last_seen = pose.get("last_face_seen_ts", now)
         if now - last_seen > SEARCH_AFTER_S and random.random() < SEARCH_PROB:
             pose = _v_search_sweep(session, pose)
@@ -502,6 +519,17 @@ def wander(session, pose):
             pose["dwell"] = random.randint(4, 8)
             pose["last_face_seen_ts"] = now  # don't sweep again immediately
             return pose
+
+    if busy:
+        # No face to track and nothing else is allowed to touch the face —
+        # a small generic drift so it's not perfectly rigid, same shape as
+        # the dwell jiggle above.
+        ny  = _clamp(pose["y"] + random.randint(-6, 6), YAW_MIN, YAW_MAX)
+        np_ = _clamp(pose["p"] + random.randint(-4, 4), PITCH_MIN, PITCH_MAX)
+        session.move(ny, np_)
+        pose.update(y=ny, p=np_)
+        pose["dwell"] = random.randint(2, 4)
+        return pose
 
     last = pose.get("last_vignette")
     choices = [(f, w) for f, w in VIGNETTES if f is not last] or VIGNETTES
@@ -536,13 +564,19 @@ def main():
             time.sleep(10)
             continue
 
-        # Stay still while Claude is actively working/speaking (recent hook
-        # activity, or a still-active busy marker for any session — covers
-        # long single tool calls where no hook fires again until it
-        # finishes), or while a needs-attention signal is outstanding (don't
-        # visually compete with that priority alert — see stackchan-hook.py).
+        # Stay COMPLETELY still right after real hook activity (the ~8s
+        # window covers reaction/TalkingBob animations we shouldn't fight),
+        # or while a needs-attention signal is outstanding (don't visually
+        # compete with that priority alert — see stackchan-hook.py).
+        #
+        # A long-running busy session (e.g. a background task) does NOT
+        # fully freeze movement anymore (2026-07-01, user feedback: sitting
+        # rigid for minutes read as "boring and static") — wander() still
+        # runs, just restricted to moves that don't touch the face (see its
+        # `busy` param), so the concentrating-squint face stays visible and
+        # uncontested while a bit of life continues underneath it.
         if not once and (seconds_since_activity() < IDLE_THRESHOLD_S
-                          or is_busy() or needs_attention()):
+                          or needs_attention()):
             continue
 
         if not once and random.random() > GLANCE_PROB:
@@ -552,7 +586,7 @@ def main():
             if not have_session:
                 session.init()
                 have_session = True
-            pose = wander(session, pose)
+            pose = wander(session, pose, busy=is_busy())
         except Exception:
             have_session = False  # re-init next time
 
