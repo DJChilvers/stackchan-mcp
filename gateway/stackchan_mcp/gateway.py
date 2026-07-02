@@ -13,6 +13,7 @@ import os
 from aiohttp import web
 
 from .capture_server import create_capture_app, stage_avatar_set
+from .companion_server import create_companion_app
 from .esp32_client import ESP32Manager
 from .mdns_advertiser import MdnsAdvertiser
 from .sensor_reactor import SensorReactor
@@ -40,6 +41,7 @@ class Gateway:
         # Phase 4.5 avatar: kept so load_avatar_set can stage payloads
         # against the same web.Application that serves /avatar_set/{id}.
         self._capture_app: web.Application | None = None
+        self._companion_runner: web.AppRunner | None = None
         self._mdns_advertiser: MdnsAdvertiser | None = None
 
     @property
@@ -114,6 +116,22 @@ class Gateway:
         )
 
     @property
+    def companion_token(self) -> str:
+        """Bearer token expected by the /api/* companion endpoints.
+
+        Authorises the Android companion app — a different trust boundary from
+        the device-to-gateway auth, so it can be set independently via
+        COMPANION_TOKEN. Falls back to STACKCHAN_TOKEN / BEARER_TOKEN so a
+        single-token (or tokenless local-dev) setup works out of the box.
+        """
+        return (
+            os.getenv("COMPANION_TOKEN")
+            or os.getenv("STACKCHAN_TOKEN")
+            or os.getenv("BEARER_TOKEN")
+            or ""
+        )
+
+    @property
     def pcm_token(self) -> str:
         """Bearer token expected by the /pcm HTTP endpoint.
 
@@ -166,6 +184,19 @@ class Gateway:
         site = web.TCPSite(self._http_runner, host, capture_port)
         await site.start()
 
+        # Start the companion API server (Android control app). Separate
+        # aiohttp app on its own port so the ESP32-facing capture server stays
+        # uncluttered; reuses this Gateway instance to dispatch device tools.
+        companion_port = int(os.getenv("COMPANION_PORT", "8770"))
+        companion_app = create_companion_app(
+            gateway=self,
+            token=self.companion_token,
+        )
+        self._companion_runner = web.AppRunner(companion_app)
+        await self._companion_runner.setup()
+        companion_site = web.TCPSite(self._companion_runner, host, companion_port)
+        await companion_site.start()
+
         if advertise_mdns:
             self._mdns_advertiser = MdnsAdvertiser()
             try:
@@ -178,8 +209,8 @@ class Gateway:
 
         self._running = True
         logger.info(
-            "Gateway started: WS on %s:%d, capture on %s:%d, vision_url=%s",
-            host, ws_port, host, capture_port, self.vision_url,
+            "Gateway started: WS on %s:%d, capture on %s:%d, companion on %s:%d, vision_url=%s",
+            host, ws_port, host, capture_port, host, companion_port, self.vision_url,
         )
 
     async def stop(self) -> None:
@@ -203,6 +234,9 @@ class Gateway:
                 logger.warning("mDNS advertisement shutdown failed: %s", exc)
             finally:
                 self._mdns_advertiser = None
+        if self._companion_runner:
+            await self._companion_runner.cleanup()
+            self._companion_runner = None
         if self._http_runner:
             await self._http_runner.cleanup()
             self._http_runner = None
