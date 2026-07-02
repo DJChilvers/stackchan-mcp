@@ -50,6 +50,14 @@ AUDIO_PROBE_ENABLED = os.environ.get("STACKCHAN_AUDIO_PROBE", "0") == "1"
 AUDIO_THRESHOLD     = float(os.environ.get("STACKCHAN_AUDIO_THRESHOLD", "0.65"))
 AUDIO_PROBE_INTERVAL = 3.0   # seconds between audio probes
 
+# The one enrolled name that gets the warm GREETING_PHRASES treatment —
+# everyone else recognized gets NON_OWNER_GREETING_PHRASES instead (2026-
+# 07-03: "everyone else Wheatley can be a bit ruder to them and say bad
+# jokes"). Compared case-insensitively against person_name in
+# _behavior_recognize. Unknown-face handling (ASK_NAME_PHRASES, the
+# enrollment flow) is unaffected either way.
+OWNER_NAME = os.environ.get("STACKCHAN_OWNER_NAME", "Dominic")
+
 # Speed presets (degrees/sec) forwarded to self.robot.set_head_angles
 _SPD = {"slow": 30, "mid": 120, "fast": 240, "max": 500}
 
@@ -450,6 +458,24 @@ class SensorReactor:
         "Look who it is! {name}! My favourite human. Don't tell the others. There are no others.",
     ]
 
+    # Fired instead of GREETING_PHRASES/NAME_GREETING_PHRASES for a
+    # recognized person who ISN'T OWNER_NAME — cheekier/backhanded rather
+    # than warm, plus a few actual (deliberately groan-worthy) jokes aimed
+    # at them specifically. Still Wheatley, not genuinely mean — teasing,
+    # not hostile.
+    NON_OWNER_GREETING_PHRASES = [
+        "Oh. It's you again, {name}. Riveting.",
+        "{name}. Back again. Try not to touch anything important.",
+        "Oh good, {name}. I was having such a nice quiet moment.",
+        "{name}! Still here, apparently. Persistent, aren't you.",
+        "It's {name}. Don't get comfortable — I'm mostly watching for someone else.",
+        "Ah, {name}. Not who I was hoping for, but I suppose you'll do.",
+        "{name}, you again. Is there a collective noun for repeat visitors? A nuisance, probably.",
+        "{name}! Question: what do you call a fish with no eyes? A fsh. Anyway. Hello.",
+        "Oh, {name}. Why don't scientists trust atoms? They make up everything. Bit like your excuse for being here, probably.",
+        "{name}, back for more. What do you call a robot that takes the long way round? R2 detour. I'll see myself out.",
+    ]
+
     # Fired alongside a "known" greeting when the arbiter judged a fresh
     # capture "definite" match + "good" quality — proposing to add it as a
     # new reference sample. Confirmation happens via tap-to-talk (same
@@ -492,10 +518,20 @@ class SensorReactor:
             await asyncio.sleep(0.22)
             await self._move(0, 46, "mid")
             await asyncio.sleep(0.35)
-            pool = list(self.GREETING_PHRASES)
-            if person_name:
-                pool += [p.format(name=person_name) for p in self.NAME_GREETING_PHRASES]
-            await self._say(_pick("greeting", pool))
+            is_owner = bool(person_name) and person_name.strip().lower() == OWNER_NAME.strip().lower()
+            if is_owner:
+                pool = list(self.GREETING_PHRASES)
+                if person_name:
+                    pool += [p.format(name=person_name) for p in self.NAME_GREETING_PHRASES]
+                await self._say(_pick("greeting", pool))
+            elif person_name:
+                pool = [p.format(name=person_name) for p in self.NON_OWNER_GREETING_PHRASES]
+                await self._say(_pick("non-owner-greeting", pool))
+            else:
+                # known but no name came through — shouldn't normally
+                # happen (vision-loop always forwards it for "known"), fall
+                # back to the generic (nameless) owner-style lines.
+                await self._say(_pick("greeting", self.GREETING_PHRASES))
             if propose_learn and person_name:
                 await asyncio.sleep(0.3)
                 phrase = _pick("learn-confirm-ask", self.LEARN_CONFIRM_ASK_PHRASES)
