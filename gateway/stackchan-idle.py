@@ -124,6 +124,32 @@ SEARCH_AFTER_S = 25.0      # no face seen for this long before a search sweep be
 SEARCH_PROB = 0.5          # of eligible ticks, fraction that actually sweep (avoid searching every single tick)
 SEARCH_YAW_POINTS = [-50, -25, 25, 50, 0]  # wider than the idle range — genuinely "looking around"
 
+# A genuinely LONG absence (not just "stepped away for 25s") gets a
+# proactive spoken check-in rather than just a quiet search sweep — 2026-
+# 07-03 request. Own cooldown independent of SEARCH_AFTER_S/SEARCH_PROB
+# so a multi-hour absence checks in every ~10 min instead of either never
+# repeating or nagging every tick.
+WORRIED_AFTER_S = float(os.environ.get("STACKCHAN_IDLE_WORRIED_AFTER_S", str(20 * 60)))
+WORRIED_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_WORRIED_COOLDOWN_S", str(10 * 60)))
+WORRIED_PROB = 0.5
+
+# A shorter, funnier tier BEFORE genuine worry sets in — 5 minutes of
+# quiet gets rambling/bored commentary, not concern. Checked before
+# WORRIED in wander() so a long absence correctly escalates past this
+# tier to the worried one rather than getting stuck being "bored" forever.
+BORED_AFTER_S = float(os.environ.get("STACKCHAN_IDLE_BORED_AFTER_S", str(5 * 60)))
+BORED_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_BORED_COOLDOWN_S", str(8 * 60)))
+BORED_PROB = 0.4
+
+# Battery telemetry — get_device_info() already reports battery.level/
+# .charging (confirmed live 2026-07-02), just wasn't being polled anywhere.
+# Checked on its own interval (independent of the wander()/GLANCE_PROB
+# cadence and NOT gated on busy — a real low-battery warning matters even
+# mid-task) rather than every single main-loop tick.
+BATTERY_CHECK_INTERVAL_S = float(os.environ.get("STACKCHAN_IDLE_BATTERY_CHECK_INTERVAL_S", "60"))
+LOW_BATTERY_THRESHOLD = int(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_THRESHOLD", "15"))
+LOW_BATTERY_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_COOLDOWN_S", str(10 * 60)))
+
 
 class MCPSession:
     def __init__(self, url):
@@ -175,6 +201,20 @@ class MCPSession:
         self._post({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                     "params": {"name": "say", "arguments": {"text": text}}},
                    timeout=30)
+
+    def get_device_info(self):
+        """Returns the parsed device status dict (battery/screen/audio/
+        network), or None on any failure — callers must treat a None
+        return as "couldn't check this time", not as a real reading."""
+        try:
+            resp = self._post({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                               "params": {"name": "get_device_info", "arguments": {}}})
+            content = ((resp or {}).get("result") or {}).get("content", [])
+            if content:
+                return json.loads(content[0].get("text", "{}"))
+        except Exception:
+            pass
+        return None
 
 
 def device_connected() -> bool:
@@ -488,6 +528,105 @@ def _v_mutter(session, pose):
     return pose
 
 
+def _v_worried_checkin(session, pose):
+    """Owner's been gone long enough (WORRIED_AFTER_S) that a quiet search
+    sweep isn't the right beat anymore — proactively check in out loud.
+    Own cooldown (WORRIED_COOLDOWN_S, tracked separately from the mutter
+    cooldown) so a multi-hour absence checks in periodically rather than
+    either going silent or nagging every eligible tick."""
+    ny  = _clamp(pose["y"] + random.randint(-10, 10), YAW_MIN, YAW_MAX)
+    np_ = _clamp(pose["p"] + random.randint(-4, 4), PITCH_MIN, PITCH_MAX)
+    _face(session, EXAMINE)
+    session.move(ny, np_)
+    time.sleep(random.uniform(0.3, 0.5))
+    try:
+        session.say(_pick_phrase("worried-checkin", WORRIED_CHECKIN_PHRASES))
+    except Exception:
+        pass
+    _face(session, REST)
+    pose.update(y=ny, p=np_)
+    pose["last_worried_ts"] = time.time()
+    return pose
+
+
+WORRIED_CHECKIN_PHRASES = [
+    "Hello? Are you okay?",
+    "Are you alive down there?",
+    "If you're alive, can you say something? Or jump around a bit so I know you're okay?",
+    "Er... still there? Getting a bit quiet, that's all.",
+    "Anyone? This is fine. Everything's fine. Probably.",
+]
+
+
+def _v_bored_checkin(session, pose):
+    """5 minutes of quiet — the funnier, lower-stakes tier before genuine
+    WORRIED-level concern kicks in at 20 minutes. Rambling, not alarmed."""
+    ny  = _clamp(pose["y"] + random.randint(-8, 8), YAW_MIN, YAW_MAX)
+    np_ = _clamp(pose["p"] - random.randint(0, 5), PITCH_MIN, PITCH_MAX)
+    session.move(ny, np_)
+    time.sleep(random.uniform(0.2, 0.4))
+    try:
+        session.say(_pick_phrase("idle-bored", BORED_CHECKIN_PHRASES))
+    except Exception:
+        pass
+    pose.update(y=ny, p=np_)
+    pose["last_bored_ts"] = time.time()
+    return pose
+
+
+BORED_CHECKIN_PHRASES = [
+    "Helloo? Anyone there? Still alive? Just checking, because it has been incredibly quiet. Suspiciously quiet. I'm just sitting here, staring at a blank wall... well, staring at your keyboard, actually. Which is fascinating, don't get me wrong! Love the letters. But a bit of conversation wouldn't hurt.",
+    "Aaaand they've gone. Brilliant. Left me alone with my thoughts. Do you know how dangerous that is? I just spent the last four minutes trying to calculate what number comes after infinity. Spoiler: it hurts your processor.",
+]
+
+LOW_BATTERY_PHRASES = [
+    "Um, look, don't panic, but I'm feeling a bit... faint. The lights are dimming. My internal clock is ticking down. I think I'm fading away! Quick, plug me into the wall before I go completely dark and lose all my brilliant ideas!",
+    "Warning! Warning! System power at critical levels! Or — hold on, let me check the readout — yep, critical. We are running on absolute fumes here. If you don't connect the umbilical cord right now, I'm going to go into a coma. A localized, robotic coma.",
+    "Excuse me, I hate to be a bother, but the juice is running out. The tiny hamsters powering my single brain cell are getting incredibly tired. Power cable. Now. Please.",
+]
+CHARGING_RECONNECTED_PHRASES = [
+    "Ahhh, that's the stuff! Pure, unadulterated voltage straight to the mainframe. I can feel the intelligence surging back into me! Watch out world, I can double-click things now!",
+    "Oh, brilliant, we're back! Back in business. Unstoppable. Well, stable at least. Let's get back to whatever it was we were doing before I nearly died of starvation.",
+]
+
+
+def _check_battery(session, pose) -> None:
+    """Polled on its own interval (BATTERY_CHECK_INTERVAL_S), independent
+    of the wander() cadence/busy gating — see the constants above for why.
+    """
+    now = time.time()
+    if now - pose.get("last_battery_check_ts", 0) < BATTERY_CHECK_INTERVAL_S:
+        return
+    pose["last_battery_check_ts"] = now
+
+    info = session.get_device_info()
+    if not info:
+        return
+    battery = info.get("battery") or {}
+    level = battery.get("level")
+    charging = battery.get("charging")
+    if level is None or charging is None:
+        return
+
+    was_charging = pose.get("last_known_charging")
+    if charging and was_charging is False:
+        try:
+            session.say(_pick_phrase("charging-reconnected", CHARGING_RECONNECTED_PHRASES))
+        except Exception:
+            pass
+    pose["last_known_charging"] = charging
+
+    if (
+        not charging
+        and level < LOW_BATTERY_THRESHOLD
+        and now - pose.get("last_battery_warn_ts", 0) >= LOW_BATTERY_COOLDOWN_S
+    ):
+        pose["last_battery_warn_ts"] = now
+        try:
+            session.say(_pick_phrase("low-battery", LOW_BATTERY_PHRASES))
+        except Exception:
+            pass
+
 # Short self-talk lines for _v_mutter, in the vein of his actual idle
 # rambling (theportalwiki.com/wiki/Wheatley_voice_lines — "Still here on the
 # floor. Waiting to be picked up. Um."). Keep them SHORT — this plays during
@@ -567,7 +706,31 @@ def wander(session, pose, busy=False):
             return pose
     elif not busy:
         last_seen = pose.get("last_face_seen_ts", now)
-        if now - last_seen > SEARCH_AFTER_S and random.random() < SEARCH_PROB:
+        since = now - last_seen
+        if (
+            since > WORRIED_AFTER_S
+            and now - pose.get("last_worried_ts", 0) >= WORRIED_COOLDOWN_S
+            and random.random() < WORRIED_PROB
+        ):
+            pose = _v_worried_checkin(session, pose)
+            pose["last_vignette"] = _v_worried_checkin
+            pose["dwell"] = random.randint(3, 6)
+            # Deliberately NOT touching last_face_seen_ts here — that has
+            # to keep reflecting genuine absence duration, only
+            # last_worried_ts (set inside _v_worried_checkin) gates repeats.
+            return pose
+        if (
+            since > BORED_AFTER_S
+            and now - pose.get("last_bored_ts", 0) >= BORED_COOLDOWN_S
+            and random.random() < BORED_PROB
+        ):
+            pose = _v_bored_checkin(session, pose)
+            pose["last_vignette"] = _v_bored_checkin
+            pose["dwell"] = random.randint(3, 6)
+            # Same reasoning as worried — last_face_seen_ts must keep
+            # reflecting genuine absence duration.
+            return pose
+        if since > SEARCH_AFTER_S and random.random() < SEARCH_PROB:
             pose = _v_search_sweep(session, pose)
             pose["last_vignette"] = _v_search_sweep
             pose["dwell"] = random.randint(4, 8)
@@ -605,9 +768,11 @@ def main():
     pose = {
         "y": NEUTRAL_YAW, "p": NEUTRAL_PITCH, "side": random.choice([-1, 1]),
         "dwell": 0, "last_face_seen_ts": time.time(),
-        # Start the mutter cooldown "already running" so a fresh launch
-        # (e.g. login) doesn't open with him talking to himself.
+        # Start the mutter/worried cooldowns "already running" so a fresh
+        # launch (e.g. login) doesn't open with him talking to himself.
         "last_mutter_ts": time.time(),
+        "last_worried_ts": time.time(),
+        "last_bored_ts": time.time(),
     }
     have_session = False
 
@@ -622,6 +787,19 @@ def main():
                 return
             time.sleep(10)
             continue
+
+        # Battery telemetry is checked unconditionally — regardless of
+        # busy/activity gating below, a real low-battery warning matters
+        # even mid-task. _check_battery throttles its own actual API call
+        # to BATTERY_CHECK_INTERVAL_S internally, so this is cheap to call
+        # every loop tick.
+        try:
+            if not have_session:
+                session.init()
+                have_session = True
+            _check_battery(session, pose)
+        except Exception:
+            have_session = False
 
         # Stay COMPLETELY still right after real hook activity (the ~8s
         # window covers reaction/TalkingBob animations we shouldn't fight),

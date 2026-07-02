@@ -430,7 +430,7 @@ async def handle_pcm(request: web.Request) -> web.Response:
 async def handle_react(request: web.Request) -> web.Response:
     """/react/<behavior>[?direction=left&type=desk] — fire a Wheatley reaction.
 
-    Behaviors: panic, hacker, overtrack, tantrum, recognize
+    Behaviors: panic, hacker, overtrack, tantrum, recognize, lights_out
     Query params forwarded to the behavior as kwargs:
       direction  left|right|up|down   (overtrack)
       type       desk|pickup           (tantrum)
@@ -447,7 +447,7 @@ async def handle_react(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "gateway not available"}, status=503)
 
     behavior = request.match_info.get("behavior", "")
-    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize"}:
+    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize", "lights_out"}:
         return web.json_response({"ok": False, "error": f"unknown behavior: {behavior}"}, status=400)
 
     kwargs: dict = {}

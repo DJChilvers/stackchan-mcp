@@ -139,6 +139,19 @@ VISION_STATE_PATH = os.path.join(TEMP, "stackchan-vision-state.json")
 # is currently visible.
 MOTION_DIFF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MOTION_THRESHOLD", "12.0"))
 
+# "Lights out" detection: there's no ambient light sensor exposed via any
+# MCP tool (checked live 2026-07-03 — the LTR-553ALS may exist on the chip
+# but nothing reads it), so this approximates one using the camera itself —
+# reuses the SAME downscaled grayscale frame already computed for motion-
+# diff, no extra capture/compute. Tracks a short rolling history and fires
+# only on a SUDDEN drop from a reasonably-lit baseline (not "the room is
+# just dim", and not while it's already dark), so it doesn't fire on
+# gradual dusk or a single noisy frame.
+LIGHTS_OUT_HISTORY_LEN = 5
+LIGHTS_OUT_MIN_BASELINE = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_MIN_BASELINE", "60.0"))
+LIGHTS_OUT_DROP_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_DROP_THRESHOLD", "40.0"))
+LIGHTS_OUT_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_COOLDOWN_S", str(30 * 60)))
+
 # Set when an unrecognized face triggers the "who are you?" prompt (see
 # sensor_reactor.py's _behavior_recognize unknown branch); stackchan-voice-
 # bridge.py checks this to know a tap-to-answer transcript is probably a
@@ -350,6 +363,47 @@ def _motion_score(prev_small, cur_small) -> float:
     return float(diff.mean())
 
 
+def _brightness(small_gray) -> float:
+    return float(small_gray.mean())
+
+
+def _check_lights_out(brightness: float, history: list, last_lights_out_ts: dict) -> bool:
+    """Returns True if this looks like a sudden lights-out transition —
+    caller decides what to do with that (fire the reaction, apply the
+    cooldown). `history` is a mutable list used as an out-param (oldest
+    first, capped at LIGHTS_OUT_HISTORY_LEN) so the caller doesn't need to
+    thread more state through _tick's already-long parameter list.
+    """
+    triggered = False
+    if history:
+        baseline = sum(history) / len(history)
+        now = time.time()
+        if (
+            baseline >= LIGHTS_OUT_MIN_BASELINE
+            and baseline - brightness >= LIGHTS_OUT_DROP_THRESHOLD
+            and now - last_lights_out_ts.get("ts", 0.0) >= LIGHTS_OUT_COOLDOWN_S
+        ):
+            last_lights_out_ts["ts"] = now
+            triggered = True
+    history.append(brightness)
+    del history[:-LIGHTS_OUT_HISTORY_LEN]
+    return triggered
+
+
+def _fire_lights_out() -> None:
+    url = f"http://127.0.0.1:{CAPTURE_PORT}/react/lights_out"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/lights_out -> %s", resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/lights_out skipped (reactor busy)")
+        else:
+            logger.warning("react/lights_out failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("react/lights_out failed")
+
+
 # ─── face detection / recognition ──────────────────────────────────────────
 
 def _load_detector():
@@ -516,12 +570,15 @@ def _call_arbiter(new_frame_path: str, reference_photo_path: str) -> dict:
 def _tick(
     detector, recognizer, sess: MCPSession, known: dict,
     last_reaction_ts: dict, last_learn_ts: dict, prev_small_box: list,
+    brightness_history: list, last_lights_out_ts: dict,
 ) -> None:
     """One perception step: capture, detect/classify, write state, maybe react.
 
     No servo calls here — see module docstring. `prev_small_box` is a
     single-element list used as a mutable "out param" so motion-diff has
     the previous tick's downscaled frame to compare against.
+    `brightness_history`/`last_lights_out_ts` are similar out-params for
+    _check_lights_out.
 
     Three-band classification (2026-07-02, arbiter design): SFace's cosine
     score alone has no middle ground, so scores are split into confidently-
@@ -548,6 +605,11 @@ def _tick(
     motion_score = _motion_score(prev_small_box[0], small)
     prev_small_box[0] = small
     motion_detected = motion_score > MOTION_DIFF_THRESHOLD
+
+    brightness = _brightness(small)
+    if _check_lights_out(brightness, brightness_history, last_lights_out_ts):
+        logger.info("tick: lights-out transition detected (brightness=%.1f)", brightness)
+        _fire_lights_out()
 
     face = _detect_largest_face(detector, img)
     if face is None:
@@ -651,6 +713,8 @@ def _loop(once: bool) -> None:
     last_reaction_ts: dict = {}
     last_learn_ts: dict = {}
     prev_small_box: list = [None]
+    brightness_history: list = []
+    last_lights_out_ts: dict = {}
     logger.info(
         "starting vision loop (poll=%.0fs cooldown=%.0fs threshold=%.3f uncertain=%.2f-%.2f)",
         POLL_INTERVAL_S, COOLDOWN_S, MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
@@ -668,7 +732,10 @@ def _loop(once: bool) -> None:
         sess = MCPSession(GATEWAY_MCP)
         try:
             sess.initialize()
-            _tick(detector, recognizer, sess, known, last_reaction_ts, last_learn_ts, prev_small_box)
+            _tick(
+                detector, recognizer, sess, known, last_reaction_ts, last_learn_ts,
+                prev_small_box, brightness_history, last_lights_out_ts,
+            )
         except Exception:
             logger.exception("tick failed")
         if once:

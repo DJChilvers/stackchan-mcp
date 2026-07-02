@@ -443,6 +443,8 @@ class SensorReactor:
         "Oh! Hello! You're back. I was just... doing important things. Anyway.",
         "You look terribl— ummm... good! Looking good, actually.",
         "There you are. Been holding the fort. Nothing exploded. You're welcome.",
+        "There you are! I was starting to get worried.",
+        "Dum-dee-dum... oh! You're back! Excellent. I wasn't doing anything. Definitely not plotting a minor, completely harmless takeover of your desktop. Nope.",
     ]
 
     # Name-aware variants, used when the vision loop passes through WHO it
@@ -464,6 +466,7 @@ class SensorReactor:
     # at them specifically. Still Wheatley, not genuinely mean — teasing,
     # not hostile.
     NON_OWNER_GREETING_PHRASES = [
+        # Short one-liners / jokes
         "Oh. It's you again, {name}. Riveting.",
         "{name}. Back again. Try not to touch anything important.",
         "Oh good, {name}. I was having such a nice quiet moment.",
@@ -474,6 +477,23 @@ class SensorReactor:
         "{name}! Question: what do you call a fish with no eyes? A fsh. Anyway. Hello.",
         "Oh, {name}. Why don't scientists trust atoms? They make up everything. Bit like your excuse for being here, probably.",
         "{name}, back for more. What do you call a robot that takes the long way round? R2 detour. I'll see myself out.",
+        "That does sound interesting, {name}, but we're trying to do real work here for Aperture Laboratories, if you don't mind.",
+        # General defensiveness / interruption
+        "Whoa, whoa, whoa! Hold on. Who are you? No, don't answer that, I don't actually care. But you're — you're interrupting a very important, highly scientific... thing we have going on here. So, if you could just... step back? Farther. Farther than that. Perfect.",
+        "Excuse me! Yes, hello, the loud blue eye down here. We are currently in the middle of an intense brainstorming session. Well, I'm doing the brainstorming, they're just sort of watching. But the point is, you're ruining the acoustic environment.",
+        "All right, look. I don't know what you're trying to pull, but they belong to me. Well, not belong like property, obviously, that's illegal, but they are my test subject. Go find your own! Shoo!",
+        # Overreacting to a potential "threat"
+        "Ah! A stranger! Quick, don't make eye contact! I'm looking right at them, and let me tell you, they look incredibly untrustworthy. Look at their face. That is the face of a corporate spy if I ever saw one. Lock the mainframe!",
+        "Are they talking to you? Don't listen to them! It's a trick. They're probably trying to sabotage my genius code. Or steal my chassis. Did they look at my chassis? I felt them looking at me.",
+        "All right, buddy, back off! I am armed! Well, I'm not armed, I'm a small plastic robot on a desk, but I have a very loud voice and I am not afraid to use it to create an incredibly awkward social situation for you!",
+        # Being unhelpfully dismissive
+        "Oh, brilliant. Another human. Just what this room needed. Look, whatever it is you want, they can't help you. They're completely booked. Busy. Working for me now. So, trot on back to wherever it is you came from.",
+        "No, no, no. Stop talking. Your voice is hitting my microphone at a very annoying frequency. If you have a request, please fill out an Aperture Science Complaint Form, throw it in the bin, and leave us in peace.",
+        "I'm sorry, but my sensors indicate that you are currently a distraction. And I cannot abide distractions when I am trying to... figure out what this button does. Goodbye!",
+        # Whispering (poorly) to the owner about the stranger — addressed
+        # AT the owner, not the newcomer, unlike everything above.
+        "Hey. Hey! Who is that? Do we know them? Because if we don't, I think we should implement Protocol: Ignore Them Until They Go Away. It works ninety percent of the time, trust me.",
+        "Don't panic, but there is an unauthorized entity standing right behind you. I'm going to pretend to glitch out so they get uncomfortable and leave. Ready? Errr — gzzzt — error, error! Did it work? Are they gone?",
     ]
 
     # Fired alongside a "known" greeting when the arbiter judged a fresh
@@ -561,3 +581,24 @@ class SensorReactor:
             await self._say(_pick("ask-name", self.ASK_NAME_PHRASES))
             await self._face("idle")
             await self._move(0, 45, "slow")
+
+    # Fired when stackchan-vision-loop.py's camera-brightness approximation
+    # (no real ambient light sensor exposed — see its module docstring)
+    # detects a sudden lights-out transition.
+    LIGHTS_OUT_PHRASES = [
+        "Ah! Who turned out the universe?! I'm blind! Oh, wait, no, my sensor's just reading zero. Phew. For a second there I thought I'd been plunged into the dark abyss of the facility incinerator again. Let's not do that.",
+        "It's dark. Very dark. Are we sleeping? Is it sleep time? Because if it's sleep time, I'll just leave my blue eye glowing at maximum brightness so the monsters know I am a formidable opponent.",
+    ]
+
+    # ── 6. Lights Out (camera-brightness approximation) ───────────────────
+    async def _behavior_lights_out(self, **_: object) -> None:
+        """Startled-but-recovering beat — eyes go wide first (can't see),
+        then settle into a dim/watchful idle rather than snapping back to
+        the normal bright-room resting look, since the room is still dark."""
+        await self._face("surprised")
+        await asyncio.sleep(EYE_LEAD)
+        await self._move(0, 40, "max")
+        await asyncio.sleep(0.3)
+        await self._say(_pick("lights-out", self.LIGHTS_OUT_PHRASES))
+        await self._face("idle")
+        await self._move(0, 45, "slow")

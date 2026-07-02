@@ -216,12 +216,18 @@ DONE_PHRASES = [
     "That's done.",
 ]
 
-# Short failure phrases for the PostToolUse hook (spoken only on error).
+# Failure phrases for the PostToolUse hook (spoken only on error).
+# Wheatley-flavoured, 2026-07-03 — the previous pool ("That command
+# failed.", "Error.") worked but had zero character; punched up per
+# request without losing the short/punchy read a tool-failure needs.
 ERROR_PHRASES = [
     "That command failed.",
     "Uh oh, something went wrong.",
     "That didn't work.",
     "Error.",
+    "Oh, bloody hell. It didn't work. Completely crashed. Now, I'm not saying it's your fault... but I definitely didn't type that line. Let's just blame the compiler. Horrible things, compilers. Very judgmental.",
+    "Whoa! Critical error! The screen just did a thing. A bad thing. I don't know what that red text means, but it looks incredibly angry. Have you tried deleting everything and starting over? That's my primary troubleshooting strategy.",
+    "Error log detected! Don't worry, I'm on it. Examining the data... scanning... yep. It's broken. Completely busted. Glad I could help!",
 ]
 
 # Busy/concentrating lines (Wheatley-flavoured), spoken ONCE per turn when
