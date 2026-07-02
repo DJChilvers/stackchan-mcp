@@ -8,12 +8,12 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Campaign
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Face
-import androidx.compose.material.icons.filled.Gamepad
-import androidx.compose.material.icons.filled.Insights
-import androidx.compose.material.icons.filled.PlayCircle
-import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
@@ -47,12 +47,12 @@ import com.aperture.wheatley.ui.theme.ApertureTheme
 import com.aperture.wheatley.ui.theme.ApertureTextDim
 
 private enum class Dest(val route: String, val label: String, val icon: ImageVector) {
-    CONTROL("control", "Control", Icons.Filled.Gamepad),
-    CAMERA("camera", "Camera", Icons.Filled.Videocam),
-    SAYINGS("sayings", "Sayings", Icons.Filled.Campaign),
-    DEMO("demo", "Demo", Icons.Filled.PlayCircle),
+    CONTROL("control", "Control", Icons.Filled.Build),
+    CAMERA("camera", "Camera", Icons.Filled.Search),
+    SAYINGS("sayings", "Sayings", Icons.Filled.Notifications),
+    DEMO("demo", "Demo", Icons.Filled.PlayArrow),
     FACES("faces", "Faces", Icons.Filled.Face),
-    STATUS("status", "Status", Icons.Filled.Insights),
+    STATUS("status", "Status", Icons.Filled.Info),
 }
 
 class MainActivity : ComponentActivity() {

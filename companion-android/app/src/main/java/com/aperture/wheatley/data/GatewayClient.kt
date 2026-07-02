@@ -20,7 +20,7 @@ private val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 private val MEDIA = "application/json; charset=utf-8".toMediaType()
 
 /**
- * Thin suspend wrapper over the gateway's /api/* companion endpoints. One
+ * Thin suspend wrapper over the gateway's companion (/api) endpoints. One
  * instance per [GatewayConfig]; rebuilt when settings change. All calls run on
  * Dispatchers.IO and never throw — failures come back as [Outcome.Err].
  */
