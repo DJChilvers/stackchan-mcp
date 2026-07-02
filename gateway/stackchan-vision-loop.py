@@ -678,13 +678,76 @@ def _loop(once: bool) -> None:
 
 # ─── enrollment CLI ─────────────────────────────────────────────────────────
 
+def _next_available_name(base: str, known: dict) -> str:
+    n = 2
+    while f"{base} ({n})" in known:
+        n += 1
+    return f"{base} ({n})"
+
+
+def _resolve_enroll_name(name: str, img, face, recognizer, known: dict) -> str:
+    """If `name` is unused, return it as-is — no collision.
+
+    If it's already enrolled, only split into a new "Name (2)" identity
+    when BOTH the local score AND the Claude arbiter agree this is clearly
+    a different person. Otherwise default to treating it as another
+    sample of the existing person — deliberately biased against creating
+    spurious duplicate identities from bad lighting/angle on a legitimate
+    second enrollment (2026-07-03 design discussion: "avoid it adding more
+    Dominics that are just me in bad light"). This is the same asymmetric
+    bar as the ongoing-recognition decision table: cheap to treat two
+    genuinely different people as one (a false merge just means one
+    profile has mixed samples, degrading match quality a bit) is still
+    less disruptive than fracturing one real person into several partial
+    identities every time the lighting's bad — worth revisiting if merges
+    ever turn out to be the bigger problem in practice.
+    """
+    existing = known.get(name)
+    if not existing:
+        return name
+
+    embedding = _embed_face(recognizer, img, face)
+    _, local_score = _best_match(recognizer, embedding, {name: existing})
+    if local_score >= UNCERTAIN_HIGH:
+        return name  # confidently the same person
+
+    ref_photo = os.path.join(REFERENCE_PHOTOS_DIR, f"{name}.jpg")
+    if not os.path.exists(ref_photo):
+        # No reference image to check against and the local score alone is
+        # inconclusive — no evidence either way, default to same-person
+        # rather than guessing.
+        return name
+
+    import cv2
+    tmp_path = os.path.join(TEMP, f"stackchan-collision-check-{int(time.time() * 1000)}.jpg")
+    cv2.imwrite(tmp_path, img)
+    try:
+        verdict = _call_arbiter(tmp_path, ref_photo)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+    if verdict["match"] == "no":
+        new_name = _next_available_name(name, known)
+        logger.info(
+            "enroll: local score=%.3f + arbiter agree %r is a different person from existing %r -> %r",
+            local_score, name, name, new_name,
+        )
+        return new_name
+    return name  # uncertain/probable/definite -> treat as the same person
+
+
 def _enroll(name: str, samples: int, interval: float) -> None:
     detector = _load_detector()
     recognizer = _load_recognizer()
     sess = MCPSession(GATEWAY_MCP)
     sess.initialize()
     known = _load_known_faces()
-    collected = list(known.get(name, []))
+
+    resolved_name = None  # determined from the first successful capture
+    collected: list = []
 
     print(f"Enrolling '{name}' — look at the camera. Capturing {samples} sample(s)...")
     got = 0
@@ -715,6 +778,12 @@ def _enroll(name: str, samples: int, interval: float) -> None:
             time.sleep(interval)
             continue
 
+        if resolved_name is None:
+            resolved_name = _resolve_enroll_name(name, img, face, recognizer, known)
+            collected = list(known.get(resolved_name, []))
+            if resolved_name != name:
+                print(f"  '{name}' is already someone else — enrolling separately as '{resolved_name}'")
+
         feat = _embed_face(recognizer, img, face)
         collected.append(feat.flatten().tolist())
         got += 1
@@ -727,15 +796,15 @@ def _enroll(name: str, samples: int, interval: float) -> None:
         print(f"  [{got}/{samples}] captured")
         time.sleep(interval)
 
-    if got == 0:
+    if got == 0 or resolved_name is None:
         print("No samples captured — nothing saved.")
         return
 
-    known[name] = collected
+    known[resolved_name] = collected
     _save_known_faces(known)
     if best_crop is not None:
-        _save_reference_photo(name, best_crop)
-    print(f"Enrolled '{name}' with {len(collected)} sample(s) total in {KNOWN_FACES_PATH}.")
+        _save_reference_photo(resolved_name, best_crop)
+    print(f"Enrolled '{resolved_name}' with {len(collected)} sample(s) total in {KNOWN_FACES_PATH}.")
 
 
 def _confirm_learn(name: str, frame_path: str) -> bool:

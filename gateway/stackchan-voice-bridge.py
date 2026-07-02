@@ -224,6 +224,10 @@ ENROLL_CONFIRM_PHRASES = [
     "{name}! Cracking name. Right up there with the great names. Remembered.",
     "Hello, {name}! I'd shake your hand, but... obvious reasons.",
     "{name}. Locked in. I never forget a face. Almost never. Rarely forget a face.",
+    # Actual bad jokes, as requested — deliberately groan-worthy, not clever.
+    "{name}! Great name. Do you know what's not great? My last host body. Anyway — remembered.",
+    "Nice to meet you, {name}. I'd tell you a chemistry joke but I know I wouldn't get a reaction. Saved you, though.",
+    "{name}, right. Here's one for you: why don't robots panic? Too many built-in fail-safes. I have none. Remembered you anyway.",
 ]
 ENROLL_FAIL_PHRASES = [
     "Hmm, didn't quite catch a name there, and I couldn't get a clean look "
@@ -232,6 +236,17 @@ ENROLL_FAIL_PHRASES = [
     "Bit of a shambles all round. Another time.",
     "Couldn't catch the name, couldn't quite see you either. "
     "We'll call that a draw and try again later.",
+]
+# Fired instead of ENROLL_CONFIRM_PHRASES when stackchan-vision-loop.py's
+# --enroll had to auto-rename because the spoken name was already taken by
+# someone whose face clearly doesn't match (see _resolve_enroll_name there
+# — only splits into a new identity when both the local score and Claude
+# agree it's a different person, specifically to avoid this firing on
+# every bad-lighting re-enrollment of someone already known).
+ENROLL_RENAMED_PHRASES = [
+    "Funny thing — already got a {said_name}, and you're definitely not them. Filed you as {saved_name} instead.",
+    "So, turns out {said_name}'s taken. Not you, apparently — different face entirely. You're {saved_name} now.",
+    "Slight mix-up: {said_name} already belongs to someone else round here. Saved you as {saved_name}.",
 ]
 
 _NAME_PATTERNS = [
@@ -272,10 +287,16 @@ def _extract_name(transcript: str) -> str | None:
     return None
 
 
-def _complete_enrollment(name: str) -> bool:
+def _complete_enrollment(name: str) -> tuple[bool, str | None]:
     """Shell out to stackchan-vision-loop.py --enroll rather than duplicating
     its cv2 face-embedding logic here (voice-bridge has no cv2 dependency
     otherwise, and this reuses the already-tested enrollment path exactly).
+
+    Returns (success, resolved_name) — resolved_name can differ from the
+    name passed in if --enroll auto-renamed due to a name collision with a
+    clearly different existing person (see _resolve_enroll_name there);
+    the caller needs the actual saved name to speak an accurate
+    confirmation rather than repeating back a name that wasn't used.
     """
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stackchan-vision-loop.py")
     try:
@@ -287,10 +308,14 @@ def _complete_enrollment(name: str) -> bool:
             "enrollment subprocess name=%r exit=%s stdout=%r",
             name, result.returncode, result.stdout[-500:],
         )
-        return result.returncode == 0 and "Enrolled" in result.stdout
+        success = result.returncode == 0 and "Enrolled" in result.stdout
+        if not success:
+            return False, None
+        m = re.search(r"Enrolled '([^']+)'", result.stdout)
+        return True, (m.group(1) if m else name)
     except Exception:
         logger.exception("enrollment subprocess failed")
-        return False
+        return False, None
 
 
 # Written by stackchan-vision-loop.py when the arbiter judges a fresh
@@ -667,10 +692,16 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                 pass
             name = _extract_name(transcript)
             logger.info("session=%s enrollment attempt, transcript=%r name=%r", session_id, transcript, name)
-            enrolled = _complete_enrollment(name) if name else False
+            enrolled, resolved_name = _complete_enrollment(name) if name else (False, None)
             _clear_thinking_marker()
             if name and enrolled:
-                _speak(_pick("enroll-confirm", ENROLL_CONFIRM_PHRASES).format(name=name))
+                if resolved_name and resolved_name != name:
+                    _speak(
+                        _pick("enroll-renamed", ENROLL_RENAMED_PHRASES)
+                        .format(said_name=name, saved_name=resolved_name)
+                    )
+                else:
+                    _speak(_pick("enroll-confirm", ENROLL_CONFIRM_PHRASES).format(name=name))
             else:
                 _speak(_pick("enroll-fail", ENROLL_FAIL_PHRASES))
             return
