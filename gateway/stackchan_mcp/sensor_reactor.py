@@ -450,6 +450,17 @@ class SensorReactor:
         "Look who it is! {name}! My favourite human. Don't tell the others. There are no others.",
     ]
 
+    # Fired alongside a "known" greeting when the arbiter judged a fresh
+    # capture "definite" match + "good" quality — proposing to add it as a
+    # new reference sample. Confirmation happens via tap-to-talk (same
+    # reasoning as ASK_NAME_PHRASES — no hands-free listening yet); see
+    # stackchan-voice-bridge.py's PENDING_LEARN_CONFIRM_MARKER handling.
+    LEARN_CONFIRM_ASK_PHRASES = [
+        "Oh, and — got a proper good look at you just then. Should I remember that view, {name}?",
+        "Quick thing, {name} — that was a clear shot. Want me to learn it?",
+        "Also! Got a really good angle there. Shall I remember that one, {name}?",
+    ]
+
     # Fired for an unrecognized face. Tells them how to actually answer
     # (tap the screen) since there's no hands-free listening yet.
     ASK_NAME_PHRASES = [
@@ -463,7 +474,8 @@ class SensorReactor:
 
     # ── 5. Face Recognized (local vision loop, no API cost) ───────────────
     async def _behavior_recognize(
-        self, person: str = "unknown", person_name: str = "", **_: object
+        self, person: str = "unknown", person_name: str = "",
+        propose_learn: bool = False, **_: object
     ) -> None:
         """stackchan-vision-loop.py spotted a face via fully-local detection.
 
@@ -484,6 +496,10 @@ class SensorReactor:
             if person_name:
                 pool += [p.format(name=person_name) for p in self.NAME_GREETING_PHRASES]
             await self._say(_pick("greeting", pool))
+            if propose_learn and person_name:
+                await asyncio.sleep(0.3)
+                phrase = _pick("learn-confirm-ask", self.LEARN_CONFIRM_ASK_PHRASES)
+                await self._say(phrase.format(name=person_name))
             await self._face("idle")
             # Matches stackchan-hook.py's IDLE_LED so the ring doesn't stay
             # stuck on the acknowledgement colour.

@@ -293,6 +293,93 @@ def _complete_enrollment(name: str) -> bool:
         return False
 
 
+# Written by stackchan-vision-loop.py when the arbiter judges a fresh
+# capture "definite" match + "good" quality (see its module docstring for
+# the arbiter design) — JSON {"name", "frame_path", "ts"}, NOT a bare
+# timestamp like the other markers here, so it gets its own staleness
+# check rather than reusing _marker_active.
+PENDING_LEARN_CONFIRM_MARKER = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-pending-learn-confirm"
+)
+PENDING_LEARN_CONFIRM_STALE_S = 120
+
+LEARN_CONFIRM_YES_PHRASES = [
+    "Brilliant, learned it. Getting better at this every day.",
+    "Done! Filed away. My facial recognition improves, slowly but surely.",
+    "Got it, remembered. You're basically unforgettable now.",
+]
+LEARN_CONFIRM_DECLINED_PHRASES = [
+    "Fair enough, I'll leave it. No harm done.",
+    "No worries, skipping that one.",
+    "Understood — won't remember that particular look.",
+]
+LEARN_CONFIRM_FAIL_PHRASES = [
+    "Hmm, that didn't quite work — couldn't save it. We'll get it next time.",
+]
+
+_YES_WORDS = {"yes", "yeah", "yep", "yup", "sure", "please", "okay", "ok", "go", "ahead", "do", "definitely"}
+_NO_WORDS = {"no", "nope", "nah", "dont", "don't", "skip", "not", "never"}
+
+
+def _parse_yes_no(transcript: str) -> bool | None:
+    """None (not True/False) on anything ambiguous — the caller must treat
+    that as "decline", never as "confirm" (fail-safe: never learn on an
+    unclear answer, same guardrail as the arbiter's malformed-output case).
+    """
+    words = set(re.findall(r"[a-z']+", transcript.lower()))
+    if words & _NO_WORDS:
+        return False
+    if words & _YES_WORDS:
+        return True
+    return None
+
+
+def _read_pending_learn_confirm() -> dict | None:
+    """Read + delete the marker. Returns None if missing/stale/corrupt, in
+    which case any referenced frame file is best-effort cleaned up too —
+    it's single-use and would otherwise sit there orphaned.
+    """
+    info = None
+    try:
+        with open(PENDING_LEARN_CONFIRM_MARKER, encoding="utf-8") as f:
+            raw = json.load(f)
+        if time.time() - float(raw.get("ts", 0)) <= PENDING_LEARN_CONFIRM_STALE_S:
+            info = raw
+        else:
+            frame_path = raw.get("frame_path")
+            if frame_path:
+                try:
+                    os.remove(frame_path)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    try:
+        os.remove(PENDING_LEARN_CONFIRM_MARKER)
+    except OSError:
+        pass
+    return info
+
+
+def _confirm_learn_sample(name: str, frame_path: str) -> bool:
+    """Shell out to stackchan-vision-loop.py --confirm-learn — same reuse
+    reasoning as _complete_enrollment above."""
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stackchan-vision-loop.py")
+    try:
+        result = subprocess.run(
+            [sys.executable, script_path, "--confirm-learn", name, frame_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        logger.info(
+            "confirm-learn subprocess name=%r exit=%s stdout=%r",
+            name, result.returncode, result.stdout[-500:],
+        )
+        return result.returncode == 0 and "Learned" in result.stdout
+    except Exception:
+        logger.exception("confirm-learn subprocess failed")
+        return False
+
+
 class MCPSession:
     def __init__(self, url, timeout=30):
         self.url = url
@@ -586,6 +673,37 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                 _speak(_pick("enroll-confirm", ENROLL_CONFIRM_PHRASES).format(name=name))
             else:
                 _speak(_pick("enroll-fail", ENROLL_FAIL_PHRASES))
+            return
+
+        # The arbiter judged a fresh capture "definite + good" and proposed
+        # learning it (see sensor_reactor.py's LEARN_CONFIRM_ASK_PHRASES) —
+        # this tap-to-talk answer is a yes/no to that, not a normal question.
+        pending_learn = _read_pending_learn_confirm()
+        if pending_learn is not None:
+            answer = _parse_yes_no(transcript)
+            logger.info(
+                "session=%s learn-confirm transcript=%r answer=%r name=%r",
+                session_id, transcript, answer, pending_learn.get("name"),
+            )
+            _clear_thinking_marker()
+            if answer is True:
+                ok = _confirm_learn_sample(
+                    pending_learn.get("name", ""), pending_learn.get("frame_path", "")
+                )
+                _speak(
+                    _pick("learn-confirm-yes", LEARN_CONFIRM_YES_PHRASES) if ok
+                    else _pick("learn-confirm-fail", LEARN_CONFIRM_FAIL_PHRASES)
+                )
+            else:
+                # False or ambiguous (None) both decline — fail-safe, never
+                # learn on an unclear answer.
+                frame_path = pending_learn.get("frame_path")
+                if frame_path:
+                    try:
+                        os.remove(frame_path)
+                    except OSError:
+                        pass
+                _speak(_pick("learn-declined", LEARN_CONFIRM_DECLINED_PHRASES))
             return
 
         t1 = time.time()

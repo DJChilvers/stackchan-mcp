@@ -44,6 +44,7 @@ Stop: kill the process (or use stackchan-vision-loop-start.vbs to run
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -52,6 +53,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Needed for the arbiter's STACKCHAN_VOICE_ANTHROPIC_API_KEY (same .env
+# entry the voice bridge uses) — this script never loaded .env before the
+# arbiter existed, since everything else here is fully local/no-API-key.
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ── single-instance lock (same pattern as stackchan-idle.py) ───────────────
 import atexit
@@ -100,6 +109,13 @@ SFACE_MODEL = os.environ.get(
 KNOWN_FACES_PATH = os.environ.get(
     "STACKCHAN_VISION_KNOWN_FACES", os.path.join(SCRIPT_DIR, "known_faces.json")
 )
+# One representative aligned face-crop per enrolled name — Claude can't
+# compare against a raw embedding vector, it needs an actual photo. Written
+# during enrollment (see _enroll), read by the arbiter (see
+# _call_arbiter/_ask_claude_arbiter below).
+REFERENCE_PHOTOS_DIR = os.environ.get(
+    "STACKCHAN_VISION_REFERENCE_PHOTOS_DIR", os.path.join(SCRIPT_DIR, "known_faces_photos")
+)
 
 # SFace's documented default cosine-similarity threshold for "same person".
 MATCH_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MATCH_THRESHOLD", "0.363"))
@@ -128,6 +144,35 @@ MOTION_DIFF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MOTION_THRESHOLD"
 # bridge.py checks this to know a tap-to-answer transcript is probably a
 # name introduction rather than a normal question.
 PENDING_ENROLLMENT_MARKER = os.path.join(TEMP, "stackchan-pending-enrollment")
+
+# ── arbiter: Claude second opinion for genuinely uncertain local matches ──
+# SFace's cosine score has no built-in middle ground — this band around
+# MATCH_THRESHOLD is where the local model is genuinely unsure and a second
+# opinion is worth the API cost; clearly-known or clearly-unknown scores
+# never call the arbiter, so this is NOT a per-tick cost (2026-07-02 design
+# discussion: costs only apply to real ambiguity, not continuous polling).
+UNCERTAIN_LOW = float(os.environ.get("STACKCHAN_VISION_UNCERTAIN_LOW", "0.2"))
+UNCERTAIN_HIGH = float(os.environ.get("STACKCHAN_VISION_UNCERTAIN_HIGH", "0.5"))
+ARBITER_MODEL = os.environ.get("STACKCHAN_VISION_ARBITER_MODEL", "claude-haiku-4-5-20251001")
+# Reuses the voice bridge's key — same Anthropic account, no reason for a
+# second one just because this is a different script.
+ARBITER_ANTHROPIC_KEY_ENV = "STACKCHAN_VOICE_ANTHROPIC_API_KEY"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+# "Should I remember that view of you?" learning-confirmation prompt: at
+# most once per person per this many seconds, independent of the hourly
+# greet cooldown, so a run of good-quality uncertain frames can't turn into
+# spam. Default 24h (2026-07-02 decision: "once per day per person").
+LEARN_CONFIRM_COOLDOWN_S = float(
+    os.environ.get("STACKCHAN_VISION_LEARN_CONFIRM_COOLDOWN_S", str(24 * 60 * 60))
+)
+# Cap growth per person — "a handful of distinct good angles beats many
+# marginal ones" (brief's guardrail). Once a name has this many samples,
+# stop proposing new ones even if a genuinely new good view shows up.
+LEARN_SAMPLE_CAP = int(os.environ.get("STACKCHAN_VISION_LEARN_SAMPLE_CAP", "8"))
+# Written when a definite+good arbiter verdict wants to propose learning;
+# stackchan-voice-bridge.py checks this on the next tap-to-talk answer.
+PENDING_LEARN_CONFIRM_MARKER = os.path.join(TEMP, "stackchan-pending-learn-confirm")
 
 # Shared with the idle loop / led-chase / voice bridge — skip a tick rather
 # than fight Claude Code's active work or an in-progress voice exchange.
@@ -228,13 +273,15 @@ def _take_photo(sess: MCPSession, question: str) -> str | None:
         return None
 
 
-def _fire_reaction(person: str, name: str | None = None) -> None:
+def _fire_reaction(person: str, name: str | None = None, propose_learn: bool = False) -> None:
     # Forward the recognized name so the greeting can actually use it —
     # recognition always knew WHO it matched, but only "known"/"unknown"
     # used to survive this hop, so greetings were stuck generic.
     url = f"{REACT_URL}?person={person}"
     if name:
         url += "&name=" + urllib.parse.quote(name)
+    if propose_learn:
+        url += "&learn=1"
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             logger.info("fired react/recognize?person=%s -> %s", person, resp.status)
@@ -273,6 +320,18 @@ def _write_pending_enrollment_marker() -> None:
     try:
         with open(PENDING_ENROLLMENT_MARKER, "w") as f:
             f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _write_pending_learn_confirm_marker(name: str, frame_path: str) -> None:
+    """The frame itself is referenced here rather than recaptured — it's
+    already the exact frame the arbiter judged "definite + good", so
+    voice-bridge.py's confirmation flow reuses it directly for the
+    embedding rather than taking a fresh (possibly worse) shot."""
+    try:
+        with open(PENDING_LEARN_CONFIRM_MARKER, "w") as f:
+            json.dump({"name": name, "frame_path": frame_path, "ts": time.time()}, f)
     except Exception:
         pass
 
@@ -336,6 +395,13 @@ def _save_known_faces(data: dict) -> None:
     os.replace(tmp, KNOWN_FACES_PATH)
 
 
+def _save_reference_photo(name: str, aligned_crop) -> None:
+    import cv2
+    os.makedirs(REFERENCE_PHOTOS_DIR, exist_ok=True)
+    path = os.path.join(REFERENCE_PHOTOS_DIR, f"{name}.jpg")
+    cv2.imwrite(path, aligned_crop)
+
+
 def _best_match(recognizer, embedding, known: dict) -> tuple[str | None, float]:
     import numpy as np
     import cv2
@@ -350,32 +416,132 @@ def _best_match(recognizer, embedding, known: dict) -> tuple[str | None, float]:
     return best_name, best_score
 
 
+# ─── arbiter: Claude second opinion for uncertain local matches ───────────
+
+ARBITER_SYSTEM_PROMPT = (
+    "You are a face-verification arbiter for a home robot. You are shown "
+    "two images: a REFERENCE photo of a known person, and a NEW photo the "
+    "robot just captured. Decide whether the NEW photo shows the SAME "
+    "person as the REFERENCE photo.\n\n"
+    "Respond with ONLY a JSON object, no other text, no markdown, exactly "
+    "this shape:\n"
+    '{"match": "no|uncertain|probable|definite", "frame_quality": "poor|good", "notes": "short optional string"}\n\n'
+    "match — how confident the NEW photo is the SAME person as the "
+    "REFERENCE: no = clearly a different person, uncertain = genuinely "
+    "can't tell, probable = likely the same person, definite = confident "
+    "it is the same person.\n"
+    "frame_quality — whether the NEW photo alone is good enough to later "
+    "use as a reference image itself: poor if too dark, blurry, an extreme "
+    "angle, or the face is partially obscured; good otherwise."
+)
+
+
+def _call_arbiter(new_frame_path: str, reference_photo_path: str) -> dict:
+    """Ask Claude to compare a fresh capture against a reference photo.
+
+    Fails safe on any error or malformed response — never {"match":
+    "definite", ...} unless Claude genuinely said so. The caller must
+    never act on anything but this function's return value (never on raw
+    API text), per the guardrail: malformed output -> no action, no save.
+    """
+    fail_safe = {"match": "no", "frame_quality": "poor", "notes": "arbiter call failed"}
+    api_key = os.environ.get(ARBITER_ANTHROPIC_KEY_ENV, "").strip()
+    if not api_key:
+        logger.info("arbiter: no API key configured, skipping")
+        return fail_safe
+
+    try:
+        with open(reference_photo_path, "rb") as f:
+            ref_b64 = base64.b64encode(f.read()).decode("ascii")
+        with open(new_frame_path, "rb") as f:
+            new_b64 = base64.b64encode(f.read()).decode("ascii")
+    except Exception:
+        logger.exception("arbiter: failed to read comparison images")
+        return fail_safe
+
+    body = json.dumps({
+        "model": ARBITER_MODEL,
+        "max_tokens": 200,
+        "system": ARBITER_SYSTEM_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "REFERENCE photo:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": ref_b64}},
+                {"type": "text", "text": "NEW photo:"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": new_b64}},
+            ],
+        }],
+    }).encode()
+    req = urllib.request.Request(
+        ANTHROPIC_URL, data=body,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.loads(resp.read())
+        parts = data.get("content", [])
+        text = " ".join(p.get("text", "") for p in parts if p.get("type") == "text").strip()
+        # Despite the system prompt saying "no markdown", Claude sometimes
+        # wraps the JSON in a ```json ... ``` fence anyway (confirmed live
+        # 2026-07-02) — strip it before parsing rather than failing safe on
+        # every single call.
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        verdict = json.loads(text)
+        match = verdict.get("match")
+        quality = verdict.get("frame_quality")
+        if match not in ("no", "uncertain", "probable", "definite"):
+            raise ValueError(f"bad match value: {match!r}")
+        if quality not in ("poor", "good"):
+            raise ValueError(f"bad frame_quality value: {quality!r}")
+        result = {"match": match, "frame_quality": quality, "notes": verdict.get("notes", "")}
+        logger.info("arbiter verdict: %r", result)
+        return result
+    except Exception:
+        logger.exception("arbiter call or verdict parsing failed")
+        return fail_safe
+
+
 # ─── main polling loop ──────────────────────────────────────────────────────
 
 def _tick(
     detector, recognizer, sess: MCPSession, known: dict,
-    last_reaction_ts: dict, prev_small_box: list,
+    last_reaction_ts: dict, last_learn_ts: dict, prev_small_box: list,
 ) -> None:
     """One perception step: capture, detect/classify, write state, maybe react.
 
     No servo calls here — see module docstring. `prev_small_box` is a
     single-element list used as a mutable "out param" so motion-diff has
     the previous tick's downscaled frame to compare against.
+
+    Three-band classification (2026-07-02, arbiter design): SFace's cosine
+    score alone has no middle ground, so scores are split into confidently-
+    known / genuinely-uncertain / confidently-unknown. Only the uncertain
+    band calls the Claude arbiter (_call_arbiter) — this is what keeps the
+    arbiter from becoming a per-tick API cost, the whole reason the local
+    loop exists in the first place.
     """
     import cv2
 
     path = _take_photo(sess, "ambient scan")
     if path is None:
         return
-    try:
-        img = cv2.imread(path)
-    finally:
-        try:
-            os.remove(path)  # don't accumulate captures forever — this loop
-        except OSError:      # snaps one every POLL_INTERVAL_S indefinitely.
-            pass
+    img = cv2.imread(path)
     if img is None:
         logger.warning("could not decode captured image at %s", path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return
 
     small = _small_gray(img)
@@ -389,6 +555,10 @@ def _tick(
             "tick: no face in frame%s", " (motion detected)" if motion_detected else ""
         )
         _write_vision_state(False, None, None, 0.0, 0.0, motion_detected)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return
 
     frame_h, frame_w = img.shape[:2]
@@ -404,32 +574,86 @@ def _tick(
     dy = float((fy - frame_h / 2) / (frame_h / 2))
 
     embedding = _embed_face(recognizer, img, face)
-    name, score = _best_match(recognizer, embedding, known)
+    candidate_name, score = _best_match(recognizer, embedding, known)
 
-    if name is not None and score >= MATCH_THRESHOLD:
-        person, key = "known", name
+    propose_learn = False
+
+    if candidate_name is not None and score >= UNCERTAIN_HIGH:
+        person, key, name = "known", candidate_name, candidate_name
+    elif candidate_name is None or score < UNCERTAIN_LOW:
+        person, key, name = "unknown", "unknown", None
     else:
-        person, key = "unknown", "unknown"
+        # Genuinely uncertain — worth a second opinion, but only if there's
+        # actually a reference photo for the best candidate to compare
+        # against (older enrollments predating this feature won't have one).
+        ref_photo = os.path.join(REFERENCE_PHOTOS_DIR, f"{candidate_name}.jpg")
+        if not os.path.exists(ref_photo):
+            logger.info(
+                "tick: uncertain score=%.3f for %r but no reference photo — treating as unknown",
+                score, candidate_name,
+            )
+            person, key, name = "unknown", "unknown", None
+        else:
+            verdict = _call_arbiter(path, ref_photo)
+            match, quality = verdict["match"], verdict["frame_quality"]
+            logger.info(
+                "tick: uncertain score=%.3f candidate=%r -> arbiter match=%s quality=%s",
+                score, candidate_name, match, quality,
+            )
+            if match == "no":
+                person, key, name = "unknown", "unknown", None
+            elif match == "uncertain":
+                # Decision table: no greet, no learn, just stay quiet and
+                # try again next tick — don't guess either way.
+                person, key, name = None, None, None
+            else:  # probable or definite
+                person, key, name = "known", candidate_name, candidate_name
+                if match == "definite" and quality == "good":
+                    existing_count = len(known.get(candidate_name, []))
+                    if (
+                        existing_count < LEARN_SAMPLE_CAP
+                        and time.time() - last_learn_ts.get(candidate_name, 0.0) >= LEARN_CONFIRM_COOLDOWN_S
+                    ):
+                        propose_learn = True
 
-    _write_vision_state(True, person, name if person == "known" else None, dx, dy, False)
+    _write_vision_state(True, person, name, dx, dy, False)
 
     now = time.time()
-    if now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S:
+    reacted = False
+    if key and now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S:
         last_reaction_ts[key] = now
         logger.info("face detected: person=%s key=%s score=%.3f", person, key, score)
-        _fire_reaction(person, name if person == "known" else None)
+        _fire_reaction(person, name, propose_learn=propose_learn)
+        reacted = True
         if person == "unknown":
             _write_pending_enrollment_marker()
+
+    # Learning proposal is piggybacked on the greet firing (simplification:
+    # the greet's own hourly cooldown already bounds this, on top of its
+    # own daily cooldown, so it can't nag even though it isn't a fully
+    # independent trigger path). If nothing fired this tick, the frame is
+    # just discarded below like any other ambient tick.
+    if propose_learn and reacted:
+        last_learn_ts[candidate_name] = now
+        _write_pending_learn_confirm_marker(candidate_name, path)
+        path = None  # ownership transferred to the marker — don't delete it
+
+    if path is not None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _loop(once: bool) -> None:
     detector = _load_detector()
     recognizer = _load_recognizer()
     last_reaction_ts: dict = {}
+    last_learn_ts: dict = {}
     prev_small_box: list = [None]
     logger.info(
-        "starting vision loop (poll=%.0fs cooldown=%.0fs threshold=%.3f)",
-        POLL_INTERVAL_S, COOLDOWN_S, MATCH_THRESHOLD,
+        "starting vision loop (poll=%.0fs cooldown=%.0fs threshold=%.3f uncertain=%.2f-%.2f)",
+        POLL_INTERVAL_S, COOLDOWN_S, MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
     )
     while True:
         if _should_skip_tick():
@@ -444,7 +668,7 @@ def _loop(once: bool) -> None:
         sess = MCPSession(GATEWAY_MCP)
         try:
             sess.initialize()
-            _tick(detector, recognizer, sess, known, last_reaction_ts, prev_small_box)
+            _tick(detector, recognizer, sess, known, last_reaction_ts, last_learn_ts, prev_small_box)
         except Exception:
             logger.exception("tick failed")
         if once:
@@ -466,6 +690,8 @@ def _enroll(name: str, samples: int, interval: float) -> None:
     got = 0
     attempts = 0
     max_attempts = samples * 5  # generous retry budget for missed detections
+    best_crop = None
+    best_area = -1.0
     while got < samples and attempts < max_attempts:
         attempts += 1
         path = _take_photo(sess, "enrollment capture")
@@ -492,6 +718,12 @@ def _enroll(name: str, samples: int, interval: float) -> None:
         feat = _embed_face(recognizer, img, face)
         collected.append(feat.flatten().tolist())
         got += 1
+        # Keep the biggest (closest/clearest) face as the reference photo —
+        # cheap proxy for "best quality" without a separate quality check.
+        area = float(face[2] * face[3])
+        if area > best_area:
+            best_area = area
+            best_crop = recognizer.alignCrop(img, face)
         print(f"  [{got}/{samples}] captured")
         time.sleep(interval)
 
@@ -501,7 +733,51 @@ def _enroll(name: str, samples: int, interval: float) -> None:
 
     known[name] = collected
     _save_known_faces(known)
+    if best_crop is not None:
+        _save_reference_photo(name, best_crop)
     print(f"Enrolled '{name}' with {len(collected)} sample(s) total in {KNOWN_FACES_PATH}.")
+
+
+def _confirm_learn(name: str, frame_path: str) -> bool:
+    """Append a learning sample from an already-captured frame (the exact
+    one the arbiter judged "definite + good") rather than taking a fresh,
+    possibly worse shot. Called by stackchan-voice-bridge.py's tap-to-talk
+    confirmation flow. Cleans up the frame file regardless of outcome — it's
+    single-use, referenced only by the now-consumed marker.
+    """
+    detector = _load_detector()
+    recognizer = _load_recognizer()
+    try:
+        import cv2
+        img = cv2.imread(frame_path)
+        if img is None:
+            print(f"Could not read frame at {frame_path}")
+            return False
+        face = _detect_largest_face(detector, img)
+        if face is None:
+            print("No face found in the saved frame")
+            return False
+
+        known = _load_known_faces()
+        existing = list(known.get(name, []))
+        if len(existing) >= LEARN_SAMPLE_CAP:
+            print(f"'{name}' already has {len(existing)} samples (cap {LEARN_SAMPLE_CAP}) — skipping")
+            return False
+
+        feat = _embed_face(recognizer, img, face)
+        existing.append(feat.flatten().tolist())
+        known[name] = existing
+        _save_known_faces(known)
+        # This frame was already judged "definite + good" by the arbiter —
+        # at least as good as whatever reference photo exists, so refresh it.
+        _save_reference_photo(name, recognizer.alignCrop(img, face))
+        print(f"Learned a new sample for '{name}' ({len(existing)} total).")
+        return True
+    finally:
+        try:
+            os.remove(frame_path)
+        except OSError:
+            pass
 
 
 def main() -> None:
@@ -509,6 +785,10 @@ def main() -> None:
     parser.add_argument("--enroll", metavar="NAME", help="teach a new/additional face sample")
     parser.add_argument("--samples", type=int, default=3, help="samples to capture when enrolling")
     parser.add_argument("--interval", type=float, default=2.0, help="seconds between enroll samples")
+    parser.add_argument(
+        "--confirm-learn", nargs=2, metavar=("NAME", "FRAME_PATH"),
+        help="append a learning sample from an already-captured frame",
+    )
     parser.add_argument("--once", action="store_true", help="run a single tick then exit (testing)")
     args = parser.parse_args()
 
@@ -517,6 +797,10 @@ def main() -> None:
         # the single-instance lock so it can run even while the background
         # loop is already active.
         _enroll(args.enroll, args.samples, args.interval)
+        return
+
+    if args.confirm_learn:
+        _confirm_learn(*args.confirm_learn)
         return
 
     _acquire_lock()

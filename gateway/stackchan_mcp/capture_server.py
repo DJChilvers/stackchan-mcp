@@ -436,6 +436,9 @@ async def handle_react(request: web.Request) -> web.Response:
       type       desk|pickup           (tantrum)
       person     known|unknown         (recognize)
       name       <enrolled name>       (recognize, optional — greet by name)
+      learn      1                     (recognize, optional — also propose
+                                         learning this view; see
+                                         stackchan-vision-loop.py's arbiter)
 
     Returns 200 {ok, behavior} if accepted, 409 if busy, 503 if no device.
     """
@@ -458,6 +461,8 @@ async def handle_react(request: web.Request) -> web.Response:
         # Forwarded as person_name: trigger()/_run() already use `name` for
         # the behavior name, so a `name` kwarg would collide (TypeError).
         kwargs["person_name"] = request.rel_url.query["name"]
+    if "learn" in request.rel_url.query:
+        kwargs["propose_learn"] = request.rel_url.query["learn"] == "1"
 
     accepted = await gateway.sensor_reactor.trigger(behavior, **kwargs)
     if not accepted:
