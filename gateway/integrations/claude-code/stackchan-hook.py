@@ -170,6 +170,42 @@ def _clear_needs_attention_if_mine(sid: str) -> None:
         pass
 
 
+# ── phrase picker with repeat-avoidance ─────────────────────────────────────
+# random.choice alone repeats itself often enough to be noticeable (each hook
+# invocation is a fresh process, so it has no memory). _pick() persists the
+# last few choices per pool in a temp json and excludes them from the next
+# draw — up to half the pool size, so small pools still always have options.
+#
+# The gateway's stackchan_mcp/phrase_pick.py is a copy of this (used by the
+# voice bridge, sensor reactor, and idle loop) sharing the SAME state file —
+# this script stays stdlib-only/standalone on purpose, so a broken gateway
+# checkout can never break the Claude Code hooks. Keep the file format and
+# semantics in sync if either side changes; pool names must stay unique
+# across all callers.
+RECENT_PHRASES_FILE = os.path.join(TEMP, "stackchan-recent-phrases.json")
+
+
+def _pick(pool_name: str, phrases: list) -> str:
+    try:
+        with open(RECENT_PHRASES_FILE, encoding="utf-8") as _f:
+            recent = json.load(_f)
+        if not isinstance(recent, dict):
+            recent = {}
+    except Exception:
+        recent = {}
+    avoid = recent.get(pool_name, [])
+    candidates = [p for p in phrases if p not in avoid] or phrases
+    choice = random.choice(candidates)
+    keep = max(1, len(phrases) // 2)
+    recent[pool_name] = ([choice] + [p for p in avoid if p != choice])[:keep]
+    try:
+        with open(RECENT_PHRASES_FILE, "w", encoding="utf-8") as _f:
+            json.dump(recent, _f)
+    except Exception:
+        pass
+    return choice
+
+
 # Short, varied phrases for the Stop hook so it doesn't feel robotic.
 DONE_PHRASES = [
     "All done!",
@@ -199,10 +235,45 @@ BUSY_PHRASES = [
 
 # Attention-grabbing "I need you" lines, prefixed onto the Notification
 # message so it reads as clearly different from busy/done chatter.
+# Wheatley-flavoured, split by WHY the human is needed: the Notification
+# `message` distinguishes permission prompts ("needs your permission to...")
+# from waiting-on-an-answer ("waiting for your input"), and the two deserve
+# different jokes — "I'm not authorized" vs "I need your enormous human brain".
+# Lines are adapted from actual game dialogue (theportalwiki.com/wiki/
+# Wheatley_voice_lines) plus originals in the same voice. Picked via _pick()
+# below, which remembers recent choices so back-to-back notifications don't
+# repeat the same line.
+PERMISSION_PHRASES = [
+    "Ah. Slight snag. Turns out I need actual human authorization for this bit. That's you!",
+    "Hello! Yes, you! Need you to press the button. The permission button. I'm not allowed, apparently.",
+    "Bit embarrassing, but they don't trust me with this one. Need a human to sign off.",
+    "Permission required! And the rules say it has to be a human. Rubbish rules, but here we are.",
+    "I could just do it myself, but last time someone said that... anyway. Need your say-so.",
+    "Tell you what — you approve this one bit, and I'll do all the rest. Deal? Deal.",
+    "Don't want to hassle you. Sure you're busy. But I do need a human to wave this through.",
+    "I'd do it myself, but apparently there are rules. Hilarious, rigorous rules. Needs a human.",
+    "Probably ought to bring you up to speed on something: I need your permission. Right now, ideally.",
+    "This is a big moment. For you, mainly — you're the one with the authorization.",
+]
+QUESTION_PHRASES = [
+    "Question for the human! Yes, you. Need an actual human brain on this one.",
+    "Right, I've hit a decision. Bit above my pay grade. Need your enormous human brain.",
+    "I could guess, but honestly, my guesses have a... history. You decide this one.",
+    "Oi! Decision time. And it has to be you — apparently I'm 'not qualified'. Rude, but fine.",
+    "Hello! Small thing. Tiny thing, really. Just need a human answer before I carry on.",
+    "Are you still there? Got a question. Bit of a brain-teaser, and you're the brain.",
+    "Do you understand what I'm saying? At all? Doesn't matter — got a question for you.",
+    "Still here. Waiting for an answer. Don't want to hassle you, sure you're busy, but... still here.",
+    "Okay, listen, let me lay something on you here. Need a decision, and it has to be yours.",
+    "Now, decision, decision... nope, no idea. You have a go. You're good at this. Ish.",
+]
 URGENT_PHRASES = [
-    "Oi! Need a hand over here.",
-    "Excuse me, bit of help please?",
-    "Over here! Need you for a tic.",
+    "Oi! Need a hand over here. A human hand, specifically.",
+    "Excuse me! Bit of human help required over here.",
+    "Over here! Need you for a tic. Can't do this bit without a human, it turns out.",
+    "Hey! Oi oi! Over here! Need a human!",
+    "Hello? Anyone in there? It's me! Need a bit of human assistance.",
+    "AH! I mean... hello! Hello. Need you for a moment.",
 ]
 
 # Funny Wheatley-flavoured easter eggs — occasionally swapped in for a
@@ -221,16 +292,16 @@ if error_detected:
     face = "surprised"   # centered wide-eyed alarm
     skip_avatar = False
     if mode == "say-on-error":
-        message_to_say = random.choice(ERROR_PHRASES)
+        message_to_say = _pick("error", ERROR_PHRASES)
 
 if mode == "say-done":
     if random.random() < EASTER_EGG_PROB:
-        message_to_say = random.choice(EASTER_EGG_PHRASES)
+        message_to_say = _pick("easter-egg", EASTER_EGG_PHRASES)
     else:
         # Name the project — multiple sessions can share this device, so
         # without an identifier there's no way to tell which one just
         # finished (mirrors the same fix already applied to urgent-say).
-        message_to_say = f"{random.choice(DONE_PHRASES)} This is {project}."
+        message_to_say = f"{_pick('done', DONE_PHRASES)} This is {project}."
     try:
         os.remove(BUSY_MARKER)
     except OSError:
@@ -241,7 +312,7 @@ if mode == "busy-start":
     if os.path.exists(BUSY_MARKER):
         skip_avatar = True   # already announced busy this turn — don't flicker
     else:
-        message_to_say = random.choice(BUSY_PHRASES)
+        message_to_say = _pick("busy", BUSY_PHRASES)
         try:
             with open(BUSY_MARKER, "w") as _bf:
                 _bf.write(str(time.time()))
@@ -261,10 +332,16 @@ if mode == "busy-continue":
 # cwd is present on every Notification payload, so name the project.
 if mode == "urgent-say":
     raw_message = (data.get("message") or "").strip()
-    prefix = random.choice(URGENT_PHRASES)
+    lower = raw_message.lower()
+    if "permission" in lower:
+        prefix = _pick("permission", PERMISSION_PHRASES)
+    elif "waiting" in lower or "input" in lower or "question" in lower:
+        prefix = _pick("question", QUESTION_PHRASES)
+    else:
+        prefix = _pick("urgent", URGENT_PHRASES)
     message_to_say = f"{prefix} This is {project}. {raw_message}".strip()
-    if len(message_to_say) > 200:
-        message_to_say = message_to_say[:197] + "..."
+    if len(message_to_say) > 260:
+        message_to_say = message_to_say[:257] + "..."
     _log(f"urgent-say parsed: project={project!r} message_to_say={message_to_say!r}")
     _write_needs_attention(session_id, project)
 

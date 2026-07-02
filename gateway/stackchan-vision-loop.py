@@ -50,6 +50,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ── single-instance lock (same pattern as stackchan-idle.py) ───────────────
@@ -227,8 +228,13 @@ def _take_photo(sess: MCPSession, question: str) -> str | None:
         return None
 
 
-def _fire_reaction(person: str) -> None:
+def _fire_reaction(person: str, name: str | None = None) -> None:
+    # Forward the recognized name so the greeting can actually use it —
+    # recognition always knew WHO it matched, but only "known"/"unknown"
+    # used to survive this hop, so greetings were stuck generic.
     url = f"{REACT_URL}?person={person}"
+    if name:
+        url += "&name=" + urllib.parse.quote(name)
     try:
         with urllib.request.urlopen(url, timeout=10) as resp:
             logger.info("fired react/recognize?person=%s -> %s", person, resp.status)
@@ -411,7 +417,7 @@ def _tick(
     if now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S:
         last_reaction_ts[key] = now
         logger.info("face detected: person=%s key=%s score=%.3f", person, key, score)
-        _fire_reaction(person)
+        _fire_reaction(person, name if person == "known" else None)
         if person == "unknown":
             _write_pending_enrollment_marker()
 

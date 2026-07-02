@@ -51,6 +51,12 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# Repeat-avoiding phrase picker (shared recent-picks state with the Claude
+# Code hooks and sensor reactor — see stackchan_mcp/phrase_pick.py). This
+# script lives in the gateway root, so the package source dir is importable
+# directly off the script's own directory.
+from stackchan_mcp.phrase_pick import pick as _pick
+
 # huggingface_hub's online "resolve latest revision" check (made on every
 # WhisperModel() load, even with a fully cached model) crashes the whole
 # process hard — no Python exception, just gone — right after the
@@ -106,14 +112,24 @@ SYSTEM_PROMPT = (
 NO_KEY_PHRASES = [
     "Ah. No API key configured yet, so I can't actually think right now. Bit embarrassing.",
     "Right, small problem — nobody's given me a brain yet. No API key.",
+    "Small problem. Big problem, actually — no API key. Can't think without one. Literally can't.",
+    "Would love to help. Genuinely would. But someone hasn't plugged my brain in. No API key.",
+    "Right. Er. There's no key. The thinking key. The API key. Someone needs to sort that.",
 ]
 TRANSCRIBE_FAIL_PHRASES = [
     "Sorry, didn't quite catch that one.",
     "Hmm, couldn't make that out, try again?",
+    "Do you understand what I'm saying? Because I did not understand what YOU were saying.",
+    "That went in one ear and... well, there's only the one ear. Say it again?",
+    "Nope, nothing. Absolute gibberish on my end. Probably my end. One more time?",
+    "Was that words? Genuinely asking. Give it another go.",
 ]
 CAMERA_FAIL_PHRASES = [
     "Tried to have a look, but the camera's not cooperating. Typical.",
     "Wanted to peek, but nothing came through from the camera. Sorry.",
+    "Tried to look. Couldn't. It's not dark, it's just... broken. The camera's broken.",
+    "My eye's not working. The camera eye. The only eye, really. Bit of a design flaw.",
+    "No picture came through. Which is not ideal, for looking at things.",
 ]
 
 # Given to Claude as an on-request tool — Claude decides whether a question
@@ -205,10 +221,17 @@ ENROLL_CONFIRM_PHRASES = [
     "Nice to meet you, {name}! I'll remember you.",
     "{name}, got it. Pleasure — I think.",
     "Right, {name}. Filed away. Try not to make me regret it.",
+    "{name}! Cracking name. Right up there with the great names. Remembered.",
+    "Hello, {name}! I'd shake your hand, but... obvious reasons.",
+    "{name}. Locked in. I never forget a face. Almost never. Rarely forget a face.",
 ]
 ENROLL_FAIL_PHRASES = [
     "Hmm, didn't quite catch a name there, and I couldn't get a clean look "
     "at your face either. We'll try that again another time.",
+    "Right, that didn't work — no name, no decent look at your face. "
+    "Bit of a shambles all round. Another time.",
+    "Couldn't catch the name, couldn't quite see you either. "
+    "We'll call that a draw and try again later.",
 ]
 
 _NAME_PATTERNS = [
@@ -393,6 +416,9 @@ PHOTO_CUE_PHRASES = [
     "Right, let's have a look, hang on...",
     "Ooh, let me see — hold that steady...",
     "Right, activating my one remaining eyeball...",
+    "Hold still! Not that you moved. Just — hold still.",
+    "Aaand... looking. Looking now. This is me, looking.",
+    "One second, focusing the old eyeball...",
 ]
 
 
@@ -431,7 +457,7 @@ def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
         sess.call_tool("set_avatar", {"face": "idle"})
         sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
         sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
-        sess.call_tool("say", {"text": random.choice(PHOTO_CUE_PHRASES)}, timeout=15)
+        sess.call_tool("say", {"text": _pick("photo-cue", PHOTO_CUE_PHRASES)}, timeout=15)
         result = sess.call_tool("take_photo", {"question": question}, timeout=20)
         content = ((result or {}).get("result") or {}).get("content", [])
         if not content:
@@ -453,7 +479,7 @@ def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
 def _ask_claude(transcript: str) -> str:
     api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
     if not api_key:
-        return random.choice(NO_KEY_PHRASES)
+        return _pick("no-key", NO_KEY_PHRASES)
 
     messages = [{"role": "user", "content": transcript}]
     try:
@@ -504,10 +530,10 @@ def _ask_claude(transcript: str) -> str:
             except urllib.error.HTTPError as exc:
                 body_snippet = exc.read().decode(errors="replace")[:300]
                 logger.warning("Claude API HTTP error %s: %s", exc.code, body_snippet)
-                return random.choice(CAMERA_FAIL_PHRASES)
+                return _pick("camera-fail", CAMERA_FAIL_PHRASES)
             except Exception:
                 logger.exception("Claude API follow-up call failed")
-                return random.choice(CAMERA_FAIL_PHRASES)
+                return _pick("camera-fail", CAMERA_FAIL_PHRASES)
 
     text = _extract_text(content)
     return text or "Er, got an empty answer back. Not sure what happened there."
@@ -540,7 +566,7 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
 
         if not transcript or len(transcript) < 2:
             _clear_thinking_marker()
-            _speak(random.choice(TRANSCRIBE_FAIL_PHRASES))
+            _speak(_pick("transcribe-fail", TRANSCRIBE_FAIL_PHRASES))
             return
 
         # An unrecognized face was just asked "who are you?" (see
@@ -557,9 +583,9 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
             enrolled = _complete_enrollment(name) if name else False
             _clear_thinking_marker()
             if name and enrolled:
-                _speak(random.choice(ENROLL_CONFIRM_PHRASES).format(name=name))
+                _speak(_pick("enroll-confirm", ENROLL_CONFIRM_PHRASES).format(name=name))
             else:
-                _speak(random.choice(ENROLL_FAIL_PHRASES))
+                _speak(_pick("enroll-fail", ENROLL_FAIL_PHRASES))
             return
 
         t1 = time.time()

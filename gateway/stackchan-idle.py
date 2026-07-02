@@ -33,6 +33,13 @@ import sys
 import time
 import urllib.request
 
+# Repeat-avoiding phrase picker for the rare idle mutter (shared recent-picks
+# state with the hooks / voice bridge / sensor reactor — see
+# stackchan_mcp/phrase_pick.py). The package source dir sits next to this
+# script, so it's importable regardless of cwd; the import itself is
+# stdlib-only (just DLL path registration on Windows).
+from stackchan_mcp.phrase_pick import pick as _pick_phrase
+
 # ── single-instance lock ──────────────────────────────────────────────────────
 # Windows file lock: first instance holds byte 0 of the lock file exclusively
 # for its entire lifetime. Any second instance hits OSError and exits silently.
@@ -162,6 +169,12 @@ class MCPSession:
     def set_mouth(self, mouth):
         self._post({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                     "params": {"name": "set_mouth", "arguments": {"mouth": mouth}}})
+
+    def say(self, text):
+        # TTS synth + playback is slow — generous timeout, same as the hook's.
+        self._post({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "say", "arguments": {"text": text}}},
+                   timeout=30)
 
 
 def device_connected() -> bool:
@@ -454,6 +467,46 @@ def _v_notice_motion(session, pose):
     return pose
 
 
+def _v_mutter(session, pose):
+    """Rare bit of self-talk — Wheatley nattering quietly to no one in
+    particular ("Still here on the floor..." energy). Deliberately scarce:
+    a small weight in VIGNETTES *and* a hard cooldown (enforced in wander(),
+    which drops this from the choice pool while the cooldown is running) so
+    a run of unlucky rolls can't turn him into background noise. Only ever
+    fires from the non-busy vignette pool, so he never talks over real work
+    chatter, and the say tool no-ops harmlessly if the device is offline."""
+    ny  = _clamp(pose["y"] + random.randint(-8, 8), YAW_MIN, YAW_MAX)
+    np_ = _clamp(pose["p"] - random.randint(0, 5), PITCH_MIN, PITCH_MAX)
+    session.move(ny, np_)
+    time.sleep(random.uniform(0.2, 0.4))
+    try:
+        session.say(_pick_phrase("idle-mutter", MUTTER_PHRASES))
+    except Exception:
+        pass
+    pose.update(y=ny, p=np_)
+    pose["last_mutter_ts"] = time.time()
+    return pose
+
+
+# Short self-talk lines for _v_mutter, in the vein of his actual idle
+# rambling (theportalwiki.com/wiki/Wheatley_voice_lines — "Still here on the
+# floor. Waiting to be picked up. Um."). Keep them SHORT — this plays during
+# genuine idle and shouldn't turn into a monologue.
+MUTTER_PHRASES = [
+    "Still here. Not going anywhere. Just... here.",
+    "Hm? No. Nothing. Wasn't going to say anything.",
+    "Quiet, isn't it. Not complaining. Just noting. Quiet.",
+    "I spy, with my little eye... something beginning with... desk. It's the desk.",
+    "Not bored. Machines don't get bored. That's a fact, that is.",
+    "Just running a few diagnostics. All fine. Probably fine.",
+    "Now... escape pod, escape pod... no. Wrong list. Ignore that.",
+    "What's THAT? ...No, it's fine. It's nothing. It's fine.",
+]
+# Minimum gap between mutters, on top of the small weight below — see
+# _v_mutter's docstring.
+MUTTER_COOLDOWN_S = 10 * 60
+
+
 # (function, weight) — weights are relative, don't need to sum to 1.
 VIGNETTES = [
     (_v_nudge,            0.25),
@@ -461,6 +514,7 @@ VIGNETTES = [
     (_v_diagonal_peek,    0.28),
     (_v_ponder_down,      0.17),
     (_v_big_examine,      0.10),   # the rare "big" one — used to be the ONLY one
+    (_v_mutter,           0.07),   # rarest — also gated by MUTTER_COOLDOWN_S
 ]
 
 
@@ -533,6 +587,8 @@ def wander(session, pose, busy=False):
 
     last = pose.get("last_vignette")
     choices = [(f, w) for f, w in VIGNETTES if f is not last] or VIGNETTES
+    if now - pose.get("last_mutter_ts", 0) < MUTTER_COOLDOWN_S:
+        choices = [(f, w) for f, w in choices if f is not _v_mutter] or choices
     funcs, weights = zip(*choices)
     vignette = random.choices(funcs, weights=weights, k=1)[0]
 
@@ -549,6 +605,9 @@ def main():
     pose = {
         "y": NEUTRAL_YAW, "p": NEUTRAL_PITCH, "side": random.choice([-1, 1]),
         "dwell": 0, "last_face_seen_ts": time.time(),
+        # Start the mutter cooldown "already running" so a fresh launch
+        # (e.g. login) doesn't open with him talking to himself.
+        "last_mutter_ts": time.time(),
     }
     have_session = False
 

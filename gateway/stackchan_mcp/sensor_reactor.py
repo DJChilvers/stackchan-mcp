@@ -38,6 +38,7 @@ import time
 import uuid
 
 from .audio_stream import is_recording, start_recording, stop_recording
+from .phrase_pick import pick as _pick
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +430,24 @@ class SensorReactor:
         "Oh, look who's back — are we fixing this code or what?",
         "Ah, there you are! Good, good. Thought you'd abandoned me to the void.",
         "Oh, it's you. Brilliant. Right, where were we?",
+        "AH! You're alive! Brilliant. Knew you'd be fine. Never doubted it.",
+        "Hey hey hey! There you are. Right — back to it, yeah?",
+        "Oh! Hello! You're back. I was just... doing important things. Anyway.",
+        "You look terribl— ummm... good! Looking good, actually.",
+        "There you are. Been holding the fort. Nothing exploded. You're welcome.",
+    ]
+
+    # Name-aware variants, used when the vision loop passes through WHO it
+    # recognized (it always knew — see stackchan-vision-loop.py's
+    # _fire_reaction — but the name used to be dropped at this hop). Mixed
+    # into the same "greeting" pick pool as the generic lines so he doesn't
+    # open with your name every single time.
+    NAME_GREETING_PHRASES = [
+        "{name}! There you are! Brilliant. Right, where were we?",
+        "Oh! {name}! It's you! I knew that. Facial recognition. Very advanced stuff.",
+        "Ah, {name}. Good. Was starting to talk to myself. More than usual.",
+        "{name}! You're back! Everything's fine. Nothing happened while you were gone. Don't check.",
+        "Look who it is! {name}! My favourite human. Don't tell the others. There are no others.",
     ]
 
     # Fired for an unrecognized face. Tells them how to actually answer
@@ -437,10 +456,15 @@ class SensorReactor:
         "Oh, hello! Don't think we've met. Tap the screen and tell me your name?",
         "Ah, someone new! Go on then, tap the screen, who are you?",
         "Right, I don't recognize you — tap the screen and introduce yourself?",
+        "Hello! Yes, you, the new one. Tap the screen and tell me your name?",
+        "Ooh, a new human! Love it. Tap the screen and introduce yourself, go on.",
+        "Hold on — I don't know you, do I? Tap the screen, give us a name.",
     ]
 
     # ── 5. Face Recognized (local vision loop, no API cost) ───────────────
-    async def _behavior_recognize(self, person: str = "unknown", **_: object) -> None:
+    async def _behavior_recognize(
+        self, person: str = "unknown", person_name: str = "", **_: object
+    ) -> None:
         """stackchan-vision-loop.py spotted a face via fully-local detection.
 
         Deliberately small/quiet compared to the other behaviours — this can
@@ -456,7 +480,10 @@ class SensorReactor:
             await asyncio.sleep(0.22)
             await self._move(0, 46, "mid")
             await asyncio.sleep(0.35)
-            await self._say(random.choice(self.GREETING_PHRASES))
+            pool = list(self.GREETING_PHRASES)
+            if person_name:
+                pool += [p.format(name=person_name) for p in self.NAME_GREETING_PHRASES]
+            await self._say(_pick("greeting", pool))
             await self._face("idle")
             # Matches stackchan-hook.py's IDLE_LED so the ring doesn't stay
             # stuck on the acknowledgement colour.
@@ -479,6 +506,6 @@ class SensorReactor:
             _mark_active()
             await self._move(6, 40, "mid")
             await asyncio.sleep(0.3)
-            await self._say(random.choice(self.ASK_NAME_PHRASES))
+            await self._say(_pick("ask-name", self.ASK_NAME_PHRASES))
             await self._face("idle")
             await self._move(0, 45, "slow")
