@@ -90,3 +90,47 @@ it a much shorter timeout tuned to `duration_ms` rather than the generous
 one used for testing.
 
 Batch with the other two items above — same rebuild+reflash window.
+
+## Management-rail motor drive (companion controller)
+
+The Wheatley companion app (Android, `companion-android/` — talks to the gateway over the
+LAN) has a Control screen with **left/right drive controls for the management-rail motor(s)**
+Dominic is adding. There is **no firmware motor tool today** — the only actuators exposed are
+the servo head (`self.robot.set_head_angles`), the LEDs, and the camera. The motor L/R buttons
+are wired in the app but disabled ("firmware pending"), and the gateway's companion API already
+exposes a `POST /api/motor {direction, speed}` endpoint stubbed to **501 Not Implemented** until
+this lands.
+
+Next flash: add a motor-drive tool (e.g. `self.rail.drive(direction, speed)` /
+`self.motor.set(...)`) wired to whatever motor driver / Grove port the rail hardware ends up
+using (PWM / H-bridge). Then map it in `stdio_server.py`'s `tool_map` like the other device
+tools, and flip the companion `/api/motor` handler + the app's motor buttons from stub to live.
+
+- Confirm the motor driver wiring / port once the rail hardware is chosen.
+- No workaround (feature doesn't exist yet); nice-to-have, not a bug.
+
+## Live camera stream (companion "live" view)
+
+The companion app's Camera screen shows face-recognition results "live", but the firmware only
+supports **on-demand single-JPEG capture** (`self.camera.take_photo`). So v1 polls snapshots
+roughly every ~1.5 s — usable, but not smooth video. A genuine live view would need a firmware
+streaming path:
+
+- **MJPEG over an HTTP endpoint on the device**, or
+- **continuous frame push over the existing WebSocket** to the gateway, which the companion API
+  would then relay to the app (e.g. over `/ws/live`).
+
+Nice-to-have; the snapshot-polling fallback works fine until then. Batch with a reflash.
+
+## Batch-with opportunities (already known, worth doing in the same reflash window)
+
+Not new, but if the firmware is being rebuilt anyway for the items above, these are the highest-
+value extras (both documented in memory):
+
+- **On-screen directional eye-gaze** — new directional optic frames + a trigger tool, so the eye
+  can glance left/right/up/down on screen independently of the head servos. Would let the
+  companion Control screen (and the idle loop) do a real eye-slide instead of faking it with a
+  head flick.
+- **PSRAM free-before-fetch for matrix avatar sets** (`avatar_set_fetcher.cc`) — free the old
+  buffer before allocating the incoming one, so a matrix avatar set can be replaced without a
+  power-cycle (currently OOMs because both 3.45 MB buffers must coexist).
