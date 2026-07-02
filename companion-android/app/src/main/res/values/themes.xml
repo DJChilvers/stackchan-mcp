@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base application theme. Compose drives the real styling (ApertureTheme);
+         this exists so the manifest has a valid parent + a dark splash colour. -->
+    <style name="Theme.WheatleyCompanion" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#050607</item>
+        <item name="android:navigationBarColor">#050607</item>
+        <item name="android:windowBackground">#050607</item>
+    </style>
+</resources>
