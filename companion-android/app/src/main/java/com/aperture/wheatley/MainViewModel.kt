@@ -38,7 +38,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private val _messages = Channel<String>(Channel.BUFFERED)
     val messages = _messages.receiveAsFlow()
 
-    private fun client() = GatewayClient(config.value)
+    // "Look at this" vision chat state (Camera screen).
+    private val _visionBusy = MutableStateFlow(false)
+    val visionBusy: StateFlow<Boolean> = _visionBusy
+    private val _visionAnswer = MutableStateFlow<String?>(null)
+    val visionAnswer: StateFlow<String?> = _visionAnswer
+
+    fun client() = GatewayClient(config.value)
 
     init {
         // Poll telemetry while the app is alive.
@@ -75,6 +81,24 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         refreshStatus()
         loadCategories()
     }
+
+    /** "Look at this": capture + Claude vision + speak; shows the answer. */
+    fun askVision(question: String) = viewModelScope.launch {
+        _visionBusy.value = true
+        when (val r = client().visionAsk(question)) {
+            is Outcome.Ok -> {
+                _visionAnswer.value = r.data.answer
+                _messages.trySend("Wheatley looked ✓")
+            }
+            is Outcome.Err -> _messages.trySend("Look ✗ ${r.message}")
+        }
+        _visionBusy.value = false
+    }
+
+    fun clearVisionAnswer() { _visionAnswer.value = null }
+
+    /** Surface a one-off message through the shared snackbar. */
+    fun toast(text: String) { _messages.trySend(text) }
 
     /** Run an API action and surface a short result message. */
     fun act(label: String, block: suspend (GatewayClient) -> Outcome<*>) = viewModelScope.launch {

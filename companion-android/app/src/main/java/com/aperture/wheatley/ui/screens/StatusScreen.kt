@@ -12,14 +12,19 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -27,6 +32,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.aperture.wheatley.Link
 import com.aperture.wheatley.MainViewModel
 import com.aperture.wheatley.data.GatewayConfig
+import com.aperture.wheatley.data.Outcome
 import com.aperture.wheatley.ui.components.AperturePanel
 import com.aperture.wheatley.ui.components.ApertureButton
 import com.aperture.wheatley.ui.components.StatRow
@@ -34,6 +40,7 @@ import com.aperture.wheatley.ui.theme.ApertureAmber
 import com.aperture.wheatley.ui.theme.ApertureDanger
 import com.aperture.wheatley.ui.theme.ApertureGood
 import com.aperture.wheatley.ui.theme.ApertureTextDim
+import kotlinx.coroutines.launch
 
 @Composable
 fun StatusScreen(vm: MainViewModel) {
@@ -70,14 +77,48 @@ fun StatusScreen(vm: MainViewModel) {
             s?.deviceStatusError?.let { StatRow("Status err", it, ApertureDanger) }
         }
 
+        OrientationPanel(vm)
+
         SettingsPanel(cfg) { vm.saveConfig(it) }
 
         Text(
-            "LAN control console. Camera & Faces arrive in later phases.",
-            style = androidx.compose.material3.MaterialTheme.typography.bodySmall,
+            "LAN control console for Wheatley.",
+            style = MaterialTheme.typography.bodySmall,
             color = ApertureTextDim,
         )
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun OrientationPanel(vm: MainViewModel) {
+    val scope = rememberCoroutineScope()
+    var upsideDown by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        (vm.client().getOrientation() as? Outcome.Ok)?.let { upsideDown = it.data }
+    }
+
+    AperturePanel("Orientation") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Mounted upside-down", color = ApertureAmber, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Flips the camera 180° and mirrors the head controls — for the rail / inverted look-down mount.",
+                    color = ApertureTextDim, style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Switch(checked = upsideDown, onCheckedChange = { want ->
+                upsideDown = want
+                scope.launch {
+                    when (val r = vm.client().setOrientation(want)) {
+                        is Outcome.Ok -> vm.toast(if (want) "Upside-down ON" else "Upside-down OFF")
+                        is Outcome.Err -> { vm.toast("Orientation ✗ ${r.message}"); upsideDown = !want }
+                    }
+                }
+            })
+        }
     }
 }
 

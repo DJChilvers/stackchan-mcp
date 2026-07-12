@@ -28,9 +28,17 @@ import com.aperture.wheatley.ui.components.ApertureButton
 import com.aperture.wheatley.ui.components.ApertureOutlineButton
 import com.aperture.wheatley.ui.theme.ApertureTextDim
 
+// Reaction behaviours exposed by the gateway's sensor reactor.
+private val REACTIONS = listOf("panic", "hacker", "tantrum", "overtrack", "lights_out")
+
+/**
+ * Combined "Perform" screen: everything that makes Wheatley speak or put on a
+ * show — category sayings, free-text speech, the demo routine, and one-off
+ * reaction triggers. (Merges the former Sayings + Demo tabs.)
+ */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun SayingsScreen(vm: MainViewModel) {
+fun PerformScreen(vm: MainViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     var freeText by remember { mutableStateOf("") }
 
@@ -38,13 +46,28 @@ fun SayingsScreen(vm: MainViewModel) {
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        AperturePanel("Categories") {
-            Text("Pick a category — Wheatley says a fresh line each tap.",
-                style = MaterialTheme.typography.bodySmall, color = ApertureTextDim)
+        AperturePanel("Demo") {
+            Text(
+                "Runs a short choreographed routine: moves, expressions, a couple of lines, LEDs.",
+                style = MaterialTheme.typography.bodySmall, color = ApertureTextDim,
+            )
+            Spacer(Modifier.height(12.dp))
+            ApertureButton("▶  Run demo", modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                vm.act("Demo") { it.demo() }
+            }
+        }
+
+        AperturePanel("Sayings") {
+            Text(
+                "Pick a category — Wheatley says a fresh line each tap.",
+                style = MaterialTheme.typography.bodySmall, color = ApertureTextDim,
+            )
             Spacer(Modifier.height(10.dp))
             if (ui.categories.isEmpty()) {
-                Text("(no categories — check the connection)",
-                    style = MaterialTheme.typography.bodySmall, color = ApertureTextDim)
+                Text(
+                    "(no categories — check the connection)",
+                    style = MaterialTheme.typography.bodySmall, color = ApertureTextDim,
+                )
             } else {
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     ui.categories.forEach { cat ->
@@ -67,8 +90,13 @@ fun SayingsScreen(vm: MainViewModel) {
             }
         }
 
-        Text("Claude-authored sayings (type a theme → fresh line) arrive with the Claude features phase.",
-            style = MaterialTheme.typography.bodySmall, color = ApertureTextDim)
+        AperturePanel("Reactions") {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                REACTIONS.forEach { r ->
+                    ApertureOutlineButton(r.replace('_', ' ')) { vm.act(r) { c -> c.react(r) } }
+                }
+            }
+        }
         Spacer(Modifier.height(24.dp))
     }
 }

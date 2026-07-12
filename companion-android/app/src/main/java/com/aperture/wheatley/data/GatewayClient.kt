@@ -24,14 +24,18 @@ private val MEDIA = "application/json; charset=utf-8".toMediaType()
  * instance per [GatewayConfig]; rebuilt when settings change. All calls run on
  * Dispatchers.IO and never throw — failures come back as [Outcome.Err].
  */
-class GatewayClient(private val config: GatewayConfig) {
+class GatewayClient(val config: GatewayConfig) {
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        // Vision ("look at this") captures a photo then calls Claude — allow for it.
+        .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
     private fun url(path: String) = config.baseUrl + path
+
+    /** Absolute URL for a fresh camera snapshot, cache-busted by [tick]. */
+    fun snapshotUrl(tick: Long): String = url("/api/camera/snapshot?t=$tick")
 
     private fun Request.Builder.auth(): Request.Builder =
         if (config.token.isNotBlank()) header("Authorization", "Bearer ${config.token}") else this
@@ -58,6 +62,15 @@ class GatewayClient(private val config: GatewayConfig) {
 
     private suspend fun post(path: String, json: JSONObject = JSONObject()): Outcome<String> =
         raw(Request.Builder().url(url(path)).auth().post(json.toString().toRequestBody(MEDIA)).build())
+
+    private suspend fun put(path: String, json: JSONObject = JSONObject()): Outcome<String> =
+        raw(Request.Builder().url(url(path)).auth().put(json.toString().toRequestBody(MEDIA)).build())
+
+    private suspend fun delete(path: String): Outcome<String> =
+        raw(Request.Builder().url(url(path)).auth().delete().build())
+
+    private fun enc(s: String): String =
+        java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     // ---- typed endpoints --------------------------------------------------
     suspend fun health(): Outcome<Boolean> = when (val r = get("/api/health")) {
@@ -113,4 +126,64 @@ class GatewayClient(private val config: GatewayConfig) {
         post("/api/react/$behavior")
 
     suspend fun demo(): Outcome<String> = post("/api/demo")
+
+    // ---- camera + vision (Phase 3) ---------------------------------------
+    suspend fun cameraMeta(): Outcome<CameraMeta> = when (val r = get("/api/camera/meta")) {
+        is Outcome.Ok -> runCatching { JSON.decodeFromString<CameraMeta>(r.data) }
+            .fold({ Outcome.Ok(it) }, { Outcome.Err("bad camera meta payload") })
+        is Outcome.Err -> r
+    }
+
+    /** "Look at this": capture + Claude vision + speak; returns the answer. */
+    suspend fun visionAsk(question: String): Outcome<VisionAnswer> {
+        val payload = JSONObject().put("question", question)
+        return when (val r = post("/api/vision/ask", payload)) {
+            is Outcome.Ok -> runCatching { JSON.decodeFromString<VisionAnswer>(r.data) }
+                .fold({ Outcome.Ok(it) }, { Outcome.Err("bad vision payload") })
+            is Outcome.Err -> r
+        }
+    }
+
+    // ---- faces roster + visitor log (Phase 4) ----------------------------
+    suspend fun faces(): Outcome<List<FaceEntry>> = when (val r = get("/api/faces")) {
+        is Outcome.Ok -> runCatching { JSON.decodeFromString<FacesResponse>(r.data).faces }
+            .fold({ Outcome.Ok(it) }, { Outcome.Err("bad faces payload") })
+        is Outcome.Err -> r
+    }
+
+    suspend fun renameFace(name: String, newName: String): Outcome<String> =
+        post("/api/faces/${enc(name)}/rename", JSONObject().put("new_name", newName))
+
+    suspend fun deleteFace(name: String): Outcome<String> =
+        delete("/api/faces/${enc(name)}")
+
+    suspend fun setGreeting(name: String, line: String): Outcome<String> =
+        put("/api/faces/${enc(name)}/greeting", JSONObject().put("line", line))
+
+    suspend fun enrollFace(name: String): Outcome<String> =
+        post("/api/faces/enroll", JSONObject().put("name", name))
+
+    /** URL for a person's reference photo (for Coil). */
+    fun facePhotoUrl(name: String): String = url("/api/faces/${enc(name)}/photo")
+
+    suspend fun visitors(): Outcome<List<VisitorEntry>> = when (val r = get("/api/visitors")) {
+        is Outcome.Ok -> runCatching { JSON.decodeFromString<VisitorsResponse>(r.data).visitors }
+            .fold({ Outcome.Ok(it) }, { Outcome.Err("bad visitors payload") })
+        is Outcome.Err -> r
+    }
+
+    /** URL for a visitor-log thumbnail (for Coil). */
+    fun visitorThumbUrl(id: String): String = url("/api/visitors/${enc(id)}/thumb")
+
+    // ---- orientation (upside-down mount) ---------------------------------
+    suspend fun getOrientation(): Outcome<Boolean> = when (val r = get("/api/orientation")) {
+        is Outcome.Ok -> Outcome.Ok(JSONObject(r.data).optBoolean("upside_down"))
+        is Outcome.Err -> r
+    }
+
+    suspend fun setOrientation(upsideDown: Boolean): Outcome<Boolean> =
+        when (val r = post("/api/orientation", JSONObject().put("upside_down", upsideDown))) {
+            is Outcome.Ok -> Outcome.Ok(JSONObject(r.data).optBoolean("upside_down"))
+            is Outcome.Err -> r
+        }
 }

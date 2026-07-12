@@ -11,7 +11,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Face
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
@@ -37,9 +36,8 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.aperture.wheatley.ui.screens.CameraScreen
 import com.aperture.wheatley.ui.screens.ControlScreen
-import com.aperture.wheatley.ui.screens.DemoScreen
 import com.aperture.wheatley.ui.screens.FacesScreen
-import com.aperture.wheatley.ui.screens.SayingsScreen
+import com.aperture.wheatley.ui.screens.PerformScreen
 import com.aperture.wheatley.ui.screens.StatusScreen
 import com.aperture.wheatley.ui.theme.ApertureAmber
 import com.aperture.wheatley.ui.theme.ApertureBlack
@@ -49,8 +47,7 @@ import com.aperture.wheatley.ui.theme.ApertureTextDim
 private enum class Dest(val route: String, val label: String, val icon: ImageVector) {
     CONTROL("control", "Control", Icons.Filled.Build),
     CAMERA("camera", "Camera", Icons.Filled.Search),
-    SAYINGS("sayings", "Sayings", Icons.Filled.Notifications),
-    DEMO("demo", "Demo", Icons.Filled.PlayArrow),
+    PERFORM("perform", "Perform", Icons.Filled.PlayArrow),
     FACES("faces", "Faces", Icons.Filled.Face),
     STATUS("status", "Status", Icons.Filled.Info),
 }
@@ -110,10 +107,9 @@ private fun AppRoot(vm: MainViewModel = viewModel()) {
         Box(Modifier.fillMaxSize().padding(pad)) {
             NavHost(nav, startDestination = Dest.CONTROL.route) {
                 composable(Dest.CONTROL.route) { ControlScreen(vm) }
-                composable(Dest.CAMERA.route) { CameraScreen() }
-                composable(Dest.SAYINGS.route) { SayingsScreen(vm) }
-                composable(Dest.DEMO.route) { DemoScreen(vm) }
-                composable(Dest.FACES.route) { FacesScreen() }
+                composable(Dest.CAMERA.route) { CameraScreen(vm) }
+                composable(Dest.PERFORM.route) { PerformScreen(vm) }
+                composable(Dest.FACES.route) { FacesScreen(vm) }
                 composable(Dest.STATUS.route) { StatusScreen(vm) }
             }
         }

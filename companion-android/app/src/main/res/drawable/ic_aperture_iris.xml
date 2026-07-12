@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Background: black circle -->
+    <path
+        android:pathData="M 54,4 C 80.51,4 102,25.49 102,52 C 102,78.51 80.51,102 54,102 C 27.49,102 6,78.51 6,52 C 6,25.49 27.49,4 54,4 Z"
+        android:fillColor="#050607"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="2" />
+    <!-- 8 iris blades (portal blue segments) -->
+    <path
+        android:pathData="M 54,54 L 54,14 A 40,40 0 0,1 82.27,19.73 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 82.27,19.73 A 40,40 0 0,1 94,54 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 94,54 A 40,40 0 0,1 82.27,88.27 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 82.27,88.27 A 40,40 0 0,1 54,94 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 54,94 A 40,40 0 0,1 25.73,88.27 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 25.73,88.27 A 40,40 0 0,1 14,54 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 14,54 A 40,40 0 0,1 25.73,19.73 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <path
+        android:pathData="M 54,54 L 25.73,19.73 A 40,40 0 0,1 54,14 Z"
+        android:fillColor="#4FC3F7"
+        android:strokeColor="#F5A623"
+        android:strokeWidth="1" />
+    <!-- Inner amber circle (portal center) -->
+    <path
+        android:pathData="M 54,38 C 63.37,38 71,45.63 71,55 C 71,64.37 63.37,72 54,72 C 44.63,72 37,64.37 37,55 C 37,45.63 44.63,38 54,38 Z"
+        android:fillColor="#F5A623"
+        android:strokeColor="#4FC3F7"
+        android:strokeWidth="1.5" />
+    <!-- Center black dot -->
+    <path
+        android:pathData="M 54,48 C 59.52,48 64,52.48 64,58 C 64,63.52 59.52,68 54,68 C 48.48,68 44,63.52 44,58 C 44,52.48 48.48,48 54,48 Z"
+        android:fillColor="#050607" />
+</vector>
