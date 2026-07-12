@@ -73,6 +73,44 @@ try:
 except Exception:
     pass
 
+# ── mount orientation ───────────────────────────────────────────────────────
+# Every head pose below was authored for UPRIGHT mounting. When the device is
+# flipped 180° (hung on the management rail — tracked by the shared
+# `upside_down` flag in the gateway's companion_settings.json, set by the
+# vision loop's `--calibrate-flip`), a body roll mirrors BOTH servo axes, so a
+# pose that "looks up at the user" upright physically points DOWN at the scan
+# tray inverted. We mirror every move_head here to preserve the INTENDED gaze —
+# the same flip stackchan-idle.py applies via PITCH_UP_SIGN/YAW_RIGHT_SIGN
+# (its inverted rest 58 ≈ 90 − its upright rest 35, i.e. the same mirror).
+# Read once per invocation (orientation can't change mid-hook). Upright =
+# identity, so this is a strict no-op / no regression when not inverted.
+_SETTINGS_PATH = os.environ.get(
+    "STACKCHAN_SETTINGS_PATH",
+    r"C:\Users\domin\tools\stackchan-mcp\gateway\companion_settings.json",
+)
+
+
+def _read_upside_down() -> bool:
+    try:
+        with open(_SETTINGS_PATH, encoding="utf-8") as _sf:
+            d = json.load(_sf)
+        if "upside_down" in d:
+            return bool(d["upside_down"])
+    except Exception:
+        pass
+    return os.environ.get("STACKCHAN_UPSIDE_DOWN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_UPSIDE_DOWN = _read_upside_down()
+
+
+def _orient(yaw, pitch):
+    """Mirror a move authored for upright mounting into the current
+    orientation: identity upright, (−yaw, 90−pitch) when inverted."""
+    if _UPSIDE_DOWN:
+        return -yaw, max(5, min(85, 90 - pitch))
+    return yaw, pitch
+
 face = sys.argv[1] if len(sys.argv) > 1 else "neutral"
 mode = sys.argv[2] if len(sys.argv) > 2 else None
 should_say = mode in ("say-done", "say-on-error", "urgent-say", "busy-start")
@@ -294,6 +332,141 @@ EASTER_EGG_PHRASES = [
 ]
 EASTER_EGG_PROB = 0.15
 
+
+# ── read the transcript to say WHAT Claude wants / just did ──────────────────
+# The Notification `message` is generic ("needs your permission to use Bash" /
+# "waiting for your input") and the Stop hook has no message at all. But every
+# hook payload carries `transcript_path`, and a pending tool_use is written to
+# the transcript BEFORE the permission prompt fires. So we read the tail and
+# describe the exact pending action (urgent-say) or what was just done
+# (say-done). Best-effort: any failure falls back to the generic phrase.
+
+def _tail_lines(path: str, max_bytes: int = 65536) -> list:
+    """Return the decoded lines from the last max_bytes of a (possibly large,
+    still-being-appended) JSONL file, dropping a leading partial line."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            chunk = f.read()
+    except Exception:
+        return []
+    text = chunk.decode("utf-8", "ignore")
+    lines = text.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # first line is probably truncated mid-JSON
+    return lines
+
+
+def _last_assistant_blocks(path: str):
+    """(tool_use_blocks, text_str) from the most recent assistant message in
+    the transcript, or ([], "") if none/unreadable."""
+    for ln in reversed(_tail_lines(path)):
+        try:
+            e = json.loads(ln)
+        except Exception:
+            continue
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        blocks = msg.get("content", [])
+        if not isinstance(blocks, list):
+            continue
+        tools = [b for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+        texts = " ".join(
+            b.get("text", "") for b in blocks
+            if isinstance(b, dict) and b.get("type") == "text"
+        ).strip()
+        return tools, texts
+    return [], ""
+
+
+def _short_text(s: str, limit: int = 160) -> str:
+    """Trim model prose to something speakable: drop code fences, collapse
+    whitespace, take roughly the first sentence, cap length."""
+    import re
+    s = re.sub(r"```.*?```", " ", s, flags=re.S)      # strip code blocks
+    s = re.sub(r"`[^`]*`", " ", s)                     # strip inline code
+    s = re.sub(r"[#*_>]", "", s)                        # strip md punctuation
+    s = " ".join(s.split())
+    if not s:
+        return ""
+    # first sentence, if it ends reasonably soon
+    m = re.search(r"^(.{15,}?[.!?])(\s|$)", s)
+    if m and len(m.group(1)) <= limit:
+        return m.group(1)
+    return s[:limit].rstrip() + ("..." if len(s) > limit else "")
+
+
+def _describe_tool(name: str, inp: dict) -> str:
+    """A short human phrase for what a pending tool_use will do."""
+    if not isinstance(inp, dict):
+        inp = {}
+    base = lambda p: os.path.basename(str(p).rstrip("/\\")) or str(p)
+    if name in ("Bash", "PowerShell"):
+        cmd = " ".join(str(inp.get("command", "")).split())
+        return f"run a command: {cmd[:80]}" if cmd else "run a terminal command"
+    if name in ("Edit", "MultiEdit", "NotebookEdit"):
+        return f"edit {base(inp.get('file_path', 'a file'))}"
+    if name == "Write":
+        return f"write {base(inp.get('file_path', 'a file'))}"
+    if name == "Read":
+        return f"read {base(inp.get('file_path', 'a file'))}"
+    if name == "Glob":
+        return f"find files matching {inp.get('pattern', '')}".strip()
+    if name == "Grep":
+        return f"search the code for {inp.get('pattern', '')}".strip()
+    if name == "WebFetch":
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(str(inp.get("url", ""))).netloc
+        except Exception:
+            host = ""
+        return f"fetch a page from {host}" if host else "fetch a web page"
+    if name == "WebSearch":
+        return f"search the web for {inp.get('query', '')}".strip()
+    if name in ("Task", "Agent"):
+        return f"start a {inp.get('subagent_type', 'helper')} sub-agent"
+    return f"use the {name} tool"
+
+
+def _describe_pending(path: str, notif_lower: str) -> str | None:
+    """Turn the transcript's last assistant turn into a specific 'what Claude
+    wants' line, or None to fall back to the raw notification message."""
+    tools, texts = _last_assistant_blocks(path)
+    # A structured question is a tool_use, but it's a QUESTION not a permission.
+    for t in tools:
+        if t.get("name") == "AskUserQuestion":
+            try:
+                q = t["input"]["questions"][0]["question"]
+                return f"Claude's asking: {_short_text(q, 180)}"
+            except Exception:
+                return "Claude's got a question for you."
+        if t.get("name") == "ExitPlanMode":
+            return "Claude's written up a plan and wants your go-ahead."
+    # Permission-style notification + a pending tool → name the exact action.
+    if "permission" in notif_lower and tools:
+        return f"Claude wants to {_describe_tool(tools[-1].get('name', ''), tools[-1].get('input', {}))}."
+    # Waiting/idle with no pending tool → say what Claude last said.
+    if texts:
+        short = _short_text(texts)
+        if short:
+            return f"Claude says: {short}"
+    return None
+
+
+def _describe_done(path: str) -> str | None:
+    """A short 'here's what I just did' line from the transcript's final
+    assistant text, for the Stop hook — or None to fall back to a plain
+    done phrase. Skips a turn that ended on a bare tool_use with no prose."""
+    _tools, texts = _last_assistant_blocks(path)
+    short = _short_text(texts, 180) if texts else ""
+    return short or None
+
+
 if error_detected:
     face = "surprised"   # centered wide-eyed alarm
     skip_avatar = False
@@ -307,7 +480,21 @@ if mode == "say-done":
         # Name the project — multiple sessions can share this device, so
         # without an identifier there's no way to tell which one just
         # finished (mirrors the same fix already applied to urgent-say).
-        message_to_say = f"{_pick('done', DONE_PHRASES)} This is {project}."
+        # Then, if the transcript's final assistant message has prose, add a
+        # short "here's what I did" summary so "done" actually reports the
+        # outcome instead of a bare "All done" (user: "yes to 1").
+        done = f"{_pick('done', DONE_PHRASES)} This is {project}."
+        summary = None
+        transcript_path = data.get("transcript_path") or ""
+        if transcript_path:
+            try:
+                summary = _describe_done(transcript_path)
+            except Exception:
+                _log("EXCEPTION in _describe_done:\n" + traceback.format_exc())
+        message_to_say = f"{done} {summary}".strip() if summary else done
+        if len(message_to_say) > 300:
+            message_to_say = message_to_say[:297] + "..."
+        _log(f"say-done summary={summary!r} message_to_say={message_to_say!r}")
     try:
         os.remove(BUSY_MARKER)
     except OSError:
@@ -345,10 +532,20 @@ if mode == "urgent-say":
         prefix = _pick("question", QUESTION_PHRASES)
     else:
         prefix = _pick("urgent", URGENT_PHRASES)
-    message_to_say = f"{prefix} This is {project}. {raw_message}".strip()
-    if len(message_to_say) > 260:
-        message_to_say = message_to_say[:257] + "..."
-    _log(f"urgent-say parsed: project={project!r} message_to_say={message_to_say!r}")
+    # Prefer the specific action/question read from the transcript; fall back
+    # to the generic notification message if that can't be determined.
+    transcript_path = data.get("transcript_path") or ""
+    detail = None
+    if transcript_path:
+        try:
+            detail = _describe_pending(transcript_path, lower)
+        except Exception:
+            _log("EXCEPTION in _describe_pending:\n" + traceback.format_exc())
+    body = detail or raw_message
+    message_to_say = f"{prefix} This is {project}. {body}".strip()
+    if len(message_to_say) > 300:
+        message_to_say = message_to_say[:297] + "..."
+    _log(f"urgent-say parsed: project={project!r} detail={detail!r} message_to_say={message_to_say!r}")
     _write_needs_attention(session_id, project)
 
 
@@ -457,7 +654,8 @@ def run_head_moves(session, face_name):
         return
     for step in seq:
         if step[0] == "move":
-            session.call_tool("move_head", {"yaw": step[1], "pitch": step[2]})
+            _y, _p = _orient(step[1], step[2])
+            session.call_tool("move_head", {"yaw": _y, "pitch": _p})
         elif step[0] == "sleep":
             time.sleep(step[1])
 
@@ -495,7 +693,8 @@ class TalkingBob:
                     y = max(-20, min(20, last_y + random.randint(-12, 12)))
                     p = center_p + random.randint(-6, 8)
                 last_y = y
-                self._sess.call_tool("move_head", {"yaw": y, "pitch": p})
+                _y, _p = _orient(y, p)
+                self._sess.call_tool("move_head", {"yaw": _y, "pitch": _p})
             except Exception:
                 pass
             self._stop.wait(random.uniform(0.4, 0.7))
@@ -511,7 +710,8 @@ class TalkingBob:
         if self._thread:
             self._thread.join(timeout=1.0)
         try:
-            self._sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH + 6})  # settle, looking up
+            _y, _p = _orient(0, LOOK_UP_PITCH + 6)  # settle, looking at the user
+            self._sess.call_tool("move_head", {"yaw": _y, "pitch": _p})
         except Exception:
             pass
 
@@ -561,8 +761,9 @@ try:
             pass
     if mode == "say-done":
         # Release the held busy look-down pose (if any) back to a relaxed
-        # looking-up idle pose now that the turn is over.
-        session.call_tool("move_head", {"yaw": 0, "pitch": LOOK_UP_PITCH + 6})
+        # look-at-the-user idle pose now that the turn is over.
+        _y, _p = _orient(0, LOOK_UP_PITCH + 6)
+        session.call_tool("move_head", {"yaw": _y, "pitch": _p})
         _set_leds(session, IDLE_LED)
     if mode == "urgent-say":
         # The wobble + blink flourish is throttled to once per

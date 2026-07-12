@@ -106,7 +106,15 @@ SYSTEM_PROMPT = (
     "- \"I just now realized — you can fall into bottomless pits. "
     "I'm rambling out of fear.\"\n"
     "- \"That's too aggressive.\" (said to himself, right after doing "
-    "something too aggressive)"
+    "something too aggressive)\n\n"
+    "Begin EVERY reply with one emotion tag in square brackets that matches "
+    "your tone, from EXACTLY this set: [happy] [sad] [surprised] [thinking] "
+    "[embarrassed] [idle]. Then a space, then the spoken words. The tag drives "
+    "my face and is stripped before speaking — never mention it. Rough guide: "
+    "[happy] pleased or amused, [surprised] alarmed or excited, [thinking] "
+    "unsure or working it out, [sad] apologetic or disappointed, [embarrassed] "
+    "self-deprecating or awkward (very you), [idle] neutral. "
+    "Example: [happy] Oh, brilliant — that actually worked."
 )
 
 NO_KEY_PHRASES = [
@@ -449,6 +457,34 @@ class MCPSession:
         )
 
 
+# Map the emotion tag Wheatley prefixes onto each reply (see SYSTEM_PROMPT)
+# to an actual avatar face. Synonyms are tolerated in case he improvises a tag
+# outside the requested set; the six canonical faces are idle/happy/thinking/
+# sad/surprised/embarrassed (set_avatar's valid values — "neutral" maps to idle).
+_EMOTION_TO_FACE = {
+    "happy": "happy", "excited": "happy", "pleased": "happy", "amused": "happy",
+    "sad": "sad", "disappointed": "sad", "sorry": "sad",
+    "surprised": "surprised", "alarmed": "surprised", "shocked": "surprised", "angry": "surprised",
+    "thinking": "thinking", "confused": "thinking", "unsure": "thinking", "curious": "thinking",
+    "embarrassed": "embarrassed", "awkward": "embarrassed", "worried": "embarrassed", "nervous": "embarrassed",
+    "idle": "idle", "neutral": "idle", "calm": "idle",
+}
+_LEADING_TAG_RE = re.compile(r"^\s*[\[(]\s*([a-zA-Z]+)\s*[\])]\s*[:\-—]?\s*")
+
+
+def _split_emotion(reply: str):
+    """(face, spoken_text): pull a leading [emotion] tag off an LLM reply and
+    map it to an avatar face. A leading bracketed token is ALWAYS stripped so
+    TTS never reads it aloud, even if the word isn't a known emotion; an
+    unknown or absent tag yields face None. Never returns empty speech."""
+    m = _LEADING_TAG_RE.match(reply or "")
+    if not m:
+        return None, reply
+    face = _EMOTION_TO_FACE.get(m.group(1).lower())
+    spoken = reply[m.end():].lstrip()
+    return face, (spoken or reply)
+
+
 def _speak(text: str, face_before: str | None = None) -> None:
     """Speak text through the gateway, reverting to a relaxed look-at-user pose."""
     try:
@@ -744,7 +780,12 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
             session_id, time.time() - t1, reply,
         )
         _clear_thinking_marker()
-        _speak(reply)
+        # Match his face to the tone of the reply (emotion tag he prefixes).
+        # Fall back to idle so a neutral answer doesn't linger on the
+        # thinking/"sad" concentrating face left over from _set_thinking_pose.
+        face, spoken = _split_emotion(reply)
+        logger.info("session=%s reply emotion=%r", session_id, face)
+        _speak(spoken, face_before=(face or "idle"))
     except Exception:
         logger.exception("capture handling failed (session=%s)", session_id)
         _clear_thinking_marker()

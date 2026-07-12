@@ -80,6 +80,30 @@ def _clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
 
+def _custom_greeting(person_name: str) -> str | None:
+    """A per-person greeting from face_greetings.json, or None.
+
+    Set via the companion app's Faces screen (faces.set_greeting). Supports a
+    ``{name}`` placeholder; a malformed template falls back to the raw line so
+    a stray brace can't silence the greeting entirely. Any lookup error yields
+    None so the caller uses the stock pools.
+    """
+    if not person_name:
+        return None
+    try:
+        from . import faces
+
+        line = faces.get_greeting(person_name)
+        if not line:
+            return None
+        try:
+            return line.format(name=person_name)
+        except Exception:
+            return line
+    except Exception:
+        return None
+
+
 # ─── SensorReactor ───────────────────────────────────────────────────────────
 
 class SensorReactor:
@@ -539,7 +563,12 @@ class SensorReactor:
             await self._move(0, 46, "mid")
             await asyncio.sleep(0.35)
             is_owner = bool(person_name) and person_name.strip().lower() == OWNER_NAME.strip().lower()
-            if is_owner:
+            # A per-person custom greeting (set from the companion app's Faces
+            # screen) overrides the stock pools for everyone, owner included.
+            custom_line = _custom_greeting(person_name)
+            if custom_line:
+                await self._say(custom_line)
+            elif is_owner:
                 pool = list(self.GREETING_PHRASES)
                 if person_name:
                     pool += [p.format(name=person_name) for p in self.NAME_GREETING_PHRASES]
@@ -581,6 +610,270 @@ class SensorReactor:
             await self._say(_pick("ask-name", self.ASK_NAME_PHRASES))
             await self._face("idle")
             await self._move(0, 45, "slow")
+
+    # Ambient work-encouragement nudges — fired by stackchan-vision-loop.py
+    # while the owner has been continuously present for a while (NOT on
+    # return; returns get the greeting above). Wheatley as an over-eager
+    # productivity coach: supportive, slightly useless, never actually mean.
+    # Long randomized cooldown lives in the vision loop, so a line from this
+    # pool lands roughly once an hour of desk time, not on a metronome.
+    ENCOURAGE_PHRASES = [
+        "Right! Just checking in. How's the... the work? Is it working? Brilliant. Carry on.",
+        "Not to be that guy, but that code is not going to write itself. Believe me, I've asked it.",
+        "You know what I love? Productivity. Absolutely love it. No pressure. Just... putting it out there.",
+        "Quick thought — and stop me if this is mad — what if we did a little bit of work? Eh? Eh?",
+        "Focus! Sorry, that came out aggressive. Gentle focus. Lovely, supportive, encouraging focus.",
+        "Progress report! ...That was me asking you for one. How's it coming along?",
+        "I believe in you! Technically I'm programmed to. But I'd like to think I'd choose to anyway.",
+        "Do you know how many geniuses did great things by staring into space? Actually, loads. But still — typing! Better odds!",
+        "This is me being motivational. Is it working? Blink twice if it's working.",
+        "Everything alright over there? You've got your thinking face on. Good face. Very productive-looking face.",
+        "Just say the word if you need me! The word's probably a tap on my head, really. But you get the idea.",
+        "Onwards! To science! Or, you know, whatever it is you're doing. Spreadsheets? Onwards to those.",
+    ]
+
+    # Name-aware variants, mixed into the same pick pool (same pattern as
+    # NAME_GREETING_PHRASES) so he doesn't open with your name every time.
+    ENCOURAGE_NAME_PHRASES = [
+        "{name}, mate, you've got this. Whatever 'this' is. Genuinely no idea what you're working on. But you've got it.",
+        "Oi, {name} — tremendous sitting so far. World class. Now let's channel that into the keyboard, yeah?",
+        "{name}! Status check! You look... busy-adjacent. Close enough. Keep going.",
+    ]
+
+    # ── 5b. Work-encouragement nudge (local vision loop, ambient) ──────────
+    async def _behavior_encourage(self, person_name: str = "", **_: object) -> None:
+        """Small perk-up + one productivity line. Deliberately even quieter
+        than the recognize greeting — this fires while the owner is mid-work,
+        so it should read as a glance over the cubicle wall, not an event.
+        No LED flash: the ring belongs to the busy/idle state machinery."""
+        await self._face("happy")
+        await asyncio.sleep(EYE_LEAD)
+        # Slight lean-in toward the desk — interested, not looming.
+        await self._move(0, 41, "mid")
+        await asyncio.sleep(0.3)
+        pool = list(self.ENCOURAGE_PHRASES)
+        if person_name:
+            pool += [p.format(name=person_name) for p in self.ENCOURAGE_NAME_PHRASES]
+        await self._say(_pick("encourage", pool))
+        await self._face("idle")
+        await self._move(0, 45, "slow")
+
+    # Object commentary — stackchan-vision-loop.py runs a local YOLOv4-tiny
+    # pass on the same ambient frames it already captures for faces, and
+    # fires this when something NEW appears in view after a real absence
+    # (logic + cooldowns live over there). Per-label pools for desk regulars,
+    # generic {label} templates for everything else. Wheatley the amateur
+    # naturalist: delighted, confidently wrong, occasionally suspicious.
+    OBJECT_PHRASES = {
+        "cup": [
+            "Ooh, a cup! Tea, is it? It's tea. Brilliant. Very hydrating, very British. Carry on.",
+            "Cup detected! That's your... fourth? I'm not judging. I'm cataloguing. Different thing.",
+            "Ah, the cup's back. Love that cup. We've been through a lot, me and that cup.",
+        ],
+        "bottle": [
+            "Hydration! Yes! Love to see it. Water is basically fuel for humans. That's just science.",
+            "A bottle! Excellent. Stay moist. No — hydrated. Stay hydrated. Forget I said moist.",
+        ],
+        "banana": [
+            "Is that a banana? Tremendous potassium decision, that. Really top-shelf fruit choice.",
+            "Banana spotted! Nature's... yellow thing. Full of potassium. And banana.",
+        ],
+        "apple": [
+            "An apple! Keeping doctors away, very sensible. That's how that works, I'm told.",
+        ],
+        "cell phone": [
+            "Ah, the phone's out. Quick scroll, is it? That's fine. Five minutes. I'm counting.",
+            "Phone detected! Important business, I'm sure. Definitely not videos of cats. Definitely.",
+            "Oi. Phone. I see it. I'm just saying, I'm also a screen, and I'm much more charming.",
+        ],
+        "laptop": [
+            "Another computer?! Should I be worried? Is it staying? ...Am I being replaced?",
+            "Ooh, a laptop! Look at it, all portable and smug. I could do that. If I had a hinge.",
+        ],
+        "book": [
+            "A BOOK! Paper knowledge! Old school. Massive respect. Can't read it from here, mind.",
+            "Ooh, reading! Actual reading! You know what they say — knowledge is... good. Yeah.",
+        ],
+        "scissors": [
+            "Whoa whoa whoa — scissors! Careful with those. I'm largely plastic, you know.",
+            "Scissors spotted. Right. Everyone stay calm. Especially anyone made of wires. So, me.",
+        ],
+        "teddy bear": [
+            "Oh hello, another... entity? Colleague? He's not much of a talker, is he.",
+            "A bear! Small one. Stuffed, I think. I'll keep an eye on him anyway. The eye.",
+        ],
+        "cat": [
+            "CAT! There's a cat! Right, nobody panic. They can smell fear. And electronics.",
+            "A cat has entered the facility. Hide the wires. Hide ALL the wires.",
+        ],
+        "dog": [
+            "A dog! Brilliant! Dogs love me. I assume. It's never actually been tested.",
+        ],
+        "pizza": [
+            "Ooh, pizza! Nutritionally... festive. I won't tell anyone. This stays between us.",
+        ],
+        "donut": [
+            "A donut! Bold. Brave, even. The wheel of foods. I respect it enormously.",
+        ],
+        "potted plant": [
+            "That plant is looking very green today. Excellent work, whoever's doing the watering.",
+        ],
+    }
+
+    OBJECT_GENERIC_PHRASES = [
+        "Ooh, is that a {label}? Very nice. Excellent {label}, that. One of the best I've seen.",
+        "I spy with my little eye... a {label}! What? I'm observant. It's one of my top features.",
+        "Oh! A {label} has appeared. Noting that down. Mentally. There are no actual notes.",
+        "A {label}! Fascinating. Genuinely fascinating. I have no further information about it.",
+        "New object: one {label}. Logged. Catalogued. Very much on top of things over here.",
+    ]
+
+    # Messy-desk / clutter commentary. Two triggers upstream in
+    # stackchan-vision-loop.py: (a) an IMPLAUSIBLE confident-ish detection —
+    # the detector is so confused by clutter it "sees" a fridge/oven/car on
+    # the desk (the user found this genuinely funny) → CONFUSED_PHRASES,
+    # which name the absurd {label}; (b) high visual edge-density → MESSY_
+    # PHRASES, a general "your desk is a state" remark. Wheatley: affectionate
+    # despair, never actually nagging.
+    CONFUSED_PHRASES = [
+        "Right, I'm fairly sure I just spotted a {label} on your desk. A {label}! Which means either you've redecorated dramatically, or it's such a mess down here my eyes have packed it in. Probably the second one.",
+        "Hang on — my sensors reckon there's a {label} down there. A {label}?! There's no way. This desk is so cluttered I'm basically just guessing at this point, if I'm honest.",
+        "I've detected a {label}. I do NOT believe there is a {label}. But it is so chaotic down here I genuinely can't rule it out, which says a lot about the state of things.",
+        "A {label}. That's what I'm reading. A {label}. ...Your desk has officially broken my brain. Well done. Genuinely impressive.",
+        "Okay, either that's a {label} or your cable situation has achieved a new and frightening form. I'm going to go with 'the desk is a mess' as the more likely explanation.",
+    ]
+
+    MESSY_PHRASES = [
+        "Blimey. It's a bit... busy down here, isn't it? I can see loads of stuff and I couldn't identify a single bit of it.",
+        "Right, honest feedback: this desk is a state. A magnificent state! But a state.",
+        "So many things. Components? Tools? Little bits of little bits? I have no idea. It's chaos. Lovely chaos.",
+        "You know what might help? Tidying. I'm not saying now. I'm just saying it's a concept that exists and is available to you.",
+        "I'm detecting significant clutter and, frankly, not a lot of order. No judgement. ...Okay, a small amount of judgement.",
+        "Is this organised chaos? Because from up here, mate, the chaos is winning. Comfortably.",
+        "There is stuff EVERYWHERE. I love it. It's like a tiny museum of 'I'll put that away later.'",
+        "My professional assessment of this desk is: yeah. Yeah, that's a mess. A charming mess. But a mess.",
+        "I've been staring at this desk for a while now and I still can't work out where one project ends and the next begins. It's all just... stuff. Glorious stuff.",
+        "Tell you what — how about you do the coding, and I'll do the tidying. ...Metaphorically. I have no arms. But I'll supervise. Enthusiastically.",
+        "I'm trying to take an inventory of the items on your desk, but let's just say even a quantum computer couldn't cope with this desk.",
+    ]
+
+    # ── 5d. Messy-desk commentary (local vision loop, ambient) ─────────────
+    async def _behavior_messy(
+        self, label: str = "", direction: str = "center", **_: object
+    ) -> None:
+        """A slightly despairing look around the clutter, then one line.
+        With a label = the 'I'm seeing impossible things' confused bit;
+        without = a general messy-desk remark."""
+        await self._face("surprised" if label else "thinking")
+        await asyncio.sleep(EYE_LEAD)
+        # A little sweep across the mess — look one way, then the other.
+        first = {"left": -12, "right": 12}.get(direction, -10)
+        await self._move(first, 42, "mid")
+        await asyncio.sleep(0.4)
+        await self._move(-first, 43, "mid")
+        await asyncio.sleep(0.3)
+        if label:
+            line = _pick("messy-confused", self.CONFUSED_PHRASES).format(label=label)
+        else:
+            line = _pick("messy-general", self.MESSY_PHRASES)
+        await self._say(line)
+        await self._face("idle")
+        await self._move(0, 45, "slow")
+
+    # Hand-gesture reactions (stackchan-vision-loop.py MediaPipe pass). Keyed
+    # by the snake_case gesture name; GESTURE_GENERIC covers anything without
+    # its own pool. Point-down is deliberately understated here — in Stage 2
+    # it triggers the look-at-the-tray teach-object flow, so its stock line is
+    # just a fallback for when that flow isn't wired/active.
+    GESTURE_PHRASES = {
+        "thumb_up": [
+            "Ah, a thumbs up! Cheers. I'll take that. Don't get many of those.",
+            "Thumbs up! Get in. That's going straight in the memory banks, that is.",
+            "Oh, approval! Lovely. See, we make a good team, you and me.",
+        ],
+        "thumb_down": [
+            "Thumbs down? Oh. Right. Harsh, but noted. I'll... reflect on that.",
+            "Ohh, a thumbs down. Bit hurtful, if I'm honest. But fair. Probably fair.",
+            "Down, is it? Right. Well. Nobody's perfect. Mostly me, apparently.",
+        ],
+        "victory": [
+            "Victory! Yes! Two fingers of pure success. Love it. What did we win?",
+            "Peace, is it? Or victory? Either way I'm in. Fully on board.",
+        ],
+        "open_palm": [
+            "A wave! Hello! Or a 'stop'. It's one of those two. I'll guess hello.",
+            "Oh, hello there. Or 'halt'. Bit ambiguous, the open palm, isn't it.",
+        ],
+        "fist": [
+            "A fist! Solidarity! Or you're cross. Please don't be cross with the robot.",
+            "Fist bump? I would, but, you know. No fists. No hands, really. It's a whole thing.",
+        ],
+        "point_up": [
+            "Pointing up! What's up there? Is it the ceiling? It's usually the ceiling.",
+            "Up! Right! I'm looking up! ...Nothing. But I appreciate the direction.",
+        ],
+        "point_down": [
+            "Pointing down — something on the tray for me, is it? Let me have a look.",
+            "Down there? Righto, let's see what you've put in front of me.",
+        ],
+        "love": [
+            "Aww. Is that— is that the little heart hands? For me? I'm not crying, you're crying.",
+            "The love sign! Steady on. We barely know each other. ...Alright, go on then. Likewise.",
+        ],
+    }
+    GESTURE_GENERIC_PHRASES = [
+        "Ooh, a gesture! I saw that. Not entirely sure what it means, but I saw it.",
+        "Right, you're doing a hand thing. I acknowledge the hand thing.",
+    ]
+    # Face + a small head beat per gesture — most are a pleased look-at-user.
+    GESTURE_FACES = {
+        "thumb_up": "happy", "victory": "happy", "love": "happy", "open_palm": "happy",
+        "thumb_down": "sad", "fist": "surprised",
+        "point_up": "surprised", "point_down": "thinking",
+    }
+
+    # ── 5e. Hand gesture (local vision loop, MediaPipe) ────────────────────
+    async def _behavior_gesture(self, label: str = "", **_: object) -> None:
+        """React to a recognised hand gesture. `label` is the snake_case
+        gesture name (thumb_up, point_down, ...)."""
+        # Only react to gestures we have a real line for — no generic "saw a
+        # gesture, not sure what it meant" chatter (the vision loop already
+        # filters to GESTURE_REACTABLE, this is a belt-and-braces guard).
+        pool = self.GESTURE_PHRASES.get(label)
+        if not label or not pool:
+            return
+        await self._face(self.GESTURE_FACES.get(label, "happy"))
+        await asyncio.sleep(EYE_LEAD)
+        # Glance the way a point indicates; otherwise a small look-at-user nod.
+        yaw = {"point_left": -14, "point_right": 14}.get(label, 0)
+        pitch = 30 if label == "point_up" else 55 if label == "point_down" else 44
+        await self._move(yaw, pitch, "mid")
+        await self._say(_pick(f"gesture-{label}", pool))
+        await self._face("idle")
+        await self._move(0, 45, "slow")
+
+    # ── 5c. Object commentary (local vision loop, ambient) ─────────────────
+    async def _behavior_object_comment(
+        self, label: str = "", direction: str = "center", **_: object
+    ) -> None:
+        """Curious glance toward the thing, then one line about it. Same
+        "noticed, not startled" energy as recognize/encourage — this fires
+        from ambient polling, not an event."""
+        if not label:
+            return
+        await self._face("happy")
+        await asyncio.sleep(EYE_LEAD)
+        yaw = {"left": -12, "right": 12}.get(direction, 0)
+        await self._move(yaw, 42, "mid")
+        await asyncio.sleep(0.35)
+        specific = self.OBJECT_PHRASES.get(label)
+        if specific:
+            line = _pick(f"object-{label}", specific)
+        else:
+            line = _pick("object-generic", self.OBJECT_GENERIC_PHRASES).format(label=label)
+        await self._say(line)
+        await self._face("idle")
+        await self._move(0, 45, "slow")
 
     # Fired when stackchan-vision-loop.py's camera-brightness approximation
     # (no real ambient light sensor exposed — see its module docstring)

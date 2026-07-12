@@ -48,6 +48,7 @@ import base64
 import json
 import logging
 import os
+import random
 import sys
 import time
 import urllib.error
@@ -95,6 +96,9 @@ logger = logging.getLogger("vision-loop")
 GATEWAY_MCP = "http://127.0.0.1:8767/mcp"
 CAPTURE_PORT = int(os.environ.get("CAPTURE_PORT", "8766"))
 REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/recognize"
+ENCOURAGE_REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/encourage"
+OBJECT_REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/object_comment"
+MESSY_REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/messy"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
@@ -120,17 +124,212 @@ REFERENCE_PHOTOS_DIR = os.environ.get(
 # SFace's documented default cosine-similarity threshold for "same person".
 MATCH_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MATCH_THRESHOLD", "0.363"))
 POLL_INTERVAL_S = float(os.environ.get("STACKCHAN_VISION_POLL_INTERVAL_S", "8"))
-# Debounce: don't re-fire the greet/notice reaction for the same identity
-# more often than this. 1 hour by default (user: "repeat if it hasn't seen
-# me for more than one hour") — long enough that sitting at the desk all
-# day only gets one welcome-back, short enough to re-greet after a real
-# absence (lunch, overnight, etc.).
+# Adaptive cadence: the device cam is snapshot-based (~1.3s/photo), so the
+# default 8s ambient poll is far too slow to catch a hand gesture — it lands
+# between snapshots. When a tick is "hot" (motion in frame or a gesture just
+# fired) the loop drops to FAST_POLL_INTERVAL_S for the next HOT_TICKS ticks,
+# so while you're actually there gesturing it watches ~every 2.5s, then relaxes
+# back to 8s when idle (gentle on the device). Set FAST==POLL to disable.
+FAST_POLL_INTERVAL_S = float(os.environ.get("STACKCHAN_VISION_FAST_POLL_INTERVAL_S", "2.5"))
+FAST_POLL_HOT_TICKS = int(os.environ.get("STACKCHAN_VISION_FAST_POLL_HOT_TICKS", "5"))
+# Debounce for UNKNOWN-face prompts only (2026-07-06): don't re-fire the
+# "who are you?" ask more often than this. Known-person greetings moved to
+# absence-based logic (below) — the old flat timer both under-greeted short
+# real absences and re-greeted someone who'd sat at the desk the whole hour.
 COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_COOLDOWN_S", str(60 * 60)))
+
+# Absence-based re-greeting (2026-07-06, "make him a more active assistant"):
+# a KNOWN person is greeted when they REAPPEAR after a real absence. "Real
+# absence" needs BOTH a wall-clock gap AND enough executed looks that missed
+# them (see _note_look) — ticks skipped for busy/pause/offline bump nothing,
+# so a long Claude session with the owner sat in frame the whole time doesn't
+# read as the owner having left.
+ABSENCE_GREET_S = float(os.environ.get("STACKCHAN_VISION_ABSENCE_GREET_S", str(20 * 60)))
+ABSENCE_MIN_MISSED_LOOKS = int(os.environ.get("STACKCHAN_VISION_ABSENCE_MIN_MISSED_LOOKS", "8"))
+# Presence hint independent of the camera seeing a face (2026-07-06 — user
+# reported false "you're not here!" greetings in LOW LIGHT, where YuNet loses
+# the face even though they never left). If there's been recent keyboard/mouse
+# input (works in the dark, unlike face detection) OR motion in frame, we have
+# evidence a human is still present, so a face-less tick is NOT counted as
+# absence — it just freezes the missed-look counter rather than climbing it.
+# The welcome-back greeting then only fires after a REAL departure (no input,
+# no motion, no face for the full absence window). PRESENCE_INPUT_WINDOW_S =
+# how recent the last input must be to count as "still here".
+PRESENCE_INPUT_WINDOW_S = float(os.environ.get("STACKCHAN_VISION_PRESENCE_INPUT_S", str(3 * 60)))
+
+# Ambient work-encouragement nudge (sensor_reactor ENCOURAGE_PHRASES): fired
+# while the owner is continuously present (recently seen, not just greeted),
+# at most once per this many seconds — stretched by a random x1.0-1.5 each
+# time so it reads as personality, not a cron job. 0 disables entirely.
+ENCOURAGE_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_ENCOURAGE_COOLDOWN_S", str(45 * 60)))
+
+# ── local object commentary (YOLOv4-tiny on the same ambient frames) ──────
+# Runs a cheap CPU object-detection pass (COCO 80-class, ~260ms/frame — see
+# _detect_objects) on frames the loop already captured for faces, and fires
+# sensor_reactor's object_comment behaviour when something NEW shows up.
+# "New" is the whole trick: we do NOT narrate a static desk every 8s — a
+# label only speaks once, then goes quiet until it has LEFT view for a while
+# and come back (see OBJECT_FORGET_S), so a mug that sits there all day is a
+# single remark, not a mantra. 0 for the cooldown disables the whole thing.
+OBJECT_MODEL_CFG = os.environ.get(
+    "STACKCHAN_VISION_OBJECT_CFG", os.path.join(MODELS_DIR, "yolov4-tiny.cfg")
+)
+OBJECT_MODEL_WEIGHTS = os.environ.get(
+    "STACKCHAN_VISION_OBJECT_WEIGHTS", os.path.join(MODELS_DIR, "yolov4-tiny.weights")
+)
+OBJECT_NAMES_PATH = os.environ.get(
+    "STACKCHAN_VISION_OBJECT_NAMES", os.path.join(MODELS_DIR, "coco.names")
+)
+OBJECT_ENABLED = os.environ.get("STACKCHAN_VISION_OBJECT_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+# 0.4 is deliberately a bit permissive: the device cam is only 320x240, and
+# confident desk objects still land around 0.4-0.5 (a remote read 0.42 in
+# testing). Raise toward 0.5+ if he starts confidently announcing things
+# that aren't there; the novelty gate + global cooldown already cap how
+# often any single false positive can speak (once per OBJECT_FORGET_S, and
+# never more than once per OBJECT_COOLDOWN_S overall).
+OBJECT_CONF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_OBJECT_CONF", "0.4"))
+# A 'person' box at/above this confidence counts as "the user is here" for the
+# idle absence clock, even with no detectable face (turned to the side, head
+# down working). Kept modestly permissive — a partial torso still reads as a
+# person; false "person" hits just make him a bit less likely to feel alone.
+PERSON_PRESENCE_CONF = float(os.environ.get("STACKCHAN_VISION_PERSON_PRESENCE_CONF", "0.4"))
+OBJECT_NMS_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_OBJECT_NMS", "0.4"))
+# Global rate-limit so he doesn't chain object remarks — at most one per
+# this many seconds regardless of how many new things appear. 0 disables.
+OBJECT_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_OBJECT_COOLDOWN_S", str(12 * 60)))
+# A label must be ABSENT this long before a re-appearance counts as new and
+# is eligible to be remarked on again. Long enough that fidgeting a mug in
+# and out of frame doesn't re-trigger it.
+OBJECT_FORGET_S = float(os.environ.get("STACKCHAN_VISION_OBJECT_FORGET_S", str(30 * 60)))
+# 'person' is handled by the face pipeline; a few COCO classes are noisy or
+# not worth a remark (chairs, dining tables everywhere). Skip them.
+OBJECT_IGNORE = set(
+    x.strip() for x in os.environ.get(
+        "STACKCHAN_VISION_OBJECT_IGNORE", "person,chair,dining table,tv,couch,bench"
+    ).split(",") if x.strip()
+)
+
+# ── messy-desk / clutter commentary ───────────────────────────────────────
+# Two triggers, both routed to sensor_reactor's `messy` behaviour:
+#  (a) IMPLAUSIBLE detection — the detector "sees" a fridge/oven/car on the
+#      desk (it did: a phantom 'refrigerator' at 0.37 on this very cam). That
+#      confident-nonsense IS the clutter signal — YOLO grasping at a cluttered
+#      frame — and it's the funny bit the user liked. Detected down to
+#      IMPLAUSIBLE_FLOOR (lower than real objects: a semi-sure absurd guess
+#      still counts). Routed with the {label} so he names the impossible thing.
+#  (b) VISUAL CLUTTER — high Canny edge-density. Measured range on this cam:
+#      ~0.01 bare tray, ~0.08 busy room. A cluttered desk closeup should sit
+#      high; EDGE_THRESHOLD default 0.09 is above 'busy room', so tune DOWN
+#      against the real desk if he never bites (logged on every fire). Needs
+#      EDGE_MIN_STREAK consecutive ticks so a one-frame fluke can't trigger it.
+# Mess is a persistent state, not a novelty, so the shared cooldown is LONG —
+# he remarks a couple of times a day, never nags. 0 disables the feature.
+CLUTTER_ENABLED = os.environ.get("STACKCHAN_VISION_CLUTTER_ENABLED", "1").strip().lower() not in ("0", "false", "no", "off")
+CLUTTER_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_CLUTTER_COOLDOWN_S", str(4 * 60 * 60)))
+IMPLAUSIBLE_FLOOR = float(os.environ.get("STACKCHAN_VISION_IMPLAUSIBLE_FLOOR", "0.25"))
+CLUTTER_EDGE_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_CLUTTER_EDGE", "0.09"))
+CLUTTER_EDGE_MIN_STREAK = int(os.environ.get("STACKCHAN_VISION_CLUTTER_EDGE_STREAK", "2"))
+# COCO classes that cannot plausibly be ON a desk — a confident-ish hit here
+# is the detector being confused by clutter, not a real object. (Animals like
+# cat/dog/bird stay OUT — they're plausible and have their own fun object
+# pools; big wildlife and vehicles/appliances/furniture go in.)
+OBJECT_IMPLAUSIBLE = set(
+    x.strip() for x in os.environ.get(
+        "STACKCHAN_VISION_OBJECT_IMPLAUSIBLE",
+        "refrigerator,oven,microwave,toaster,sink,toilet,bed,"
+        "car,truck,bus,train,boat,airplane,motorcycle,bicycle,"
+        "traffic light,fire hydrant,stop sign,parking meter,"
+        "elephant,bear,zebra,giraffe,horse,cow,sheep",
+    ).split(",") if x.strip()
+)
+
+# ── hand gesture recognition (MediaPipe, on the same ambient frames) ──────────
+# Stage 1: recognise the 7 built-in MediaPipe gestures + a custom point-
+# up/down/left/right derived from the hand landmarks (MediaPipe only labels
+# "Pointing_Up"). The device cam is snapshot-based (~POLL_INTERVAL_S apart),
+# not a video stream, so this is turn-taking: hold the gesture a beat and the
+# next tick catches it. Debounced so one held gesture = one reaction, not a
+# stream (fires again only after GESTURE_COOLDOWN_S, or immediately if the
+# gesture CHANGES). Fires sensor_reactor's `gesture` behaviour. 0 cooldown
+# disables reactions but leave detection on for the Stage-2 teach-object flow.
+GESTURE_MODEL = os.environ.get(
+    "STACKCHAN_VISION_GESTURE_MODEL", os.path.join(MODELS_DIR, "gesture_recognizer.task")
+)
+# Default OFF since 2026-07-12 (user: "never seems to work") — set
+# STACKCHAN_VISION_GESTURE_ENABLED=1 to re-enable the MediaPipe gesture path.
+GESTURE_ENABLED = os.environ.get("STACKCHAN_VISION_GESTURE_ENABLED", "0").strip().lower() not in ("0", "false", "no", "off")
+GESTURE_MIN_SCORE = float(os.environ.get("STACKCHAN_VISION_GESTURE_MIN_SCORE", "0.5"))
+GESTURE_MIN_HAND_CONF = float(os.environ.get("STACKCHAN_VISION_GESTURE_MIN_HAND_CONF", "0.5"))
+GESTURE_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_GESTURE_COOLDOWN_S", "20"))
+GESTURE_REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/gesture"
+# MediaPipe category_name -> our snake_case canonical gesture name. "Pointing_
+# Up" is resolved to a real direction (point_up/down/left/right) from landmarks.
+_MP_GESTURE_MAP = {
+    "Thumb_Up": "thumb_up", "Thumb_Down": "thumb_down", "Victory": "victory",
+    "Closed_Fist": "fist", "Open_Palm": "open_palm", "ILoveYou": "love",
+    "Pointing_Up": "point_up",
+}
+# Only these deliberate, meaningful gestures get a reaction. Anything else —
+# an unmapped pose, or a point_left/point_right (which a HAND WORKING ON THE
+# DESK trips constantly: fingers out, moving sideways) — is IGNORED, no
+# reaction, no "saw a gesture, not sure what it meant" chatter (user: that
+# fired far too often off normal desk-work hand movement).
+GESTURE_REACTABLE = set(
+    x.strip() for x in os.environ.get(
+        "STACKCHAN_VISION_GESTURE_REACTABLE",
+        "thumb_up,thumb_down,victory,fist,open_palm,love,point_up,point_down",
+    ).split(",") if x.strip()
+)
 
 # Written every tick — stackchan-idle.py reads this to decide whether to
 # track a face, search for one, or glance toward motion. See the module
 # docstring for why movement lives there and not here.
 VISION_STATE_PATH = os.path.join(TEMP, "stackchan-vision-state.json")
+
+# Shared with stackchan-idle.py — holds the auto-learned resting angle.
+REST_POSE_PATH = os.path.join(TEMP, "stackchan-rest-pose.json")
+
+# Mount orientation — the SINGLE source of truth, shared with the companion
+# server (stackchan_mcp/companion_server.py `_is_upside_down`) via the same
+# companion_settings.json, and read by stackchan-idle.py too. When inverted,
+# the RAW camera image comes out rotated 180 deg (confirmed via the scan-tray
+# ArUco markers reading ~180 deg), so YuNet can't detect an upright-in-world
+# face until we rotate frames back. --calibrate-flip sets this from the tray.
+SETTINGS_PATH = os.path.join(SCRIPT_DIR, "companion_settings.json")
+
+
+def _is_upside_down() -> bool:
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if "upside_down" in d:
+            return bool(d["upside_down"])
+    except Exception:
+        pass
+    return os.environ.get("STACKCHAN_UPSIDE_DOWN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Boot-time auto-orientation runs a short camera sweep and can move the head;
+# this marker tells stackchan-idle.py to hold still while it does (so the two
+# don't fight for the servo at login). Set STACKCHAN_AUTO_ORIENT=0 to disable
+# the boot sweep entirely (falls back to the persisted flag).
+ORIENTING_MARKER = os.path.join(TEMP, "stackchan-orienting")
+AUTO_ORIENT_ENABLED = os.environ.get("STACKCHAN_AUTO_ORIENT", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _touch_marker(path: str) -> None:
+    try:
+        with open(path, "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
+
+def _clear_marker(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 # Motion detection: cheap frame-differencing (grayscale, downscaled, mean
 # absolute difference) — no extra model needed. Only meaningful as a signal
@@ -144,12 +343,24 @@ MOTION_DIFF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MOTION_THRESHOLD"
 # but nothing reads it), so this approximates one using the camera itself —
 # reuses the SAME downscaled grayscale frame already computed for motion-
 # diff, no extra capture/compute. Tracks a short rolling history and fires
-# only on a SUDDEN drop from a reasonably-lit baseline (not "the room is
-# just dim", and not while it's already dark), so it doesn't fire on
-# gradual dusk or a single noisy frame.
+# only when a reasonably-lit baseline transitions to GENUINELY dark frames
+# (two consecutive, in absolute terms — see LIGHTS_OUT_MAX_DARK), so it
+# doesn't fire on gradual dusk, a single noisy frame, or a mere exposure
+# drop in a room that's still clearly lit.
 LIGHTS_OUT_HISTORY_LEN = 5
 LIGHTS_OUT_MIN_BASELINE = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_MIN_BASELINE", "60.0"))
-LIGHTS_OUT_DROP_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_DROP_THRESHOLD", "40.0"))
+# The frame must now be genuinely DARK in absolute terms (grayscale mean,
+# 0-255), not merely a big drop from baseline — the old drop-only rule fired
+# in broad daylight (2026-07-06: 11:33/12:28/13:15) on auto-exposure shifts,
+# a hand near the lens, or the idle wander pointing him at a dark corner.
+# ~12 is "lights off at night" territory; a dim evening room reads 25-40.
+# Two consecutive dark ticks are required, so a one-frame transient (hand
+# over lens) can't trigger it. Superseded STACKCHAN_VISION_LIGHTS_OUT_DROP_
+# THRESHOLD, which is gone — with a lit baseline and a truly-dark now, the
+# drop is implied. NOTE: the real fix is the LTR-553 ambient light sensor,
+# unlocked in the next firmware flash (see firmware/TODO.md) — prefer lux
+# over this camera approximation once it exists.
+LIGHTS_OUT_MAX_DARK = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_MAX_DARK", "12.0"))
 LIGHTS_OUT_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_COOLDOWN_S", str(30 * 60)))
 
 # Set when an unrecognized face triggers the "who are you?" prompt (see
@@ -157,6 +368,25 @@ LIGHTS_OUT_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_COOLDO
 # bridge.py checks this to know a tap-to-answer transcript is probably a
 # name introduction rather than a normal question.
 PENDING_ENROLLMENT_MARKER = os.path.join(TEMP, "stackchan-pending-enrollment")
+
+# Head-settle coordination: stackchan-idle.py touches HEAD_MOVED_MARKER on every
+# significant head move. We wait for it to age past HEAD_SETTLE_S before
+# capturing so we don't detect on a motion-BLURRED frame (missed faces / false
+# gestures / garbage objects). If it's STILL moving after HEAD_SETTLE_MAX_WAIT_S
+# (a sustained sweep), skip the tick rather than trust a blur.
+HEAD_MOVED_MARKER = os.path.join(TEMP, "stackchan-head-moved")
+HEAD_SETTLE_S = float(os.environ.get("STACKCHAN_VISION_HEAD_SETTLE_S", "0.4"))
+HEAD_SETTLE_MAX_WAIT_S = float(os.environ.get("STACKCHAN_VISION_HEAD_SETTLE_MAX_WAIT_S", "1.2"))
+
+
+def _head_settling() -> bool:
+    """True if the head moved within the last HEAD_SETTLE_S (still settling)."""
+    try:
+        with open(HEAD_MOVED_MARKER) as f:
+            moved_at = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return time.time() - moved_at < HEAD_SETTLE_S
 
 # ── arbiter: Claude second opinion for genuinely uncertain local matches ──
 # SFace's cosine score has no built-in middle ground — this band around
@@ -307,9 +537,211 @@ def _fire_reaction(person: str, name: str | None = None, propose_learn: bool = F
         logger.exception("react/recognize?person=%s failed", person)
 
 
+def _fire_encourage(name: str | None = None) -> None:
+    url = ENCOURAGE_REACT_URL
+    if name:
+        url += "?name=" + urllib.parse.quote(name)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/encourage -> %s", resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/encourage skipped (reactor busy)")
+        else:
+            logger.warning("react/encourage failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("react/encourage failed")
+
+
+def _fire_object_comment(label: str, direction: str = "center") -> None:
+    url = OBJECT_REACT_URL + "?label=" + urllib.parse.quote(label)
+    if direction and direction != "center":
+        url += "&direction=" + urllib.parse.quote(direction)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/object_comment label=%s -> %s", label, resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/object_comment label=%s skipped (reactor busy)", label)
+        else:
+            logger.warning("react/object_comment label=%s failed: HTTP %s", label, exc.code)
+    except Exception:
+        logger.exception("react/object_comment label=%s failed", label)
+
+
+def _fire_messy(label: str = "", direction: str = "center") -> None:
+    url = MESSY_REACT_URL
+    params = []
+    if label:
+        params.append("label=" + urllib.parse.quote(label))
+    if direction and direction != "center":
+        params.append("direction=" + urllib.parse.quote(direction))
+    if params:
+        url += "?" + "&".join(params)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/messy label=%s -> %s", label or "-", resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/messy skipped (reactor busy)")
+        else:
+            logger.warning("react/messy failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("react/messy failed")
+
+
+def _pick_new_object(detections: list, object_last_seen: dict, now: float) -> tuple | None:
+    """Given this tick's detections (label, conf, direction, implausible) and
+    the per-label last-seen timestamps, refresh all last-seen stamps and
+    return the single best NEW object — one not seen within OBJECT_FORGET_S —
+    or None. Highest-confidence new label wins (implausible or not; the caller
+    routes on the implausible flag)."""
+    chosen = None
+    for label, conf, direction, implausible in detections:
+        last = object_last_seen.get(label, 0.0)
+        is_new = now - last >= OBJECT_FORGET_S
+        object_last_seen[label] = now  # seen this tick, regardless
+        if is_new and chosen is None:
+            chosen = (label, conf, direction, implausible)
+    return chosen
+
+
+def _maybe_fire_object(new_object, last_object_comment: list, now: float) -> bool:
+    """Fire a queued object comment if the global anti-chatter cooldown
+    allows. `new_object` is a (label, conf, direction) 3-tuple. `last_object_
+    comment` is a 1-element mutable timestamp holder. A comment blocked by the
+    cooldown is simply dropped (novelty was already consumed by
+    _pick_new_object), NOT queued — better to miss one remark than to build a
+    backlog that fires long after the thing appeared."""
+    if not new_object or OBJECT_COOLDOWN_S <= 0:
+        return False
+    if now - last_object_comment[0] < OBJECT_COOLDOWN_S:
+        return False
+    label, conf, direction = new_object
+    last_object_comment[0] = now
+    logger.info("firing object comment label=%s conf=%.2f dir=%s", label, conf, direction)
+    _fire_object_comment(label, direction)
+    return True
+
+
+def _comment_on_scene(new_object, edge_frac, messy_state: dict,
+                      last_object_comment: list, now: float) -> bool:
+    """Lowest-priority ambient commentary, run once per tick after greeting/
+    encourage have had their say. Priority within: an implausible 'confused'
+    detection > a real new object > general visual clutter. Returns True if
+    he spoke (so the caller doesn't stack another remark)."""
+    # (a) implausible detection -> confused-by-mess bit, naming the absurdity
+    if new_object is not None:
+        label, conf, direction, implausible = new_object
+        if implausible:
+            if _maybe_fire_messy(messy_state, now, label=label, direction=direction):
+                return True
+        elif _maybe_fire_object((label, conf, direction), last_object_comment, now):
+            return True
+    # (b) general visual clutter (stable over CLUTTER_EDGE_MIN_STREAK ticks)
+    return _maybe_fire_messy(messy_state, now, edge_frac=edge_frac)
+
+
+def _maybe_fire_messy(messy_state: dict, now: float, label: str = "",
+                      direction: str = "center", edge_frac: float | None = None) -> bool:
+    """Fire a messy-desk remark, shared long cooldown across both triggers.
+    `label` set = implausible-object 'confused' bit (novelty already applied
+    upstream). `edge_frac` set = general-clutter bit, which additionally
+    requires the streak (maintained in messy_state by the caller) so a single
+    busy frame can't trigger it."""
+    if not CLUTTER_ENABLED or CLUTTER_COOLDOWN_S <= 0:
+        return False
+    if now - messy_state["ts"] < CLUTTER_COOLDOWN_S:
+        return False
+    if label:
+        messy_state["ts"] = now
+        logger.info("firing messy(confused) label=%s", label)
+        _fire_messy(label=label, direction=direction)
+        return True
+    if edge_frac is not None and messy_state["streak"] >= CLUTTER_EDGE_MIN_STREAK:
+        messy_state["ts"] = now
+        logger.info("firing messy(clutter) edge=%.3f streak=%d", edge_frac, messy_state["streak"])
+        _fire_messy()
+        return True
+    return False
+
+
+def _seconds_since_user_input() -> float | None:
+    """Seconds since the last keyboard/mouse input on this Windows session, or
+    None if unavailable (non-Windows / API failure). Uses GetLastInputInfo — a
+    strong 'a human is physically at the computer' signal that works in the
+    dark, unlike face detection. GetTickCount wraps ~every 49.7 days; dwTime is
+    the same clock, so the subtraction stays valid over the short windows we
+    care about."""
+    try:
+        import ctypes
+
+        class _LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        info = _LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        now_ticks = ctypes.windll.kernel32.GetTickCount()
+        idle_ms = (now_ticks - info.dwTime) & 0xFFFFFFFF
+        return idle_ms / 1000.0
+    except Exception:
+        return None
+
+
+def _user_present_hint(motion_detected: bool) -> bool:
+    """True if there's non-camera evidence a human is present right now:
+    recent keyboard/mouse input, or motion in the frame. Used to avoid
+    counting a face-less tick as absence (see PRESENCE_INPUT_WINDOW_S)."""
+    if motion_detected:
+        return True
+    idle = _seconds_since_user_input()
+    return idle is not None and idle <= PRESENCE_INPUT_WINDOW_S
+
+
+def _note_look(seen_key: str | None, last_seen_ts: dict, missed_looks: dict,
+               suppress_absence: bool = False) -> None:
+    """Bookkeeping for absence-based greeting: on every EXECUTED tick, bump
+    the missed-look counter for each known-seen-before name that was NOT the
+    one recognized, and reset the one that was. Ticks that never run (busy /
+    paused / device offline) bump nothing — 'absent' must mean "we actually
+    looked and they weren't there", not "we weren't looking".
+
+    `suppress_absence` freezes the counters (no bump) when we DID look and saw
+    no face but have other evidence a human is here (recent input / motion) —
+    so low light losing the face doesn't fake a departure. A real sighting
+    (seen_key set) still resets that person's counter regardless."""
+    if not suppress_absence:
+        for known_name in list(last_seen_ts):
+            if known_name != seen_key:
+                missed_looks[known_name] = missed_looks.get(known_name, 0) + 1
+    if seen_key is not None:
+        missed_looks[seen_key] = 0
+
+
+def _log_visitor_safe(recognizer, img, face, name, known, score) -> None:
+    """Append a visitor-log entry with a small face thumbnail.
+
+    Fire-and-forget: a logging failure must never disrupt recognition. The
+    thumbnail is the aligned 112x112 crop (same one used for reference photos),
+    JPEG-encoded here so stackchan_mcp.visitor_log needs no OpenCV.
+    """
+    try:
+        import cv2
+        from stackchan_mcp import visitor_log
+
+        crop = recognizer.alignCrop(img, face)
+        ok, buf = cv2.imencode(".jpg", crop)
+        thumb = buf.tobytes() if ok else None
+        visitor_log.append(name, known, float(score), thumb)
+    except Exception:
+        logger.debug("visitor log append failed", exc_info=True)
+
+
 def _write_vision_state(
     face_visible: bool, person: str | None, name: str | None,
-    dx: float, dy: float, motion_detected: bool,
+    dx: float, dy: float, motion_detected: bool, present: bool = False,
 ) -> None:
     state = {
         "ts": time.time(),
@@ -319,6 +751,13 @@ def _write_vision_state(
         "dx": dx,
         "dy": dy,
         "motion_detected": motion_detected,
+        # Broader "the user is here" than face_visible: true if a face is seen
+        # OR a person is in frame (YOLO — covers working turned-to-the-side)
+        # OR there's been recent keyboard/mouse input. The idle loop uses THIS
+        # for its absence clock so it doesn't decide you're gone just because
+        # your face turned away. (Raw motion is NOT used — his own head
+        # movement between snapshots dominates the frame diff.)
+        "present": present,
     }
     try:
         tmp = VISION_STATE_PATH + ".tmp"
@@ -375,12 +814,18 @@ def _check_lights_out(brightness: float, history: list, last_lights_out_ts: dict
     thread more state through _tick's already-long parameter list.
     """
     triggered = False
-    if history:
-        baseline = sum(history) / len(history)
+    if len(history) >= 3:
+        # history[-1] is LAST tick's frame; the baseline deliberately
+        # excludes it so the "was the room lit before?" check isn't dragged
+        # down by the first dark frame of the transition we're confirming.
+        prev = history[-1]
+        older = history[:-1]
+        baseline = sum(older) / len(older)
         now = time.time()
         if (
-            baseline >= LIGHTS_OUT_MIN_BASELINE
-            and baseline - brightness >= LIGHTS_OUT_DROP_THRESHOLD
+            brightness <= LIGHTS_OUT_MAX_DARK
+            and prev <= LIGHTS_OUT_MAX_DARK
+            and baseline >= LIGHTS_OUT_MIN_BASELINE
             and now - last_lights_out_ts.get("ts", 0.0) >= LIGHTS_OUT_COOLDOWN_S
         ):
             last_lights_out_ts["ts"] = now
@@ -414,6 +859,223 @@ def _load_detector():
 def _load_recognizer():
     import cv2
     return cv2.FaceRecognizerSF.create(SFACE_MODEL, "")
+
+
+def _load_object_model():
+    """YOLOv4-tiny COCO detector, or None if disabled / files missing.
+    Returns (DetectionModel, class_names) so a missing model just quietly
+    turns the feature off rather than crashing the whole vision loop."""
+    if not OBJECT_ENABLED:
+        return None
+    if not (os.path.exists(OBJECT_MODEL_CFG) and os.path.exists(OBJECT_MODEL_WEIGHTS)
+            and os.path.exists(OBJECT_NAMES_PATH)):
+        logger.warning(
+            "object detection enabled but model files missing (%s / %s / %s) — disabling",
+            OBJECT_MODEL_CFG, OBJECT_MODEL_WEIGHTS, OBJECT_NAMES_PATH,
+        )
+        return None
+    try:
+        import cv2
+        net = cv2.dnn.readNetFromDarknet(OBJECT_MODEL_CFG, OBJECT_MODEL_WEIGHTS)
+        model = cv2.dnn.DetectionModel(net)
+        model.setInputParams(size=(416, 416), scale=1 / 255.0, swapRB=True)
+        with open(OBJECT_NAMES_PATH, encoding="utf-8") as f:
+            names = [ln.strip() for ln in f if ln.strip()]
+        logger.info("object detector loaded (%d COCO classes)", len(names))
+        return (model, names)
+    except Exception:
+        logger.exception("failed to load object detector — disabling")
+        return None
+
+
+def _detect_objects(object_model, img):
+    """Return (objects, person_present). `objects` is a deduped list of
+    (label, confidence, direction, implausible), best-confidence-first, one box
+    per label (real objects need OBJECT_CONF_THRESHOLD; IMPLAUSIBLE classes
+    count from the lower IMPLAUSIBLE_FLOOR). `person_present` is True if a
+    'person' box is in frame at >= PERSON_PRESENCE_CONF — a presence signal for
+    the idle absence clock, independent of face detection (a person turned to
+    the side has no detectable face but is very much still here)."""
+    if object_model is None:
+        return [], False
+    model, names = object_model
+    # Run at the lowest floor either path needs, then apply the per-label
+    # floor below (so one detect() pass serves both real + implausible).
+    floor = min(OBJECT_CONF_THRESHOLD, IMPLAUSIBLE_FLOOR, PERSON_PRESENCE_CONF)
+    try:
+        classes, scores, boxes = model.detect(
+            img, confThreshold=floor, nmsThreshold=OBJECT_NMS_THRESHOLD
+        )
+    except Exception:
+        logger.debug("object detect failed", exc_info=True)
+        return [], False
+    frame_w = img.shape[1]
+    best: dict = {}
+    person_present = False
+    for cls, score, box in zip(classes, scores, boxes):
+        label = names[int(cls)] if 0 <= int(cls) < len(names) else None
+        if not label:
+            continue
+        conf = float(score)
+        if label == "person" and conf >= PERSON_PRESENCE_CONF:
+            person_present = True
+        if label in OBJECT_IGNORE:
+            continue
+        implausible = label in OBJECT_IMPLAUSIBLE
+        if conf < (IMPLAUSIBLE_FLOOR if implausible else OBJECT_CONF_THRESHOLD):
+            continue
+        if label in best and conf <= best[label][0]:
+            continue
+        cx = box[0] + box[2] / 2
+        frac = cx / frame_w
+        direction = "left" if frac < 0.38 else "right" if frac > 0.62 else "center"
+        best[label] = (conf, direction, implausible)
+    objects = sorted(
+        ((lbl, c, d, im) for lbl, (c, d, im) in best.items()),
+        key=lambda t: t[1], reverse=True,
+    )
+    return objects, person_present
+
+
+def _edge_fraction(img) -> float:
+    """Fraction of Canny edge pixels — a cheap 'visual busyness' proxy.
+    ~0.01 for a bare surface, ~0.08 for a busy room, higher for real clutter.
+    The messy-desk trigger's (b) signal; see CLUTTER_EDGE_THRESHOLD."""
+    import cv2
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    return float((edges > 0).mean())
+
+
+# ─── hand gesture recognition (MediaPipe) ───────────────────────────────────
+
+def _load_gesture_model():
+    """MediaPipe GestureRecognizer (IMAGE mode), or None if disabled / missing
+    / mediapipe unavailable — so a missing model quietly turns gestures off
+    rather than crashing the loop (same fail-safe as _load_object_model)."""
+    if not GESTURE_ENABLED:
+        return None
+    if not os.path.exists(GESTURE_MODEL):
+        logger.warning("gesture recognition enabled but model missing (%s) — disabling", GESTURE_MODEL)
+        return None
+    try:
+        from mediapipe.tasks.python import vision, BaseOptions
+        opts = vision.GestureRecognizerOptions(
+            base_options=BaseOptions(model_asset_path=GESTURE_MODEL),
+            num_hands=1,
+            min_hand_detection_confidence=GESTURE_MIN_HAND_CONF,
+            min_hand_presence_confidence=GESTURE_MIN_HAND_CONF,
+        )
+        model = vision.GestureRecognizer.create_from_options(opts)
+        logger.info("gesture recognizer loaded")
+        return model
+    except Exception:
+        logger.exception("failed to load gesture recognizer — disabling")
+        return None
+
+
+def _pointing_direction(landmarks) -> str | None:
+    """From the 21 hand landmarks, if this is a single-finger point (index
+    extended, the other three fingers curled), return point_up/down/left/
+    right from the index-finger vector. Else None. Landmarks are normalized
+    [0,1] with origin TOP-LEFT, so +y is downward on screen."""
+    try:
+        tip, pip, mcp = landmarks[8], landmarks[6], landmarks[5]
+        # index extended = tip clearly beyond the pip joint from the mcp
+        # (distance tip->mcp bigger than pip->mcp). Other fingers curled =
+        # their tips closer to the wrist than their pips.
+        def _curled(tip_i, pip_i):
+            return _dist(landmarks[tip_i], landmarks[0]) < _dist(landmarks[pip_i], landmarks[0])
+        index_extended = _dist(tip, mcp) > _dist(pip, mcp) * 1.15
+        others_curled = sum(_curled(t, p) for t, p in ((12, 10), (16, 14), (20, 18))) >= 2
+        if not (index_extended and others_curled):
+            return None
+        dx, dy = tip.x - mcp.x, tip.y - mcp.y
+        if abs(dy) >= abs(dx):
+            return "point_up" if dy < 0 else "point_down"
+        # camera image is un-mirrored world-upright here; +x = user's left in
+        # frame, but for a point we just report screen-left/right.
+        return "point_right" if dx > 0 else "point_left"
+    except Exception:
+        return None
+
+
+def _dist(a, b) -> float:
+    return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2) ** 0.5
+
+
+def _detect_gesture(gesture_model, img):
+    """Return (gesture_name, score) for the top hand gesture in `img`, or None.
+    MediaPipe's 7 built-ins are snake_cased; a 'Pointing_Up' (or any single-
+    finger point) is refined to point_up/down/left/right via the landmarks."""
+    if gesture_model is None:
+        return None
+    try:
+        import cv2
+        import mediapipe as mp
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = gesture_model.recognize(mp_img)
+    except Exception:
+        logger.debug("gesture recognize failed", exc_info=True)
+        return None
+    if not res.gestures or not res.gestures[0]:
+        return None
+    top = res.gestures[0][0]
+    name = _MP_GESTURE_MAP.get(top.category_name)
+    score = float(top.score)
+    landmarks = res.hand_landmarks[0] if res.hand_landmarks else None
+    # Refine any pointing pose (MediaPipe only ever labels Pointing_Up) into a
+    # real direction — this is how we get point_down, which has no built-in.
+    if landmarks is not None:
+        pointed = _pointing_direction(landmarks)
+        if pointed is not None:
+            return (pointed, max(score, GESTURE_MIN_SCORE))
+    if name is None or top.category_name == "None" or score < GESTURE_MIN_SCORE:
+        return None
+    return (name, score)
+
+
+def _fire_gesture(name: str) -> None:
+    url = GESTURE_REACT_URL + "?label=" + urllib.parse.quote(name)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/gesture %s -> %s", name, resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/gesture %s skipped (reactor busy)", name)
+        else:
+            logger.warning("react/gesture %s failed: HTTP %s", name, exc.code)
+    except Exception:
+        logger.exception("react/gesture %s failed", name)
+
+
+def _maybe_fire_gesture(detected, gesture_state: dict, now: float):
+    """Debounce hand gestures: fire on a NEW gesture, or the same one again
+    only after GESTURE_COOLDOWN_S (so a held pose = one reaction, not a
+    stream). A no-hand tick resets the memory so re-showing the same gesture
+    later counts as fresh. Returns the fired gesture name (for Stage-2 flows
+    to consume) or None. GESTURE_COOLDOWN_S<=0 keeps detection but fires no
+    reaction. `detected` is (name, score) or None."""
+    if detected is None:
+        gesture_state["last"] = None
+        return None
+    name, score = detected
+    # Ignore anything that isn't a deliberate, meaningful gesture (e.g. a
+    # point_left/right from a hand just working on the desk) — no reaction,
+    # no chatter. Reset last so a real gesture right after still fires.
+    if name not in GESTURE_REACTABLE:
+        gesture_state["last"] = None
+        return None
+    if (name == gesture_state.get("last") and GESTURE_COOLDOWN_S > 0
+            and now - gesture_state.get("ts", 0.0) < GESTURE_COOLDOWN_S):
+        return None
+    gesture_state["last"] = name
+    gesture_state["ts"] = now
+    logger.info("gesture: %s (%.2f)", name, score)
+    if GESTURE_COOLDOWN_S > 0:
+        _fire_gesture(name)
+    return name
 
 
 def _detect_largest_face(detector, img):
@@ -571,6 +1233,9 @@ def _tick(
     detector, recognizer, sess: MCPSession, known: dict,
     last_reaction_ts: dict, last_learn_ts: dict, prev_small_box: list,
     brightness_history: list, last_lights_out_ts: dict,
+    last_seen_ts: dict, missed_looks: dict, last_encourage: dict,
+    object_model, object_last_seen: dict, last_object_comment: list,
+    messy_state: dict, gesture_model, gesture_state: dict,
 ) -> None:
     """One perception step: capture, detect/classify, write state, maybe react.
 
@@ -589,6 +1254,17 @@ def _tick(
     """
     import cv2
 
+    # Don't capture mid-move — wait for the head to settle (idle flags moves),
+    # else the frame is motion-blurred and gives bad face/gesture/object reads.
+    # If it's still moving after the max wait (a sustained sweep), skip the tick
+    # entirely rather than trust a blur (also saves a wasted take_photo).
+    _settle_waited = 0.0
+    while _head_settling() and _settle_waited < HEAD_SETTLE_MAX_WAIT_S:
+        time.sleep(0.1)
+        _settle_waited += 0.1
+    if _head_settling():
+        return
+
     path = _take_photo(sess, "ambient scan")
     if path is None:
         return
@@ -601,10 +1277,56 @@ def _tick(
             pass
         return
 
+    # When hung upside-down the raw frame is rotated 180 — undo it so YuNet
+    # sees an upright face and dx/dy come out in world-upright coordinates
+    # (a face to the user's right reads dx>0, etc.). Single flag, shared with
+    # the companion server + idle loop. See SETTINGS_PATH above.
+    if _is_upside_down():
+        img = cv2.rotate(img, cv2.ROTATE_180)
+
+    # Local object pass on the SAME oriented frame (no extra capture). Runs
+    # every executed tick so novelty tracking (_pick_new_object stamps every
+    # detected label's last-seen) stays accurate; actually SPEAKING is gated
+    # separately below on the global cooldown and on not talking over a
+    # greeting/encourage. edge_frac + the clutter streak feed the messy-desk
+    # remark's (b) trigger; both are maintained every tick regardless of
+    # whether anything is said, so the streak reflects real persistence.
+    obj_now = time.time()
+    detected_objects, person_present = _detect_objects(object_model, img)
+    new_object = _pick_new_object(detected_objects, object_last_seen, obj_now)
+    edge_frac = _edge_fraction(img)
+    if edge_frac >= CLUTTER_EDGE_THRESHOLD:
+        messy_state["streak"] += 1
+    else:
+        messy_state["streak"] = 0
+
+    # Hand gesture pass on the same frame. A gesture is a DELIBERATE user act,
+    # so it takes priority over ambient object/messy commentary this tick
+    # (gesture_fired gates those below); it still shares the reactor lock, so
+    # a 409 just means he was mid-say.
+    gesture_fired = _maybe_fire_gesture(
+        _detect_gesture(gesture_model, img), gesture_state, obj_now
+    )
+
     small = _small_gray(img)
     motion_score = _motion_score(prev_small_box[0], small)
     prev_small_box[0] = small
     motion_detected = motion_score > MOTION_DIFF_THRESHOLD
+    # Non-camera presence evidence (recent input / motion) — lets a face-less
+    # tick avoid being mis-counted as the owner having left (e.g. low light).
+    present_hint = _user_present_hint(motion_detected)
+    # Broad "user is here" for the idle absence clock (see _write_vision_state):
+    # a person in frame (YOLO — turned-to-the-side working) OR recent keyboard/
+    # mouse input. NOT raw motion (his own head movement dominates that). Face
+    # visibility is OR'd in at each _write_vision_state call.
+    _idle_s = _seconds_since_user_input()
+    input_recent = _idle_s is not None and _idle_s <= PRESENCE_INPUT_WINDOW_S
+    user_present = person_present or input_recent
+    # "Hot" = something is happening in front of the camera (motion, or a
+    # gesture just fired) — the loop polls FAST while hot so held gestures
+    # actually get caught between the slow ambient snapshots. Set here, before
+    # the face branch, so every return path below carries it. Read by _loop.
+    gesture_state["hot"] = motion_detected or bool(gesture_fired)
 
     brightness = _brightness(small)
     if _check_lights_out(brightness, brightness_history, last_lights_out_ts):
@@ -614,9 +1336,17 @@ def _tick(
     face = _detect_largest_face(detector, img)
     if face is None:
         logger.info(
-            "tick: no face in frame%s", " (motion detected)" if motion_detected else ""
+            "tick: no face in frame%s%s",
+            " (motion detected)" if motion_detected else "",
+            " (present: recent input/motion — not counting absence)" if present_hint else "",
         )
-        _write_vision_state(False, None, None, 0.0, 0.0, motion_detected)
+        _note_look(None, last_seen_ts, missed_looks, suppress_absence=present_hint)
+        _write_vision_state(False, None, None, 0.0, 0.0, motion_detected, present=user_present)
+        # Nobody's here to greet, but a new object / a fridge-hallucination /
+        # a cluttered desk still earns a remark — unless a gesture already
+        # fired this tick (that takes the reactor).
+        if not gesture_fired:
+            _comment_on_scene(new_object, edge_frac, messy_state, last_object_comment, obj_now)
         try:
             os.remove(path)
         except OSError:
@@ -678,17 +1408,70 @@ def _tick(
                     ):
                         propose_learn = True
 
-    _write_vision_state(True, person, name, dx, dy, False)
+    _write_vision_state(True, person, name, dx, dy, False, present=True)
 
     now = time.time()
     reacted = False
-    if key and now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S:
+    absent_for = 0.0
+    if person == "known" and key:
+        absent_for = now - last_seen_ts.get(key, now)
+        # Greet on FIRST sight since process start, or on return from a real
+        # absence (wall-clock gap AND enough looks that actually missed them
+        # — see ABSENCE_GREET_S comment).
+        should_react = key not in last_seen_ts or (
+            absent_for >= ABSENCE_GREET_S
+            and missed_looks.get(key, 0) >= ABSENCE_MIN_MISSED_LOOKS
+        )
+        last_seen_ts[key] = now
+    elif key:
+        should_react = now - last_reaction_ts.get(key, 0.0) >= COOLDOWN_S
+    else:
+        should_react = False
+    # A recognized owner resets their own counter (real sighting). An
+    # unrecognized/uncertain face still means a human is here, so with a
+    # presence hint don't let it accrue as the owner's absence either.
+    _note_look(
+        key if person == "known" else None, last_seen_ts, missed_looks,
+        suppress_absence=(person != "known" and present_hint),
+    )
+
+    if key and should_react:
         last_reaction_ts[key] = now
-        logger.info("face detected: person=%s key=%s score=%.3f", person, key, score)
+        logger.info(
+            "face detected: person=%s key=%s score=%.3f absent_for=%.0fs",
+            person, key, score, absent_for,
+        )
         _fire_reaction(person, name, propose_learn=propose_learn)
+        _log_visitor_safe(recognizer, img, face, name, person == "known", score)
         reacted = True
         if person == "unknown":
             _write_pending_enrollment_marker()
+
+    # Ambient work-nudge: only while the owner-ish person is continuously
+    # present (seen recently, didn't just get greeted). Busy/paused ticks
+    # never reach this point, so it can't talk over Claude or a voice chat.
+    encouraged = False
+    if (
+        ENCOURAGE_COOLDOWN_S > 0
+        and person == "known"
+        and not reacted
+        and absent_for < ABSENCE_GREET_S
+        and now - last_encourage["ts"] >= last_encourage["gap"]
+    ):
+        last_encourage["ts"] = now
+        last_encourage["gap"] = ENCOURAGE_COOLDOWN_S * random.uniform(1.0, 1.5)
+        logger.info(
+            "firing encourage nudge for %s (next gap >= %.0fs)", name, last_encourage["gap"]
+        )
+        _fire_encourage(name)
+        encouraged = True
+
+    # Object / messy-desk commentary, lowest priority: only if he didn't just
+    # greet, encourage, OR react to a gesture this tick, so he never doubles
+    # up. Novelty/streak were already updated above regardless, so a thing
+    # seen during a greeting tick won't re-trigger next tick either.
+    if not reacted and not encouraged and not gesture_fired:
+        _comment_on_scene(new_object, edge_frac, messy_state, last_object_comment, obj_now)
 
     # Learning proposal is piggybacked on the greet firing (simplification:
     # the greet's own hourly cooldown already bounds this, on top of its
@@ -710,15 +1493,49 @@ def _tick(
 def _loop(once: bool) -> None:
     detector = _load_detector()
     recognizer = _load_recognizer()
+    object_model = _load_object_model()
+    gesture_model = _load_gesture_model()
+    gesture_state: dict = {"last": None, "ts": 0.0}
     last_reaction_ts: dict = {}
     last_learn_ts: dict = {}
     prev_small_box: list = [None]
     brightness_history: list = []
     last_lights_out_ts: dict = {}
+    last_seen_ts: dict = {}
+    missed_looks: dict = {}
+    object_last_seen: dict = {}
+    # 1-element list = mutable timestamp of the last object comment. Seeded
+    # to 0.0 so the very first new object can speak immediately (unlike the
+    # encourage nudge, an object remark on startup is welcome, not a lecture).
+    last_object_comment: list = [0.0]
+    # Messy-desk remark state: shared long cooldown timestamp + the running
+    # count of consecutive high-edge-density ticks (the clutter-streak). ts=0.0
+    # so the first genuinely cluttered/confused view can speak straight away.
+    messy_state: dict = {"ts": 0.0, "streak": 0}
+    # First nudge no earlier than one full (stretched) cooldown after start —
+    # boot-time gets the greeting, not a productivity lecture.
+    last_encourage: dict = {
+        "ts": time.time(),
+        "gap": ENCOURAGE_COOLDOWN_S * random.uniform(1.0, 1.5),
+    }
     logger.info(
-        "starting vision loop (poll=%.0fs cooldown=%.0fs threshold=%.3f uncertain=%.2f-%.2f)",
-        POLL_INTERVAL_S, COOLDOWN_S, MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
+        "starting vision loop (poll=%.0fs unknown_cooldown=%.0fs absence_greet=%.0fs "
+        "encourage=%.0fs objects=%s obj_cooldown=%.0fs clutter=%s edge_thr=%.3f "
+        "gestures=%s threshold=%.3f uncertain=%.2f-%.2f)",
+        POLL_INTERVAL_S, COOLDOWN_S, ABSENCE_GREET_S, ENCOURAGE_COOLDOWN_S,
+        object_model is not None, OBJECT_COOLDOWN_S,
+        CLUTTER_ENABLED and object_model is not None, CLUTTER_EDGE_THRESHOLD,
+        gesture_model is not None,
+        MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
     )
+    # Boot-time orientation auto-detect: figure out which way up he is now
+    # (he may have been flipped while powered off) and set the shared flag.
+    if not once and AUTO_ORIENT_ENABLED:
+        try:
+            _auto_orient_on_boot(detector)
+        except Exception:
+            logger.exception("auto-orient on boot failed")
+    hot_ticks = 0  # >0 = poll fast (recent motion/gesture); decays each tick
     while True:
         if _should_skip_tick():
             time.sleep(POLL_INTERVAL_S)
@@ -735,12 +1552,204 @@ def _loop(once: bool) -> None:
             _tick(
                 detector, recognizer, sess, known, last_reaction_ts, last_learn_ts,
                 prev_small_box, brightness_history, last_lights_out_ts,
+                last_seen_ts, missed_looks, last_encourage,
+                object_model, object_last_seen, last_object_comment,
+                messy_state, gesture_model, gesture_state,
             )
         except Exception:
             logger.exception("tick failed")
         if once:
             return
-        time.sleep(POLL_INTERVAL_S)
+        # Adaptive cadence: a "hot" tick (motion/gesture) keeps the loop fast
+        # for the next FAST_POLL_HOT_TICKS ticks so held gestures get caught;
+        # it relaxes back to the slow ambient poll once nothing's happening.
+        if gesture_state.pop("hot", False):
+            hot_ticks = FAST_POLL_HOT_TICKS
+        interval = FAST_POLL_INTERVAL_S if hot_ticks > 0 else POLL_INTERVAL_S
+        if hot_ticks > 0:
+            hot_ticks -= 1
+        time.sleep(interval)
+
+
+# ─── ArUco scan-tray orientation calibration (2026-07-06) ───────────────────
+# There is no readable orientation sensor over MCP (no IMU tool; the i2c_*
+# tools only reach the external Grove Port A, not the internal bus the BMI270
+# sits on — see firmware/TODO.md). So we work orientation out from the CAMERA
+# using the scan tray Wheatley hangs over: it has four DICT_4X4_50 ArUco
+# markers (IDs 0-3), one per corner, printed upright. We read the markers'
+# rotation in the RAW (un-rotated) frame — printed-upright markers read ~0 deg
+# when the body is upright and ~180 deg when it's inverted (confirmed live).
+# The verdict is written to the shared companion_settings.json `upside_down`
+# flag — the single source of truth the vision loop, idle loop, and companion
+# server all read. No face needed; run it any time the tray is in view.
+CALIB_PITCH_POINTS = (65, 75, 55, 85, 45)  # sweep until the tray markers appear
+CALIB_MIN_MARKERS = 2                       # need at least this many before deciding
+
+
+def _detect_marker_rotations(img) -> list[float]:
+    """Rotation (deg, -180..180) of each DICT_4X4_50 marker's top edge in the
+    frame. ~0 = marker upright, ~±180 = rotated 180 (body inverted)."""
+    import cv2
+    import numpy as np
+
+    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    try:  # OpenCV >= 4.7 API
+        detector = cv2.aruco.ArucoDetector(adict, cv2.aruco.DetectorParameters())
+        corners, ids, _ = detector.detectMarkers(img)
+    except AttributeError:  # older API
+        corners, ids, _ = cv2.aruco.detectMarkers(img, adict)
+    rots: list[float] = []
+    if ids is not None:
+        for c in corners:
+            pts = c.reshape(-1, 2)  # marker's own TL, TR, BR, BL
+            top = pts[1] - pts[0]
+            rots.append(float(np.degrees(np.arctan2(top[1], top[0]))))
+    return rots
+
+
+def _rotations_inverted(rots: list[float]) -> bool:
+    """True if the markers read as rotated ~180 deg (body inverted). Robust to
+    angle wrap by averaging unit vectors."""
+    import numpy as np
+    mx = float(np.mean([np.cos(np.radians(a)) for a in rots]))
+    my = float(np.mean([np.sin(np.radians(a)) for a in rots]))
+    return abs(float(np.degrees(np.arctan2(my, mx)))) > 90.0
+
+
+def _set_upside_down(flag: bool) -> None:
+    """Merge the verdict into companion_settings.json (shared source of truth)."""
+    data = {}
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    data["upside_down"] = bool(flag)
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, SETTINGS_PATH)
+
+
+# Boot sweep poses (yaw, pitch): a broad spread so the tray or a face turns up
+# whichever way he's currently mounted — we don't yet know which way is up.
+AUTO_ORIENT_POSES = ((0, 60), (0, 45), (0, 30), (0, 75), (-40, 45), (40, 45), (0, 15), (0, 85))
+
+
+def _auto_orient_on_boot(detector) -> None:
+    """Work out which way up he is at startup and set the shared upside_down
+    flag, MOVING the camera to hunt for a cue. Priority of cues:
+      1. the scan-tray ArUco codes (rotation-invariant, unambiguous), then
+      2. a face (detected in the RAW frame => upright; only in the 180-rotated
+         frame => inverted).
+    If neither is seen anywhere in the sweep, LEAVE the flag as it was before
+    boot — user's rule: "if unsure, assume the same way round as before boot."
+    (Generic "other object" orientation would need a DNN/OCR model; not built —
+    an unreliable guess that flips the wrong way is worse than keeping prev.)
+    Disable with STACKCHAN_AUTO_ORIENT=0.
+    """
+    import cv2
+
+    prev = _is_upside_down()
+    sess = MCPSession(GATEWAY_MCP)
+    try:
+        sess.initialize()
+        sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
+    except Exception:
+        logger.info("auto-orient: device not ready; keeping previous upside_down=%s", prev)
+        return
+
+    _touch_marker(ORIENTING_MARKER)  # tell the idle loop to hold still
+    try:
+        for yaw, pitch in AUTO_ORIENT_POSES:
+            try:
+                sess.call_tool("move_head", {"yaw": yaw, "pitch": pitch})
+            except Exception:
+                continue
+            time.sleep(1.1)
+            path = _take_photo(sess, "boot orientation check")
+            if not path:
+                continue
+            img = cv2.imread(path)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if img is None:
+                continue
+
+            rots = _detect_marker_rotations(img)
+            if rots:
+                inverted = _rotations_inverted(rots)
+                _set_upside_down(inverted)
+                logger.info("auto-orient: tray markers (%d) -> upside_down=%s (was %s)",
+                            len(rots), inverted, prev)
+                return
+
+            raw_face = _detect_largest_face(detector, img) is not None
+            rot_face = _detect_largest_face(detector, cv2.rotate(img, cv2.ROTATE_180)) is not None
+            if raw_face != rot_face:  # decisive only when exactly one orientation sees it
+                inverted = rot_face
+                _set_upside_down(inverted)
+                logger.info("auto-orient: face (raw=%s rot=%s) -> upside_down=%s (was %s)",
+                            raw_face, rot_face, inverted, prev)
+                return
+
+        logger.info("auto-orient: no tray/face cue found in sweep; keeping previous upside_down=%s", prev)
+    finally:
+        try:
+            sess.call_tool("move_head", {"yaw": 0, "pitch": 45})
+        except Exception:
+            pass
+        _clear_marker(ORIENTING_MARKER)
+
+
+def _calibrate_flip() -> None:
+    import numpy as np
+    import cv2
+
+    sess = MCPSession(GATEWAY_MCP)
+    sess.initialize()
+    sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
+
+    print("Calibrating orientation from the scan-tray ArUco markers...")
+    rots: list[float] = []
+    for pitch in CALIB_PITCH_POINTS:
+        sess.call_tool("move_head", {"yaw": 0, "pitch": pitch})
+        time.sleep(1.2)
+        path = _take_photo(sess, "tray orientation calibration")
+        if not path:
+            continue
+        img = cv2.imread(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        if img is None:
+            continue
+        found = _detect_marker_rotations(img)
+        if found:
+            logger.info("calibrate-flip: pitch %d saw %d marker(s): %s", pitch, len(found), found)
+            rots.extend(found)
+        if len(rots) >= CALIB_MIN_MARKERS:
+            break
+
+    if len(rots) < CALIB_MIN_MARKERS:
+        print(f"Only found {len(rots)} tray marker(s) (need {CALIB_MIN_MARKERS}). "
+              "Point him at the scan tray (the 4 corner codes) and retry. Nothing changed.")
+        return
+
+    # Robust mean angle (angles wrap at ±180): average unit vectors.
+    mx = float(np.mean([np.cos(np.radians(a)) for a in rots]))
+    my = float(np.mean([np.sin(np.radians(a)) for a in rots]))
+    mean_abs = abs(float(np.degrees(np.arctan2(my, mx))))  # 0..180
+    inverted = mean_abs > 90.0
+    _set_upside_down(inverted)
+    print(f"Read {len(rots)} marker rotation(s), mean |angle| {mean_abs:.0f} deg -> "
+          f"{'UPSIDE DOWN' if inverted else 'UPRIGHT'}. "
+          f"Set companion_settings.json upside_down={inverted}. "
+          "Restart the idle loop to apply (stackchan-idle-start.vbs).")
+    logger.info("calibrate-flip(aruco): rots=%s mean_abs=%.1f inverted=%s", rots, mean_abs, inverted)
 
 
 # ─── enrollment CLI ─────────────────────────────────────────────────────────
@@ -925,8 +1934,18 @@ def main() -> None:
         "--confirm-learn", nargs=2, metavar=("NAME", "FRAME_PATH"),
         help="append a learning sample from an already-captured frame",
     )
+    parser.add_argument(
+        "--calibrate-flip", action="store_true",
+        help="work out the pitch orientation (up/down) from the camera and save it",
+    )
     parser.add_argument("--once", action="store_true", help="run a single tick then exit (testing)")
     args = parser.parse_args()
+
+    if args.calibrate_flip:
+        # Foreground one-shot, like --enroll — skip the single-instance lock
+        # so it runs even while the background loop is active.
+        _calibrate_flip()
+        return
 
     if args.enroll:
         # Enrollment is an explicit, foreground, one-shot CLI action — skip

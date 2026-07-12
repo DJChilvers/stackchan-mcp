@@ -21,6 +21,14 @@ set TRAMPOLINE_FAILS=0
 set LOOP_FAILS=0
 
 :loop
+REM If another gateway is already listening on 8767, this watchdog is a
+REM duplicate (double launch, or a respawned chain after the original
+REM recovered) -- exit quietly instead of crash-looping on the ownership lock.
+netstat -ano | findstr "LISTENING" | findstr ":8767" >nul 2>&1
+if not errorlevel 1 (
+  echo [%date% %time%] another gateway is already listening on 8767 -- exiting this watchdog >> "%LOG%"
+  exit /b 0
+)
 if %LOOP_FAILS% GEQ 10 goto respawn
 if %TRAMPOLINE_FAILS% GEQ 3 goto fallback
 
@@ -58,6 +66,15 @@ ping -n 6 127.0.0.1 >nul
 goto loop
 
 :respawn
+REM Respawn via Task Scheduler first: the new process is spawned by the
+REM Task Scheduler service, fully outside this (possibly wedged) process
+REM tree. On 2026-07-06 a wedged watchdog's "start wscript" respawn failed
+REM silently and everything stayed dead. Fall back to start if the task is
+REM missing.
 echo [%date% %time%] %LOOP_FAILS% consecutive failed launches -- respawning a fresh watchdog process and exiting this one >> "%LOG%"
-start "" wscript.exe "%~dp0stackchan-daemon-start.vbs"
+schtasks /Run /TN "StackChan Gateway" >nul 2>&1
+if errorlevel 1 (
+  echo [%date% %time%] schtasks respawn failed -- falling back to start wscript >> "%LOG%"
+  start "" wscript.exe "%~dp0stackchan-daemon-start.vbs"
+)
 exit /b 1

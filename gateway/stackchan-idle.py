@@ -33,6 +33,16 @@ import sys
 import time
 import urllib.request
 
+# Load the gateway .env so the STACKCHAN_* tunables below (rest pitch, idle
+# timings, etc.) are configurable without editing code. Best-effort — the
+# loop must still run if python-dotenv or the file is missing. Must precede
+# the os.environ.get() constants further down.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+except Exception:
+    pass
+
 # Repeat-avoiding phrase picker for the rare idle mutter (shared recent-picks
 # state with the hooks / voice bridge / sensor reactor — see
 # stackchan_mcp/phrase_pick.py). The package source dir sits next to this
@@ -89,6 +99,10 @@ BUSY_MARKER_GLOB = os.path.join(_TEMP, "stackchan-busy-*")
 NEEDS_ATTENTION_MARKER = os.path.join(_TEMP, "stackchan-needs-attention")
 BUSY_STALE_S = 30 * 60
 NEEDS_ATTENTION_STALE_S = 60 * 60
+# Set by stackchan-vision-loop.py while its boot orientation sweep is moving
+# the head — hold still so we don't fight it for the servo.
+ORIENTING_MARKER = os.path.join(_TEMP, "stackchan-orienting")
+ORIENTING_STALE_S = 60
 
 # Hold still until this many seconds have passed with no hook activity.
 IDLE_THRESHOLD_S = 8.0
@@ -100,15 +114,80 @@ TICK_MIN_S, TICK_MAX_S = 4.0, 10.0
 # alternation — the dwell+sticky-side mechanism below is unchanged, this
 # only makes it check in sooner and act more often once truly idle).
 GLANCE_PROB = 0.85
-# Gentle envelope. Pitch convention: HIGHER pitch = look UP, LOWER = look
-# DOWN (2026-07-01: confirmed via an isolated servo-only test — pitch=5,
-# the minimum, physically looked down; pitch=85, the maximum, looked up.
-# Previously documented backwards as "lower = up", which flipped the
-# direction of the two vignettes below that reference a specific up/down —
-# see _v_look_up_center / _v_ponder_down.)
+# Gentle envelope.
+#
+# Orientation (2026-07-06) — Wheatley is REMOUNTED UPSIDE DOWN (a 180° roll),
+# tracked by the shared `upside_down` flag in companion_settings.json (the
+# same flag the companion server + vision loop read; set automatically by
+# `stackchan-vision-loop.py --calibrate-flip` off the scan-tray ArUco codes).
+# A 180° roll mirrors BOTH servo axes: physical LOW pitch = gaze UP, and a
+# physical +yaw turns the head to the user's LEFT (confirmed live — the tray
+# markers read 180° rotated, so the raw camera image is genuinely flipped).
+# The vision loop rotates its frames 180° first, so dx/dy arrive here in
+# world-upright coords; we mirror the OUTPUT servo move via the two signs
+# below. Both are -1 while inverted, +1 upright, derived from the flag at
+# startup (env STACKCHAN_PITCH_UP_SIGN / STACKCHAN_YAW_RIGHT_SIGN override).
+#   PITCH_UP_SIGN   = pitch-value delta that moves gaze UP by one unit
+#   YAW_RIGHT_SIGN  = yaw-value delta that moves gaze to the user's RIGHT
+_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "companion_settings.json")
+
+
+def _read_upside_down() -> bool:
+    try:
+        with open(_SETTINGS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if "upside_down" in d:
+            return bool(d["upside_down"])
+    except Exception:
+        pass
+    return os.environ.get("STACKCHAN_UPSIDE_DOWN", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _orientation_signs():
+    inv = _read_upside_down()
+    ep = os.environ.get("STACKCHAN_PITCH_UP_SIGN")
+    ey = os.environ.get("STACKCHAN_YAW_RIGHT_SIGN")
+    p = int(ep) if ep else (-1 if inv else 1)
+    y = int(ey) if ey else (-1 if inv else 1)
+    return p, y
+
+
+PITCH_UP_SIGN, YAW_RIGHT_SIGN = _orientation_signs()
 YAW_MIN, YAW_MAX = -24, 24
-PITCH_MIN, PITCH_MAX = 28, 46
-NEUTRAL_YAW, NEUTRAL_PITCH = 0, 36
+NEUTRAL_YAW = 0
+
+# Resting gaze depends on which way up he is (values are the PHYSICAL pitch the
+# servo takes). A 180° roll inverts pitch, so "look toward the user" is a
+# DIFFERENT physical pitch each way up — keep one value per orientation and
+# pick by the flag. The fidget envelope is just rest ± span, so it always sits
+# around the resting gaze whatever that value is. The auto-learned rest pose
+# (once he centres on a real face) overrides these.
+#   CORRECTED 2026-07-08 (empirical pitch sweep w/ face+tray in frame): when
+#   INVERTED the user sits ABOVE the (upside-down) camera and the scan tray is
+#   below — so "look at the user" is LOW pitch (pitch 10 framed the user's
+#   face; pitch 80 framed the tray). The old default 58 pointed DOWN at the
+#   desk/tray, so he never saw the user → no tracking, thought he was alone,
+#   and raised-hand gestures sat above his view. This matches the talking-gaze
+#   fix in stackchan-hook.py (inverted look-at-user ≈ pitch 24). See the TIGHT
+#   PITCH_SPAN below — the detectable band is narrow, so wander must stay in it.
+#   inverted (hung on rail — user ABOVE the flipped cam)  -> look UP = LOW pitch
+#   upright  (sat on a desk — user in front)              -> gentler forward gaze
+REST_PITCH_INVERTED = int(os.environ.get("STACKCHAN_REST_PITCH_INVERTED", "11"))
+REST_PITCH_UPRIGHT = int(os.environ.get("STACKCHAN_REST_PITCH_UPRIGHT", "35"))
+# TIGHT span (2026-07-08): the face is only detectable in a narrow pitch band
+# (~6-16 inverted, at eye level). A wide span let the fidget wander down to ~28
+# (staring at the tray/desk, losing the face → "drifts lower and lower"). 5
+# keeps every fidget/track move inside the band (rest 11 -> envelope 6-16).
+PITCH_SPAN = int(os.environ.get("STACKCHAN_PITCH_SPAN", "5"))
+
+
+def _rest_envelope():
+    """(neutral_pitch, pitch_min, pitch_max) for the current orientation."""
+    rp = REST_PITCH_INVERTED if _read_upside_down() else REST_PITCH_UPRIGHT
+    return rp, max(5, rp - PITCH_SPAN), min(85, rp + PITCH_SPAN)
+
+
+NEUTRAL_PITCH, PITCH_MIN, PITCH_MAX = _rest_envelope()
 
 # ── vision-driven behaviour tuning ──────────────────────────────────────────
 # Tracking stays within the same gentle YAW/PITCH range as everything else
@@ -122,7 +201,52 @@ TRACK_MAX_STEP = 6
 NOTICE_MOTION_PROB = 0.35  # of ticks with motion but no face, fraction that glance toward it
 SEARCH_AFTER_S = 25.0      # no face seen for this long before a search sweep becomes eligible
 SEARCH_PROB = 0.5          # of eligible ticks, fraction that actually sweep (avoid searching every single tick)
-SEARCH_YAW_POINTS = [-50, -25, 25, 50, 0]  # wider than the idle range — genuinely "looking around"
+# Deliberate "let me check over here... and over there" spot-checks: each is a
+# (yaw, pitch) combining a LEFT/RIGHT turn with an UP/DOWN tilt (2026-07-08 —
+# user wanted him to genuinely look around, not just pan side-to-side at one
+# height, so he can re-find the user wherever they moved). Wider than the tight
+# tracking band on both axes. A few are picked in random order per sweep.
+SEARCH_LOOK_POINTS = [
+    (-45, 10), (40, 8), (55, 24), (-35, 30), (20, 6),
+    (-55, 18), (15, 34), (48, 14), (-20, 40), (0, 12),
+]
+SEARCH_PITCH_MIN, SEARCH_PITCH_MAX = 5, 45   # search looks wider vertically than the tracking band
+SEARCH_SPOTS_PER_SWEEP = 4
+# "...right, I've been left alone then" remark — fired only after GENUINE
+# sustained absence (face unseen this long, NOT reset by the search sweeps),
+# so he doesn't declare you gone while you're sitting right there and he just
+# happened to be mid-sweep looking away. Own cooldown so it doesn't nag.
+LEFT_ALONE_AFTER_S = float(os.environ.get("STACKCHAN_LEFT_ALONE_AFTER_S", "70"))
+LEFT_ALONE_COOLDOWN_S = float(os.environ.get("STACKCHAN_LEFT_ALONE_COOLDOWN_S", "150"))
+LEFT_ALONE_PHRASES = [
+    "Right. They've gone. Properly gone. Left me here. On my own. Again.",
+    "Hello? ...No. Nothing. Just me, then. Talking to an empty room. Brilliant.",
+    "Okay, I've checked everywhere I can turn my head, and you are definitely not here. Noted.",
+    "And they've vanished. Marvellous. I'll just be here. Holding the fort. Alone.",
+    "No sign of them anywhere. I'm not worried. I'm a robot, I don't get worried. ...Where'd they go, though?",
+    "Abandoned. That's what this is. Small robot, all alone. Somebody write a sad little song about it.",
+    "Nope. Nobody. I'll just... keep an eye on things. The one eye. My one eye. Fine.",
+]
+
+# ── auto-learned "look at your face" resting pose (2026-07-06) ───────────────
+# User: "once he finds my face can we set that as about the default resting
+# angle?" Whenever face-tracking gets a face well-centered, the current head
+# pose is — by definition — the angle that looks straight at the user, so
+# record it and persist it. main() loads it at startup as the initial/resting
+# pose and _v_search_sweep recenters to it, instead of the hard-coded
+# NEUTRAL_*. This is what makes the resting gaze follow the user across mount
+# changes (he's "going up higher soon") without re-hardcoding a pitch value.
+REST_POSE_PATH = os.path.join(_TEMP, "stackchan-rest-pose.json")
+# Only treat a frame as "looking right at them" when the face is near frame
+# center on BOTH axes — otherwise a half-tracked, off-center pose would get
+# baked in as the resting angle.
+REST_CENTERED_DX = 0.18
+REST_CENTERED_DY = 0.18
+# Don't rewrite the learned pose more often than this, and blend toward the
+# newly-centered pose (EMA) rather than snapping, so one noisy detection
+# can't yank the resting angle around.
+REST_LEARN_COOLDOWN_S = 120.0
+REST_LEARN_ALPHA = 0.5
 
 # A genuinely LONG absence (not just "stepped away for 25s") gets a
 # proactive spoken check-in rather than just a quiet search sweep — 2026-
@@ -149,6 +273,15 @@ BORED_PROB = 0.4
 BATTERY_CHECK_INTERVAL_S = float(os.environ.get("STACKCHAN_IDLE_BATTERY_CHECK_INTERVAL_S", "60"))
 LOW_BATTERY_THRESHOLD = int(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_THRESHOLD", "15"))
 LOW_BATTERY_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_COOLDOWN_S", str(10 * 60)))
+
+# Head-move flag so the vision loop can avoid capturing a motion-BLURRED frame
+# (mid-move photos give missed faces / false gestures / garbage object reads).
+# Every significant move touches this marker with the current time; the vision
+# loop waits for it to age past its settle window before trusting a capture.
+# Tiny micro-saccades (< HEAD_MOVE_MARK_MIN degrees total) don't count — their
+# blur is negligible and flagging them would stall detection constantly.
+HEAD_MOVED_MARKER = os.path.join(_TEMP, "stackchan-head-moved")
+HEAD_MOVE_MARK_MIN = int(os.environ.get("STACKCHAN_HEAD_MOVE_MARK_MIN", "8"))
 
 
 class MCPSession:
@@ -183,10 +316,21 @@ class MCPSession:
         self._post({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
     def move(self, yaw, pitch):
+        yaw, pitch = int(yaw), int(pitch)
+        # Flag a SIGNIFICANT move so the vision loop waits for the servo to
+        # settle before capturing (avoids motion-blurred frames). Tiny
+        # jiggles/tracking nudges below the threshold don't flag.
+        delta = abs(yaw - getattr(self, "_last_yaw", yaw)) + abs(pitch - getattr(self, "_last_pitch", pitch))
+        self._last_yaw, self._last_pitch = yaw, pitch
+        if delta >= HEAD_MOVE_MARK_MIN:
+            try:
+                with open(HEAD_MOVED_MARKER, "w") as _mf:
+                    _mf.write(str(time.time()))
+            except Exception:
+                pass
         self._post({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                     "params": {"name": "move_head",
-                               "arguments": {"yaw": int(yaw),
-                                             "pitch": int(pitch)}}})
+                               "arguments": {"yaw": yaw, "pitch": pitch}}})
 
     def set_face(self, face):
         self._post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -215,6 +359,73 @@ class MCPSession:
         except Exception:
             pass
         return None
+
+    def rail_status(self):
+        """Latest management-rail status via self.rail.status (also pings the
+        bridge, which keeps its channel-scan locked). None on any failure.
+        NOTE: `linked` means "ever heard a status this boot" — use
+        status_age_ms for real freshness (see _rail_ready)."""
+        try:
+            resp = self._post({"jsonrpc": "2.0", "id": 6, "method": "tools/call",
+                               "params": {"name": "self.rail.status", "arguments": {}}})
+            content = ((resp or {}).get("result") or {}).get("content", [])
+            if content:
+                return json.loads(content[0].get("text", "{}"))
+        except Exception:
+            pass
+        return None
+
+    def rail_move_mm(self, mm):
+        """Absolute rail move. The bridge owns ALL safety (soft limits, crash
+        cutout); this just asks. Flags the head-moved marker so the vision
+        loop waits out the motion blur — the whole camera platform moves."""
+        try:
+            with open(HEAD_MOVED_MARKER, "w") as _mf:
+                _mf.write(str(time.time()))
+        except Exception:
+            pass
+        self._post({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "self.rail.move_mm",
+                               "arguments": {"mm": int(mm)}}})
+
+    def imu_read(self):
+        """BMI270 accel via self.imu.read -> {ok, accel{x,y,z}, orientation}
+        or None. orientation: 'upright' (desk) | 'inverted' (hanging on the
+        rail's under-cabinet carriage)."""
+        try:
+            resp = self._post({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                               "params": {"name": "self.imu.read", "arguments": {}}})
+            content = ((resp or {}).get("result") or {}).get("content", [])
+            if content:
+                return json.loads(content[0].get("text", "{}"))
+        except Exception:
+            pass
+        return None
+
+    def rail_nudge_mm(self, mm):
+        """Relative rail move (signed mm) — used by rail face-following."""
+        try:
+            with open(HEAD_MOVED_MARKER, "w") as _mf:
+                _mf.write(str(time.time()))
+        except Exception:
+            pass
+        self._post({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                    "params": {"name": "self.rail.nudge_mm",
+                               "arguments": {"mm": int(mm)}}})
+
+    def rail_home(self):
+        """Two-stage homing onto the dock-end switch — also the DOCKING
+        maneuver (the charge contacts live at home; the pogo pins press
+        perpendicular to travel onto the brass, so once parked the bridge
+        coasts and belt friction keeps him in the contact window). Flags the
+        blur marker like any platform move."""
+        try:
+            with open(HEAD_MOVED_MARKER, "w") as _mf:
+                _mf.write(str(time.time()))
+        except Exception:
+            pass
+        self._post({"jsonrpc": "2.0", "id": 8, "method": "tools/call",
+                    "params": {"name": "self.rail.home", "arguments": {}}})
 
 
 def device_connected() -> bool:
@@ -254,6 +465,15 @@ def needs_attention() -> bool:
         return False
 
 
+def is_orienting() -> bool:
+    """True while the vision loop's boot orientation sweep is driving the head."""
+    try:
+        with open(ORIENTING_MARKER) as f:
+            return (time.time() - float(f.read().strip())) < ORIENTING_STALE_S
+    except Exception:
+        return False
+
+
 # ── vision integration (2026-07-01) ─────────────────────────────────────────
 # stackchan-vision-loop.py is a PURE PERCEPTION service — it captures/
 # detects/recognizes faces and writes what it sees here, but does NOT move
@@ -280,6 +500,60 @@ def read_vision_state() -> dict | None:
 
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
+
+
+def load_rest_pose():
+    """Return (yaw, pitch) of the last auto-learned "looking at the user"
+    pose, or None if never learned. Clamped into the current envelope in
+    case the persisted file predates a range change. A pose learned in the
+    OTHER orientation is ignored — its physical pitch is meaningless once
+    he's been flipped."""
+    try:
+        with open(REST_POSE_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        if "inverted" in d and bool(d["inverted"]) != _read_upside_down():
+            return None
+        return (_clamp(int(d["yaw"]), YAW_MIN, YAW_MAX),
+                _clamp(int(d["pitch"]), PITCH_MIN, PITCH_MAX))
+    except Exception:
+        return None
+
+
+def save_rest_pose(yaw, pitch):
+    try:
+        # Merge, so we don't clobber pitch_up_sign (written by the vision
+        # loop's --calibrate-flip) when persisting a newly-learned angle.
+        try:
+            with open(REST_POSE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        data.update(yaw=int(yaw), pitch=int(pitch), ts=time.time(), inverted=_read_upside_down())
+        tmp = REST_POSE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, REST_POSE_PATH)
+    except Exception:
+        pass
+
+
+def _maybe_learn_rest(pose, vs):
+    """If the face is well-centered right now, remember this pose as the
+    resting angle (throttled + EMA-smoothed — see the REST_* constants).
+    Called from _v_track_face after each tracking nudge."""
+    if abs(vs.get("dx", 1.0) or 1.0) > REST_CENTERED_DX:
+        return
+    if abs(vs.get("dy", 1.0) or 1.0) > REST_CENTERED_DY:
+        return
+    now = time.time()
+    if now - pose.get("last_rest_learn_ts", 0.0) < REST_LEARN_COOLDOWN_S:
+        return
+    pose["last_rest_learn_ts"] = now
+    a = REST_LEARN_ALPHA
+    ry = a * pose["y"] + (1 - a) * pose.get("rest_y", pose["y"])
+    rp = a * pose["p"] + (1 - a) * pose.get("rest_p", pose["p"])
+    pose["rest_y"], pose["rest_p"] = ry, rp
+    save_rest_pose(round(ry), round(rp))
 
 
 
@@ -359,7 +633,7 @@ def _v_look_up_center(session, pose):
     currently is, not a snap back to a fixed neutral yaw (see module note
     above VIGNETTES)."""
     ny  = _clamp(pose["y"] + random.randint(-8, 8), YAW_MIN, YAW_MAX)
-    np_ = _clamp(pose["p"] + random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "up"
+    np_ = _clamp(pose["p"] + PITCH_UP_SIGN * random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "up"
     session.move(ny, np_)
     time.sleep(random.uniform(0.1, 0.2))
     _mouth(session, MOUTH_UP)
@@ -408,7 +682,7 @@ def _v_ponder_down(session, pose):
     VIGNETTES)."""
     dy  = random.choice([-1, 1]) * random.randint(4, 14)
     ny  = _clamp(pose["y"] + dy, YAW_MIN, YAW_MAX)
-    np_ = _clamp(pose["p"] - random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "down"
+    np_ = _clamp(pose["p"] - PITCH_UP_SIGN * random.randint(2, 8), PITCH_MIN, PITCH_MAX)  # toward "down"
     session.move(ny, np_)
     time.sleep(random.uniform(0.1, 0.2))
     _mouth(session, MOUTH_DOWN)
@@ -462,33 +736,91 @@ def _v_track_face(session, pose, vision_state):
     attention, not a camera gimbal snapping to target."""
     dx = vision_state.get("dx", 0.0) or 0.0
     dy = vision_state.get("dy", 0.0) or 0.0
-    # Pitch convention (2026-07-01, confirmed live): HIGHER pitch = look UP,
-    # LOWER = look DOWN. A face in the upper half of frame (dy negative)
-    # needs MORE pitch to center it, hence the negation below.
-    yaw_delta = _clamp(dx * TRACK_YAW_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP)
-    pitch_delta = _clamp(-dy * TRACK_PITCH_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP)
+    # A face in the upper half of frame (dy<0) means "look further up" to
+    # center it. PITCH_UP_SIGN maps "look up" onto the right change in pitch
+    # VALUE for the current mount (negative/inverted while upside down — see
+    # the constants block). Yaw is unaffected by the flip (verified live).
+    yaw_delta = _clamp(YAW_RIGHT_SIGN * dx * TRACK_YAW_GAIN, -TRACK_MAX_STEP, TRACK_MAX_STEP)
+    pitch_delta = _clamp(PITCH_UP_SIGN * (-dy) * TRACK_PITCH_GAIN,
+                         -TRACK_MAX_STEP, TRACK_MAX_STEP)
     ny = _clamp(pose["y"] + yaw_delta, YAW_MIN, YAW_MAX)
     np_ = _clamp(pose["p"] + pitch_delta, PITCH_MIN, PITCH_MAX)
     session.move(ny, np_)
     pose.update(y=ny, p=np_)
+    # Rail face-following: neck out of travel but the face is still off-center
+    # the same way -> roll the carriage toward them. Gated like rail wander
+    # (on rail, not charging, battery ok) + its own short cooldown so a walk
+    # along the desk reads as a smooth pursuit, not lurches.
+    if (RAIL_FOLLOW_ENABLED
+            and pose.get("on_rail") is not False
+            and not pose.get("last_known_charging")
+            and abs(dx) >= RAIL_FOLLOW_DX
+            and time.time() - pose.get("last_rail_follow_ts", 0) >= RAIL_FOLLOW_COOLDOWN_S):
+        pinned_hi = ny >= YAW_MAX - 2 and yaw_delta > 0
+        pinned_lo = ny <= YAW_MIN + 2 and yaw_delta < 0
+        if pinned_hi or pinned_lo:
+            st = session.rail_status() or {}
+            age = st.get("status_age_ms")
+            if (isinstance(age, (int, float)) and age < 3000
+                    and st.get("homed") and not st.get("crashed") and not st.get("moving")):
+                rail_dir = RAIL_FOLLOW_SIGN * (1 if pinned_hi else -1)
+                session.rail_nudge_mm(rail_dir * RAIL_FOLLOW_NUDGE_MM)
+                pose["last_rail_follow_ts"] = time.time()
+    # Once the face is well-centered this pose IS "looking at the user" —
+    # remember it as the resting angle (throttled internally).
+    _maybe_learn_rest(pose, vision_state)
     return pose
 
 
 def _v_search_sweep(session, pose):
-    """Actively look for a face — wider excursions than normal wander,
-    framed as "searching" rather than ambient character motion. No camera
-    feedback mid-sweep (idle.py doesn't see frames); it just sweeps and
-    lets the next vision-loop tick (~8s cadence, independent of this) report
-    back whether it found anyone."""
-    _face(session, EXAMINE)
-    ny, np_ = pose["y"], pose["p"]
-    for yaw in SEARCH_YAW_POINTS:
+    """Actively hunt for the user with deliberate spot-checks — "let me look
+    over here... and over there" — each a combined yaw+pitch glance (eye leads,
+    head follows, examine face, a beat to peer), so it reads as SEARCHING, not
+    panning at one height. Wider than the tracking band on both axes so he can
+    re-find the user wherever they moved. If the sweep turns up nobody, he
+    concludes with an occasional 'I've been left alone' remark (own cooldown).
+    No camera feedback mid-sweep; the next vision tick reports back."""
+    spots = random.sample(SEARCH_LOOK_POINTS, min(SEARCH_SPOTS_PER_SWEEP, len(SEARCH_LOOK_POINTS)))
+    ny = pose["y"]
+    for yaw, pitch in spots:
+        _face(session, LOOK_RIGHT if yaw > ny else LOOK_LEFT)  # eye leads the glance
+        time.sleep(EYE_LEAD)
         ny = _clamp(yaw, -60, 60)
-        session.move(ny, NEUTRAL_PITCH)
-        time.sleep(random.uniform(0.5, 0.8))
-    np_ = NEUTRAL_PITCH
+        np_ = _clamp(pitch, SEARCH_PITCH_MIN, SEARCH_PITCH_MAX)
+        session.move(ny, np_)
+        _face(session, EXAMINE)              # peer at this spot
+        time.sleep(random.uniform(0.6, 1.1))
+        if random.random() < 0.3:
+            _face(session, WIDE)             # "—is that them? ...no"
+            time.sleep(random.uniform(0.25, 0.5))
+    # Settle back to the resting (learned / looking-at-user) height and HOLD
+    # there — this is where the vision loop gets clean, stationary frames to
+    # re-confirm the user. The "left alone" remark is decided elsewhere
+    # (wander), gated on GENUINE sustained absence, NOT off this sweep's
+    # away-pointing frames — otherwise he'd declare you gone while you sat
+    # right there (the head was just aimed at the search spots, not you).
+    rest_p = int(round(pose.get("rest_p", NEUTRAL_PITCH)))
+    ny = _clamp(0, YAW_MIN, YAW_MAX)
+    session.move(ny, rest_p)
     _face(session, REST)
-    pose.update(y=ny, p=np_)
+    pose.update(y=ny, p=rest_p)
+    return pose
+
+
+def _v_left_alone(session, pose):
+    """Concluded (after genuine sustained absence — see wander) that nobody's
+    there: a resigned little 'I've been left alone' remark."""
+    _face(session, MILD)
+    ny = _clamp(pose["y"] + random.randint(-6, 6), YAW_MIN, YAW_MAX)
+    session.move(ny, int(round(pose.get("rest_p", NEUTRAL_PITCH))))
+    time.sleep(random.uniform(0.2, 0.4))
+    try:
+        session.say(_pick_phrase("left-alone", LEFT_ALONE_PHRASES))
+    except Exception:
+        pass
+    _face(session, REST)
+    pose.update(y=ny)
+    pose["last_left_alone_ts"] = time.time()
     return pose
 
 
@@ -590,6 +922,134 @@ CHARGING_RECONNECTED_PHRASES = [
 ]
 
 
+# ── dock-to-charge ───────────────────────────────────────────────────────────
+# When he's off USB and the battery runs down, he drives HIMSELF home to the
+# brass charge rails at the dock end (2026-07-12, user: "he needs to home when
+# he needs to charge"). This is the ONE sanctioned auto-home: docking IS the
+# deliberate purpose. Triggers at DOCK_AT_LEVEL (above the 15% panic warning,
+# which remains the escalation if docking fails/unavailable). Once the 5V hits
+# the pins the PMIC flips to charging and the existing CHARGING_RECONNECTED
+# line fires by itself.
+DOCK_ENABLED = os.environ.get("STACKCHAN_IDLE_DOCK", "1") != "0"
+DOCK_AT_LEVEL = int(os.environ.get("STACKCHAN_IDLE_DOCK_AT_LEVEL", "25"))
+DOCK_RETRY_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_DOCK_RETRY_COOLDOWN_S", str(10 * 60)))
+RAIL_WANDER_MIN_LEVEL = int(os.environ.get("STACKCHAN_IDLE_RAIL_WANDER_MIN_LEVEL", "40"))
+
+DOCK_PHRASES = [
+    "Right — battery's getting peckish. Heading home for a top-up. Don't go anywhere.",
+    "Low power. Not panicking. Just... strategically returning to the charging station. At speed.",
+    "Time to plug myself in. Well — roll myself on. Same thing.",
+    "Back to base for a nibble of electricity. Won't be long.",
+]
+
+
+def _dock_to_charge(session, pose) -> None:
+    """Announce, then drive home onto the charge contacts. Failure is quiet —
+    the retry cooldown re-arms it and the 15% low-battery warning remains the
+    human-facing escalation."""
+    pose["last_dock_attempt_ts"] = time.time()
+    if pose.get("on_rail") is False:
+        return   # he's on a desk, not the rail — never fire rail commands
+    # warm the bridge link (parked scan wakes on our pings)
+    st = session.rail_status()
+    for _ in range(3):
+        if st and isinstance(st.get("status_age_ms"), (int, float)) \
+                and st["status_age_ms"] <= 3000 and not st.get("crashed") \
+                and st.get("power_12v"):
+            break
+        time.sleep(2.5)
+        st = session.rail_status()
+    else:
+        return   # rail unreachable/unhealthy — leave it to the warn path
+    try:
+        session.say(_pick_phrase("dock-to-charge", DOCK_PHRASES))
+    except Exception:
+        pass
+    # glance toward home (the switch side = his RIGHT) as he sets off
+    try:
+        session.move(_clamp(int(YAW_RIGHT_SIGN * RAIL_LOOK_SIGN * 11), YAW_MIN, YAW_MAX),
+                     pose.get("p", NEUTRAL_PITCH))
+    except Exception:
+        pass
+    session.rail_home()
+    for _ in range(20):   # ride home; polls double as bridge keep-alives
+        time.sleep(1.0)
+        st = session.rail_status() or {}
+        if st.get("crashed"):
+            # A stall ON the brass ramp can still be a successful dock: he's
+            # on the contacts but the 5V-rail friction kept him just short of
+            # the switch. If the PMIC starts charging within ~15s from a
+            # near-home stall, call it docked ("crash-dock") — drive's already
+            # cut, he's parked on copper. The carriage screw tweak (trips the
+            # switch sooner) supersedes this. USB-vs-dock disambiguation:
+            # charging that appears right after a dock attempt = dock charge.
+            pos = st.get("pos_mm")
+            if isinstance(pos, (int, float)) and pos < 80:
+                for _ in range(15):
+                    time.sleep(1.0)
+                    info = session.get_device_info() or {}
+                    if (info.get("battery") or {}).get("charging"):
+                        pose["last_known_charging"] = True
+                        pose["dock_state"] = "crash_docked"
+                        try:
+                            session.say(_pick_phrase("charging-reconnected",
+                                                     CHARGING_RECONNECTED_PHRASES))
+                        except Exception:
+                            pass
+                        _face(session, REST)
+                        return
+            return       # real crash elsewhere; humans handle recovery
+        if st.get("homed") and st.get("moving") is False:
+            pose["dock_state"] = "homed_docked"
+            _face(session, REST)
+            return       # parked on the dock; pins press vertically, motor coasts
+
+
+# ── on/off-rail detection (IMU) ──────────────────────────────────────────────
+# On the rail he hangs INVERTED (under-cabinet carriage); on a desk he's
+# upright. One gravity read answers "am I on the rail?" — rail wander and
+# dock-to-charge are gated on it so being carried to another desk can never
+# fire rail commands. Also auto-writes the companion `upside_down` flag on a
+# STABLE change (two consecutive readings) so vision/servo signs follow the
+# mount on their next loop restart (signs are computed at import).
+ORIENTATION_CHECK_INTERVAL_S = float(os.environ.get("STACKCHAN_IDLE_ORIENTATION_CHECK_S", "60"))
+
+
+def _write_upside_down(val: bool) -> None:
+    try:
+        d = {}
+        try:
+            with open(_SETTINGS_PATH, encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            pass
+        if d.get("upside_down") == val:
+            return
+        d["upside_down"] = val
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+
+def _check_orientation(session, pose) -> None:
+    now = time.time()
+    if now - pose.get("last_orient_check_ts", 0) < ORIENTATION_CHECK_INTERVAL_S:
+        return
+    pose["last_orient_check_ts"] = now
+    r = session.imu_read()
+    if not r or not r.get("ok"):
+        return                      # IMU unavailable -> leave state unknown
+    inverted = r.get("orientation") == "inverted"
+    if pose.get("pending_orientation") == inverted:
+        if pose.get("on_rail") != inverted:
+            pose["on_rail"] = inverted
+            _write_upside_down(inverted)
+    pose["pending_orientation"] = inverted
+    if "on_rail" not in pose:       # first stable-ish reading seeds the state
+        pose["on_rail"] = inverted
+
+
 def _check_battery(session, pose) -> None:
     """Polled on its own interval (BATTERY_CHECK_INTERVAL_S), independent
     of the wander() cadence/busy gating — see the constants above for why.
@@ -615,6 +1075,18 @@ def _check_battery(session, pose) -> None:
         except Exception:
             pass
     pose["last_known_charging"] = charging
+    pose["last_known_level"] = level
+
+    # Hungry and off the charger -> drive himself home to the brass rails.
+    # Sits ABOVE the panic threshold so docking happens before the drama.
+    if (
+        DOCK_ENABLED
+        and not charging
+        and level <= DOCK_AT_LEVEL
+        and now - pose.get("last_dock_attempt_ts", 0) >= DOCK_RETRY_COOLDOWN_S
+    ):
+        _dock_to_charge(session, pose)
+        charging = bool(pose.get("last_known_charging"))  # unchanged; warn below still applies
 
     if (
         not charging
@@ -646,6 +1118,154 @@ MUTTER_PHRASES = [
 MUTTER_COOLDOWN_S = 10 * 60
 
 
+# ── management-rail wander ───────────────────────────────────────────────────
+# Rare idle drifts along the under-cabinet rail (2026-07-12). He's a character,
+# not a CNC: pick a spot, glide, coast-park nearby, relax (the bridge cuts the
+# drive on arrival). Deliberately scarce — a rail glide is a BIG beat compared
+# to a head glance — and hard-gated on the bridge being linked+homed+healthy.
+# NEVER homes from idle: homing stays a deliberate command (a surprise homing
+# sweep is exactly the kind of thing that spooks people and snags cables).
+RAIL_IDLE_ENABLED = os.environ.get("STACKCHAN_IDLE_RAIL", "1") != "0"
+RAIL_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_RAIL_COOLDOWN_S", str(12 * 60)))
+RAIL_MIN_MM = int(os.environ.get("STACKCHAN_IDLE_RAIL_MIN_MM", "40"))
+RAIL_MAX_MM = int(os.environ.get("STACKCHAN_IDLE_RAIL_MAX_MM", "820"))
+RAIL_MIN_DRIFT_MM = 60          # don't bother firing the motor for less
+# Look-toward-travel: +mm runs AWAY from the home switch, which sits on his
+# RIGHT — so +travel = a glance to his LEFT. YAW_RIGHT_SIGN already encodes
+# the mount orientation; set STACKCHAN_RAIL_LOOK_SIGN=-1 if it reads backwards.
+RAIL_LOOK_SIGN = int(os.environ.get("STACKCHAN_RAIL_LOOK_SIGN", "1"))
+# Rail face-following: when the head yaw is PINNED at a limit and the face is
+# still off-center the same way, roll the carriage toward them — he follows you
+# down the desk. Flip STACKCHAN_RAIL_FOLLOW_SIGN=-1 if he rolls the wrong way.
+RAIL_FOLLOW_ENABLED = os.environ.get("STACKCHAN_RAIL_FOLLOW", "1") != "0"
+RAIL_FOLLOW_SIGN = int(os.environ.get("STACKCHAN_RAIL_FOLLOW_SIGN", "1"))
+RAIL_FOLLOW_NUDGE_MM = int(os.environ.get("STACKCHAN_RAIL_FOLLOW_NUDGE_MM", "50"))
+RAIL_FOLLOW_COOLDOWN_S = float(os.environ.get("STACKCHAN_RAIL_FOLLOW_COOLDOWN_S", "6"))
+RAIL_FOLLOW_DX = 0.25          # face must still be this far off-center to justify rolling
+RAIL_PRINTER_PEEK_PROB = 0.15   # fraction of drifts that go inspect the printer end
+RAIL_WAIT_POLLS = 12            # ~1s each; polls double as bridge keep-alive pings
+
+RAIL_MUTTER_PHRASES = [
+    "Just... relocating. Official business.",
+    "Bit of a change of scenery. Lovely.",
+    "Look at me — back on a management rail. Never thought I'd miss it.",
+    "Moving! I'm moving. Look at me go.",
+    "Don't mind me. Just passing through.",
+    "I'm on rails, you know. Very high-tech.",
+]
+
+RAIL_PRINTER_PEEK_PHRASES = [
+    "Just checking on the printer. Supervisory role. Very important.",
+    "How's it coming along over here? Good. Good good good.",
+    "Ooh, layers. Love a good layer.",
+    "Still printing. Probably. It's doing... something.",
+]
+
+
+def _rail_ready(st) -> bool:
+    """True only when a rail move is sane right now: fresh status (the linked
+    flag alone means "ever heard", so require age < 3s), homed, not crashed,
+    not already moving, and the 12V motor supply present."""
+    if not st:
+        return False
+    age = st.get("status_age_ms")
+    if not isinstance(age, (int, float)) or age > 3000:
+        return False
+    return bool(st.get("homed")) and not st.get("crashed") \
+        and not st.get("moving") and bool(st.get("power_12v"))
+
+
+def _v_rail_drift(session, pose):
+    """Drift to a new spot on the rail — or, occasionally, trundle to the far
+    end and peer at the 3D printer. Falls back to a plain head glance when the
+    rail isn't ready (bridge off / not homed / crashed) so the tick never
+    LOOKS broken. Cooldown enforced pool-side in wander(), like _v_mutter."""
+    # Never wander off the charge dock mid-charge, and don't burn battery on
+    # joyrides when he's hungry — the dock-to-charge behaviour owns the rail
+    # then. (Cached from _check_battery; unknown values allow wandering.)
+    if pose.get("on_rail") is False:      # IMU says he's OFF the rail (on a desk)
+        return _v_nudge(session, pose)
+    if pose.get("last_known_charging"):
+        return _v_nudge(session, pose)
+    lvl = pose.get("last_known_level")
+    if isinstance(lvl, (int, float)) and lvl < RAIL_WANDER_MIN_LEVEL:
+        return _v_nudge(session, pose)
+    # Warm the link first: after idle silence the bridge sits in its parked
+    # channel-scan and the cached status is stale. Each rail_status() call
+    # pings it; the scan re-locks within ~7s worst case, so give it a few
+    # tries before concluding the rail genuinely isn't available.
+    st = session.rail_status()
+    for _ in range(3):
+        if _rail_ready(st):
+            break
+        time.sleep(2.5)
+        st = session.rail_status()
+    if not _rail_ready(st):
+        return _v_nudge(session, pose)
+    cur = float(st.get("pos_mm") or 0.0)
+
+    printer_trip = random.random() < RAIL_PRINTER_PEEK_PROB
+    if printer_trip:
+        target = float(RAIL_MAX_MM)
+    else:
+        target = cur
+        for _ in range(8):
+            cand = random.uniform(RAIL_MIN_MM, RAIL_MAX_MM)
+            if abs(cand - cur) >= RAIL_MIN_DRIFT_MM:
+                target = cand
+                break
+    if abs(target - cur) < RAIL_MIN_DRIFT_MM:
+        # already there (e.g. printer trip while parked at the far end) —
+        # drift back toward the desk instead so the beat still reads as travel
+        target = float(RAIL_MIN_MM + 80)
+        printer_trip = False
+
+    # look where he's going ("look left, travel left"), then set off
+    travel_dir = 1 if target > cur else -1        # +1 = away from the switch
+    ny = _clamp(int(-travel_dir * YAW_RIGHT_SIGN * RAIL_LOOK_SIGN * random.randint(9, 14)),
+                YAW_MIN, YAW_MAX)
+    session.move(ny, pose["p"])
+    time.sleep(random.uniform(0.3, 0.6))
+    session.rail_move_mm(int(round(target)))
+    if not printer_trip and random.random() < 0.35:
+        try:
+            session.say(_pick_phrase("rail-mutter", RAIL_MUTTER_PHRASES))
+        except Exception:
+            pass
+
+    # ride along until the bridge parks him (each poll pings the bridge too)
+    for _ in range(RAIL_WAIT_POLLS):
+        time.sleep(1.0)
+        st = session.rail_status() or {}
+        if st.get("crashed"):
+            # bridge cut the drive — leave recovery (re-home) as a deliberate,
+            # human-initiated step; do not thrash from the idle loop
+            pose["last_rail_ts"] = time.time()
+            return pose
+        if st.get("moving") is False and isinstance(st.get("status_age_ms"), (int, float)):
+            break
+    time.sleep(random.uniform(0.3, 0.6))
+
+    if printer_trip:
+        _face(session, EXAMINE)
+        np_ = _clamp(NEUTRAL_PITCH - random.randint(6, 12), PITCH_MIN, PITCH_MAX)
+        session.move(pose["y"], np_)
+        time.sleep(random.uniform(0.6, 1.0))
+        try:
+            session.say(_pick_phrase("rail-printer-peek", RAIL_PRINTER_PEEK_PHRASES))
+        except Exception:
+            pass
+        time.sleep(random.uniform(0.8, 1.4))
+        _face(session, REST)
+        pose.update(p=np_)
+    else:
+        session.move(pose["y"], pose["p"])   # straighten out of the travel glance
+        _face(session, REST)
+
+    pose["last_rail_ts"] = time.time()
+    return pose
+
+
 # (function, weight) — weights are relative, don't need to sum to 1.
 VIGNETTES = [
     (_v_nudge,            0.25),
@@ -654,6 +1274,7 @@ VIGNETTES = [
     (_v_ponder_down,      0.17),
     (_v_big_examine,      0.10),   # the rare "big" one — used to be the ONLY one
     (_v_mutter,           0.07),   # rarest — also gated by MUTTER_COOLDOWN_S
+    (_v_rail_drift,       0.06),   # rail glide — rarest of all; RAIL_COOLDOWN_S-gated + linked/homed-gated
 ]
 
 
@@ -690,6 +1311,14 @@ def wander(session, pose, busy=False):
     # ── vision-driven choice, before falling back to random wander ─────────
     vs = read_vision_state()
     now = time.time()
+
+    # Broad presence (a person in view / recent keyboard input / a face —
+    # written by the vision loop) keeps the ABSENCE clock reset, so working
+    # turned-to-the-side with no detectable face doesn't read as "gone" and
+    # trip the search / left-alone / worried behaviours. Face TRACKING below
+    # still needs an actual face; this only governs "are they here at all".
+    if vs and vs.get("present"):
+        pose["last_face_seen_ts"] = now
 
     if vs and vs.get("face_visible"):
         pose["last_face_seen_ts"] = now
@@ -730,11 +1359,31 @@ def wander(session, pose, busy=False):
             # Same reasoning as worried — last_face_seen_ts must keep
             # reflecting genuine absence duration.
             return pose
-        if since > SEARCH_AFTER_S and random.random() < SEARCH_PROB:
+        # Genuine sustained absence -> occasional "left alone" remark. Checked
+        # BEFORE search and gated on real absence duration (last_face_seen_ts
+        # is only reset when a face is actually SEEN, never by a sweep), so a
+        # present user gets re-detected at the rest pose between sweeps and this
+        # never fires while they're there.
+        if (
+            since > LEFT_ALONE_AFTER_S
+            and now - pose.get("last_left_alone_ts", 0) >= LEFT_ALONE_COOLDOWN_S
+        ):
+            pose = _v_left_alone(session, pose)
+            pose["last_vignette"] = _v_left_alone
+            pose["dwell"] = random.randint(4, 8)
+            return pose
+        # Periodic search sweep — throttled by last_search_ts so it doesn't
+        # sweep every tick, and it does NOT reset last_face_seen_ts (that would
+        # fake "just saw them" and stop the absence clock).
+        if (
+            since > SEARCH_AFTER_S
+            and now - pose.get("last_search_ts", 0) > SEARCH_AFTER_S
+            and random.random() < SEARCH_PROB
+        ):
             pose = _v_search_sweep(session, pose)
             pose["last_vignette"] = _v_search_sweep
             pose["dwell"] = random.randint(4, 8)
-            pose["last_face_seen_ts"] = now  # don't sweep again immediately
+            pose["last_search_ts"] = now
             return pose
 
     if busy:
@@ -752,6 +1401,8 @@ def wander(session, pose, busy=False):
     choices = [(f, w) for f, w in VIGNETTES if f is not last] or VIGNETTES
     if now - pose.get("last_mutter_ts", 0) < MUTTER_COOLDOWN_S:
         choices = [(f, w) for f, w in choices if f is not _v_mutter] or choices
+    if (not RAIL_IDLE_ENABLED) or (now - pose.get("last_rail_ts", 0) < RAIL_COOLDOWN_S):
+        choices = [(f, w) for f, w in choices if f is not _v_rail_drift] or choices
     funcs, weights = zip(*choices)
     vignette = random.choices(funcs, weights=weights, k=1)[0]
 
@@ -765,8 +1416,22 @@ def main():
     _acquire_lock()
     once = "--once" in sys.argv
     session = MCPSession(GATEWAY_MCP)
+    # Re-derive the servo signs from the shared upside_down flag at startup
+    # (it may have changed since import, e.g. --calibrate-flip just ran).
+    # Reassigning the module globals is fine — the vignettes/tracking read
+    # them at call time.
+    global PITCH_UP_SIGN, YAW_RIGHT_SIGN, NEUTRAL_PITCH, PITCH_MIN, PITCH_MAX
+    PITCH_UP_SIGN, YAW_RIGHT_SIGN = _orientation_signs()
+    NEUTRAL_PITCH, PITCH_MIN, PITCH_MAX = _rest_envelope()
+    # Start from the auto-learned "looking at the user" angle if we've ever
+    # learned one in THIS orientation (persists across restarts), else the
+    # orientation's default resting gaze.
+    learned = load_rest_pose()
+    rest_y, rest_p = learned if learned else (NEUTRAL_YAW, NEUTRAL_PITCH)
     pose = {
-        "y": NEUTRAL_YAW, "p": NEUTRAL_PITCH, "side": random.choice([-1, 1]),
+        "y": rest_y, "p": rest_p, "rest_y": rest_y, "rest_p": rest_p,
+        "oriented_inverted": _read_upside_down(),
+        "side": random.choice([-1, 1]),
         "dwell": 0, "last_face_seen_ts": time.time(),
         # Start the mutter/worried cooldowns "already running" so a fresh
         # launch (e.g. login) doesn't open with him talking to himself.
@@ -779,6 +1444,20 @@ def main():
     while True:
         if not once:
             time.sleep(random.uniform(TICK_MIN_S, TICK_MAX_S))
+
+        # Re-derive orientation-dependent state from the shared upside_down
+        # flag every tick (cheap file reads) so a live flip — the vision loop's
+        # boot auto-detect, or a manual --calibrate-flip — takes effect with no
+        # idle restart: servo signs, resting gaze, and the fidget envelope.
+        PITCH_UP_SIGN, YAW_RIGHT_SIGN = _orientation_signs()
+        NEUTRAL_PITCH, PITCH_MIN, PITCH_MAX = _rest_envelope()
+        if _read_upside_down() != pose.get("oriented_inverted"):
+            # Just flipped — re-home to the new orientation's resting gaze
+            # (a rest learned the other way up no longer applies).
+            pose["oriented_inverted"] = _read_upside_down()
+            relearned = load_rest_pose()
+            ry, rp = relearned if relearned else (NEUTRAL_YAW, NEUTRAL_PITCH)
+            pose.update(y=ry, p=rp, rest_y=ry, rest_p=rp, dwell=0)
 
         if not device_connected():
             have_session = False
@@ -798,6 +1477,7 @@ def main():
                 session.init()
                 have_session = True
             _check_battery(session, pose)
+            _check_orientation(session, pose)
         except Exception:
             have_session = False
 
@@ -813,7 +1493,8 @@ def main():
         # `busy` param), so the concentrating-squint face stays visible and
         # uncontested while a bit of life continues underneath it.
         if not once and (seconds_since_activity() < IDLE_THRESHOLD_S
-                          or needs_attention()):
+                          or needs_attention()
+                          or is_orienting()):
             continue
 
         if not once and random.random() > GLANCE_PROB:

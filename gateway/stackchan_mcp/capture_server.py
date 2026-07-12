@@ -430,15 +430,19 @@ async def handle_pcm(request: web.Request) -> web.Response:
 async def handle_react(request: web.Request) -> web.Response:
     """/react/<behavior>[?direction=left&type=desk] — fire a Wheatley reaction.
 
-    Behaviors: panic, hacker, overtrack, tantrum, recognize, lights_out
+    Behaviors: panic, hacker, overtrack, tantrum, recognize, lights_out,
+    encourage, object_comment, messy
     Query params forwarded to the behavior as kwargs:
-      direction  left|right|up|down   (overtrack)
+      direction  left|right|up|down   (overtrack, object_comment, messy)
       type       desk|pickup           (tantrum)
       person     known|unknown         (recognize)
-      name       <enrolled name>       (recognize, optional — greet by name)
+      name       <enrolled name>       (recognize/encourage, optional —
+                                         address them by name)
       learn      1                     (recognize, optional — also propose
                                          learning this view; see
                                          stackchan-vision-loop.py's arbiter)
+      label      <coco class name>     (object_comment — the detected thing;
+                                         messy — optional absurd detection)
 
     Returns 200 {ok, behavior} if accepted, 409 if busy, 503 if no device.
     """
@@ -447,7 +451,7 @@ async def handle_react(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "gateway not available"}, status=503)
 
     behavior = request.match_info.get("behavior", "")
-    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize", "lights_out"}:
+    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize", "lights_out", "encourage", "object_comment", "messy", "gesture"}:
         return web.json_response({"ok": False, "error": f"unknown behavior: {behavior}"}, status=400)
 
     kwargs: dict = {}
@@ -463,6 +467,8 @@ async def handle_react(request: web.Request) -> web.Response:
         kwargs["person_name"] = request.rel_url.query["name"]
     if "learn" in request.rel_url.query:
         kwargs["propose_learn"] = request.rel_url.query["learn"] == "1"
+    if "label" in request.rel_url.query:
+        kwargs["label"] = request.rel_url.query["label"]
 
     accepted = await gateway.sensor_reactor.trigger(behavior, **kwargs)
     if not accepted:

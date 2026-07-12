@@ -734,6 +734,38 @@ async def _dispatch_mcp_tool(
             "self.i2c.write_read",
             arguments,
         ),
+        "self.rail.home": (
+            "self.rail.home",
+            {},
+        ),
+        "self.rail.move_mm": (
+            "self.rail.move_mm",
+            arguments,
+        ),
+        "self.rail.nudge_mm": (
+            "self.rail.nudge_mm",
+            arguments,
+        ),
+        "self.rail.stop": (
+            "self.rail.stop",
+            {},
+        ),
+        "self.rail.status": (
+            "self.rail.status",
+            {},
+        ),
+        "self.imu.read": (
+            "self.imu.read",
+            {},
+        ),
+        "self.light.read": (
+            "self.light.read",
+            {},
+        ),
+        "self.wifi.set_power_save": (
+            "self.wifi.set_power_save",
+            arguments,
+        ),
     }
 
     if name not in tool_map:
@@ -1849,6 +1881,117 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                         },
                     },
                     "required": ["addr", "write_bytes", "n_bytes"],
+                },
+            ),
+            Tool(
+                name="self.rail.home",
+                description=(
+                    "Home the management rail (bridge two-stage homing onto "
+                    "the limit switch, zeroes position). Required once per "
+                    "bridge power-up before absolute moves."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.rail.move_mm",
+                description=(
+                    "Move the carriage to an ABSOLUTE position from home in "
+                    "mm (0=home/dock end..896=far soft limit). Requires the "
+                    "rail homed first."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mm": {
+                            "type": "integer",
+                            "description": (
+                                "Absolute position from home in mm "
+                                "(0=home/dock end..896=far soft limit)."
+                            ),
+                            "minimum": 0,
+                            "maximum": 896,
+                        },
+                    },
+                    "required": ["mm"],
+                },
+            ),
+            Tool(
+                name="self.rail.nudge_mm",
+                description=(
+                    "Move the carriage a RELATIVE distance in mm (signed; "
+                    "+=away from home)."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mm": {
+                            "type": "integer",
+                            "description": (
+                                "Relative distance in mm (signed; "
+                                "+=away from home)."
+                            ),
+                            "minimum": -100,
+                            "maximum": 100,
+                        },
+                    },
+                    "required": ["mm"],
+                },
+            ),
+            Tool(
+                name="self.rail.stop",
+                description=(
+                    "Immediately stop the carriage and hold (also aborts "
+                    "homing)."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.rail.status",
+                description=(
+                    "Read latest rail status from the bridge: linked, "
+                    "status_age_ms, homed, crashed, endstop, moving, "
+                    "power_12v, pos_mm, rpm, vin, ack_seq/last_seq, "
+                    "wifi_channel."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.imu.read",
+                description=(
+                    "Read the on-board BMI270 accelerometer: {ok, "
+                    "accel:{x,y,z}, orientation:upright|inverted}."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.light.read",
+                description=(
+                    "Read the LTR-553ALS ambient light sensor: {ok, ch0, "
+                    "ch1} raw counts."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.wifi.set_power_save",
+                description=(
+                    "Set the device's WiFi power-save mode at runtime. "
+                    "'none' disables modem sleep (radio always on — required "
+                    "for reliable ESP-NOW RX, e.g. rail status/link, and "
+                    "low-jitter command streams; higher idle power). "
+                    "'min_modem' restores the default light modem sleep. "
+                    "'max_modem' = deepest sleep. Returns {ok, previous, "
+                    "current}."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "mode": {
+                            "type": "string",
+                            "enum": ["none", "min_modem", "max_modem"],
+                            "description": "WiFi power-save mode",
+                        }
+                    },
+                    "required": ["mode"],
                 },
             ),
             Tool(

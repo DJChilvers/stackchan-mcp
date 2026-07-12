@@ -479,12 +479,25 @@ class ESP32Manager:
                 "Device-driven listen capture enabled (audio hook %s)",
                 audio_hook_url,
             )
-        logger.info("ESP32 WebSocket server starting on ws://%s:%d", host, port)
+        # Keepalive: the library default (ping every 20s, drop if no pong within
+        # 20s) false-drops a busy ESP32 — it can't answer a ping mid-photo, mid-TTS,
+        # or while the touch-sensor charging-noise wobble hogs its main loop, so a
+        # perfectly-alive device gets culled. Give it generous slack (still detects
+        # a truly-dead peer and closes so the firmware reconnects). Tunable; set
+        # STACKCHAN_WS_PING_INTERVAL=0 to disable server-initiated pings entirely.
+        ping_interval = float(os.getenv("STACKCHAN_WS_PING_INTERVAL", "20")) or None
+        ping_timeout = float(os.getenv("STACKCHAN_WS_PING_TIMEOUT", "75")) or None
+        logger.info(
+            "ESP32 WebSocket server starting on ws://%s:%d (ping_interval=%s ping_timeout=%s)",
+            host, port, ping_interval, ping_timeout,
+        )
         self._server = await websockets.serve(
             self._handler,
             host,
             port,
             process_request=self._check_auth,
+            ping_interval=ping_interval,
+            ping_timeout=ping_timeout,
         )
 
     async def stop(self) -> None:
