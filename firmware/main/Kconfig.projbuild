@@ -1137,6 +1137,32 @@ config STACKCHAN_AUTO_TORQUE_RELEASE_MS
         Runtime-overridable via the set_auto_torque_release MCP tool
         (session override, not persisted across reboot).
 
+config RAIL_ENABLED
+    bool "Management rail: ESP-NOW sender + self.rail.* MCP tools"
+    default y
+    help
+        Compiles in the rail_driver ESP-NOW sender (to the bench bridge MCU
+        that drives the Roller485 on the management rail) and registers the
+        self.rail.home / move_mm / nudge_mm / stop / status MCP tools. All
+        motion safety (homing, soft limits, crash cutout, dead-man jog) lives
+        on the bridge; this only sends commands. Disable to compile the rail
+        feature out entirely.
+
+config IMU_ENABLED
+    bool "On-board BMI270 IMU (self.imu.read)"
+    default y
+    help
+        Expose the CoreS3 BMI270 accelerometer as self.imu.read for
+        orientation auto-detect. Init is gated on a BMI270 chip-id probe, so
+        it skips cleanly if 0x68 is not actually a BMI270.
+
+config LIGHT_ENABLED
+    bool "On-board LTR-553ALS light sensor (self.light.read)"
+    default y
+    help
+        Expose the LTR-553ALS ambient-light sensor as self.light.read. Init is
+        gated on the LTR-553 part-id, so it skips cleanly if not present.
+
 endif # BOARD_TYPE_STACKCHAN
 
 endmenu

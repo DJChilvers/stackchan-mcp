@@ -3,6 +3,58 @@
 Not actionable via the gateway/MCP at runtime — batch these into the next
 time the firmware actually gets rebuilt and flashed.
 
+## FLASH-DAY CHECKLIST (added 2026-07-09 — read before plugging anything in)
+
+**Ports — do not mix these up:** COM5 = **Wheatley (CoreS3)**, the board being
+flashed today. COM7 = rail bridge (classic M5Stack Core) — do NOT reflash.
+COM8 = Core Ink test-sender. Confirm with Device Manager before `idf.py flash`.
+
+**Before flashing:**
+- Prefer a plain `idf.py flash` over `erase-flash`. NVS holds the Wi-Fi
+  credentials AND the `wifi/sleep_mode` checkbox (user set it OFF 2026-07-06).
+  A full erase reverts sleep_mode to its compiled default (ON, unless this
+  build changes the default per the "No sleep mode" section below) and forces
+  Wi-Fi re-provisioning via the 192.168.4.1 AP page.
+- **Screen language — DECIDED 2026-07-09: flip ja-JP → en-US in this build.**
+  It's compile-time (`main/CMakeLists.txt` → `CONFIG_LANGUAGE_*` → `LANG_DIR`),
+  so a rebuild-anyway makes the switch free — the "not worth a dedicated
+  reflash" judgement from 2026-06-30 no longer applies. en-US is the only
+  English locale; visually ≈ en-GB except the boot word "Initializing...".
+  Set it BEFORE building — it's baked into the app binary, not NVS.
+- ESP-NOW sender (section below): match Wheatley's associated **WiFi channel**
+  or pin the AP; the bench bridge is currently pinned to channel 1.
+
+**After flashing — verify in this order:**
+1. Device reconnects to the gateway (`curl http://127.0.0.1:8767/status` →
+   `esp32_connected: true`). On reconnect the gateway auto-repushes the matrix
+   avatar and auto-disables torque release — check the daemon log for both.
+   (First matrix push after a fresh boot always fits in PSRAM — no OOM risk.)
+2. AP-config page: **sleep-mode checkbox is OFF** (or the new default is OFF).
+3. `set_touch_sensor_enabled` no longer returns `Unknown tool` → the charging
+   phantom-stroke workaround can now be wired gateway-side (see touch section).
+4. `listen` tool responds instead of hanging 25s → re-add the voice-bridge
+   follow-up-listening loop (reverted version is in git history; shorten the
+   timeout per the section below).
+5. If the ESP-NOW sender is in this build: command a HOME / NUDGE from
+   Wheatley's MCP action and watch the bridge (MAC 80:7D:3A:DB:DC:08) move
+   the motor + stream status back.
+6. If the wake word made this build: "Hey Wheatley" from a metre away.
+
+## Archive this build for Wheatley mk2 (added 2026-07-09)
+
+The user intends to build a **second Wheatley (mk2)** once mk1 is finished, so
+one unit can move into the house. Make today's build reproducible so mk2 is a
+flash-only job, not a from-scratch rebuild:
+- Save alongside the repo (or a tagged commit): the source **commit hash**,
+  the generated **`sdkconfig`**, the **ESP-IDF version**, and the built
+  artifacts (`bootloader.bin`, `partition-table.bin`, app `.bin` — or one
+  `esptool.py merge_bin` image) with the flash offsets.
+- Note the per-device bits mk2 will need decided later: its own MAC (matters
+  if it ever gets ESP-NOW peers of its own), mDNS/device naming, and whether
+  the gateway's `ESP32Manager` handles **two concurrent devices** or needs
+  work (single-device assumptions likely — check before mk2 arrives). House
+  unit will be on the same Wi-Fi/gateway.
+
 ## Touch sensor false-triggers on charging noise
 
 The capacitive head-touch sensor misreads electrical noise from the
@@ -91,23 +143,36 @@ one used for testing.
 
 Batch with the other two items above — same rebuild+reflash window.
 
-## Management-rail motor drive (companion controller)
+## Management-rail motor drive — ESP-NOW sender to the bridge (UPDATED 2026-07-06)
 
-The Wheatley companion app (Android, `companion-android/` — talks to the gateway over the
-LAN) has a Control screen with **left/right drive controls for the management-rail motor(s)**
-Dominic is adding. There is **no firmware motor tool today** — the only actuators exposed are
-the servo head (`self.robot.set_head_angles`), the LEDs, and the camera. The motor L/R buttons
-are wired in the app but disabled ("firmware pending"), and the gateway's companion API already
-exposes a `POST /api/motor {direction, speed}` endpoint stubbed to **501 Not Implemented** until
-this lands.
+**Architecture changed — this supersedes the old "firmware motor tool + /api/motor + app
+buttons" plan.** The rail motor is NOT driven by Wheatley. It's driven by a **separate bridge
+MCU** (currently a classic M5Stack Core) that owns the I2C wire to the Roller485 Lite. Wheatley's
+firmware job is to be the **ESP-NOW SENDER** to that bridge. Spec:
+`C:\Users\domin\Documents\StackChan\wheatley-rail-build-spec.md` §4. Chain:
+`phone/MCP → WiFi → Wheatley (CoreS3) → ESP-NOW → bridge → I2C → Roller485`.
 
-Next flash: add a motor-drive tool (e.g. `self.rail.drive(direction, speed)` /
-`self.motor.set(...)`) wired to whatever motor driver / Grove port the rail hardware ends up
-using (PWM / H-bridge). Then map it in `stdio_server.py`'s `tool_map` like the other device
-tools, and flip the companion `/api/motor` handler + the app's motor buttons from stub to live.
+The bridge firmware is built + bench-validated (motor control, trapezoidal smoothing, two-stage
+repeatable homing on an M5 Limit switch, current+stall crash detection, and an **ESP-NOW receiver**):
+`C:\Users\domin\Documents\StackChan\core2-rail-controller\`. Bridge MAC = **80:7D:3A:DB:DC:08**.
 
-- Confirm the motor driver wiring / port once the rail hardware is chosen.
-- No workaround (feature doesn't exist yet); nice-to-have, not a bug.
+**What to add to Wheatley firmware in the next reflash — an ESP-NOW sender:**
+- Wire protocol: `RailCmdPacket` / `RailStatusPacket` in
+  `C:\Users\domin\Documents\StackChan\core2-rail-controller\rail_espnow.h` (copy verbatim).
+  Commands: HOME / MOVE_MM (abs, mm×10) / NUDGE_MM (rel) / STOP / JOG / PING. Status back:
+  pos_mm, rpm, vin, flags (homed / crashed / endstop / moving / power).
+- **Channel gotcha (spec §4):** ESP-NOW + WiFi share the radio and MUST be on the same channel.
+  Read Wheatley's associated WiFi channel at startup and set ESP-NOW to it (or pin the AP channel).
+  Mismatch = the link silently does nothing. (Bench test currently pins both to channel 1.)
+- Peer = the bridge MAC above. Send commands; receive + surface status/faults (crash, not-homed).
+- Expose as **MCP actions** ("move to X mm", "go to dock", "move to left/right end", "home") so
+  the rail is commandable from MCP/phone — this is the spec's Wheatley task list §8.
+- A standalone **test-sender** already validates the bridge end-to-end:
+  `C:\Users\domin\Documents\StackChan\rail-sender-test\` — port its logic into the firmware.
+
+The old `POST /api/motor` 501 stub + companion app L/R buttons are DROPPED as the drive path
+(the bridge owns drive). If still wanted, the app could relay to Wheatley's ESP-NOW MCP action
+instead — optional, not required.
 
 ## Live camera stream (companion "live" view)
 
@@ -134,3 +199,97 @@ value extras (both documented in memory):
 - **PSRAM free-before-fetch for matrix avatar sets** (`avatar_set_fetcher.cc`) — free the old
   buffer before allocating the incoming one, so a matrix avatar set can be replaced without a
   power-cycle (currently OOMs because both 3.45 MB buffers must coexist).
+- **Default auto torque-release OFF** (Issue #152 feature). The gateway disables it on every
+  reconnect (`_disable_auto_torque_release()` in `esp32_client.py`), which works but is
+  load-bearing — a device power-cycle with the gateway down leaves servos silently limp.
+  Flipping the firmware default to OFF makes the gateway call a belt-and-braces no-op.
+
+## No sleep mode — keep it off across the reflash (added 2026-07-06, source-verified)
+
+Sleep mode was the cause of Wheatley silently dropping off the gateway
+after ~20 min without interaction and staying frozen/blind until a screen
+tap. The user turned it OFF via the AP-config checkbox on 2026-07-06 (he's
+on USB power, so there's no battery reason to sleep). Source-level facts
+(explored 2026-07-06):
+
+- **Setting:** NVS key `sleep_mode` (u8) in the `wifi` namespace. Written
+  only by the AP-config page (`components/78__esp-wifi-connect/
+  wifi_configuration_ap.cc` ~L814-819, checkbox in
+  `assets/wifi_configuration.html` ~L338). **Default is TRUE/enabled**
+  (~L244). There is NO MCP tool or WebSocket message to change it at
+  runtime — the gateway cannot manage it.
+- **Mechanism:** StackChan uses `PowerSaveTimer(-1, 60, 300)`
+  (`main/boards/stackchan/stackchan.cc` ~L2117-2131,
+  `main/boards/common/power_save_timer.cc`): after **60s** idle it enters
+  power-save (wake-word off, codec input off, CPU throttled with
+  auto-light-sleep, display dimmed to 10), after **300s** it requests
+  shutdown. Both durations are hardcoded constructor params, not
+  NVS-configurable. The timer only starts at all if `sleep_mode` is true
+  (power_save_timer.cc ~L32-36) — which is why the checkbox fix works.
+- **What resets the idle counter:** LCD tap (via `StartListening` →
+  `SetPowerSaveLevel(PERFORMANCE)`, stackchan.cc ~L2358), audio open/
+  close, listening/speaking transitions. **Head-touch (Si12T) taps/strokes
+  do NOT** — they only emit gateway events (stackchan.cc ~L3890/3903).
+  Gateway WS traffic doesn't either, which matches the observed drop 23
+  min after the last physical stroke despite constant touch polling.
+- **Wake tap = tap-to-talk, inseparably:** the same LCD touch that wakes
+  from power-save IS the `StartListening()` call — waking him this way
+  always starts an audio capture → Claude API chat. There is no
+  swallowed-wake-tap path in current firmware, and no network wake path.
+
+For the next flash:
+- **Change the default to OFF** for this board (wifi_configuration_ap.cc
+  ~L244) — or simply don't instantiate the PowerSaveTimer in stackchan.cc —
+  so a factory/NVS reset can't silently reintroduce disappearing-Wheatley.
+  Then verify the checkbox state first thing after flashing.
+- If sleep is ever wanted again (battery use): swallow the wake tap
+  (wake without starting listening), and make head-touch events count as
+  activity/wake sources — they currently don't.
+
+## Expose the ambient light sensor (LTR-553ALS) — real lux for "lights out" (added 2026-07-06)
+
+Nothing currently reads the LTR-553ALS (checked live 2026-07-03), so the
+gateway's lights-out reaction approximates darkness from the camera's mean
+frame brightness. That approximation false-triggered repeatedly ("it's
+dark" lines in a fully lit room — auto-exposure dips, hand near the lens,
+idle wander pointing at a dark corner); tightened gateway-side 2026-07-06
+(absolute-darkness threshold + two consecutive dark frames in
+stackchan-vision-loop.py `_check_lights_out`), but a real sensor makes the
+whole guessing game unnecessary.
+
+Add an MCP tool (e.g. `self.light.read` → lux, mirroring the IMU item
+below — it's on the same internal I2C bus that's deliberately not exposed
+via `self.i2c.*`). Then rewire stackchan-vision-loop.py's lights-out check
+to prefer lux when the tool exists (keep the camera fallback for older
+firmware). Batch with the reflash items above.
+
+## Expose the IMU (BMI270/BMM150) for orientation auto-detect
+
+The CoreS3's on-board IMU sits on the internal I2C bus and is deliberately
+NOT exposed through MCP tools (see `main/boards/stackchan/stackchan.cc` ~L507:
+"Direct on-board ICs only; not exposed through self.i2c.* MCP tools").
+
+The companion app now has a **manual** "mounted upside-down" toggle
+(`/api/orientation` in `stackchan_mcp/companion_server.py`) so the gateway
+rotates the camera 180° and mirrors head yaw/pitch when Wheatley is hung
+inverted (e.g. on the management rail, looking down at the scan tray).
+
+To make that **automatic**, add a firmware tool (e.g. `self.imu.read` →
+accel x/y/z, or a derived `orientation`/`pitch`/`roll`) that reads the
+BMI270 gravity vector. The gateway could then infer upright vs inverted
+from the sign of gravity-Z and set the flag itself — no manual toggle, and
+it works with nothing in the camera's view.
+
+**Interim (no reflash needed), added 2026-07-06:** orientation is now
+auto-detectable from the **camera** instead, via the scan tray's four
+DICT_4X4_50 ArUco corner codes (IDs 0-3, printed upright). Run
+`python stackchan-vision-loop.py --calibrate-flip` (`_calibrate_flip` there):
+it sweeps a couple of pitches until the tray markers are in view, reads their
+rotation (~0° = upright, ~180° = inverted — the raw camera image genuinely
+rotates with the body, confirmed live), and writes the `upside_down` flag in
+companion_settings.json. The vision loop rotates frames 180° off that same
+flag so YuNet can detect faces while inverted, and stackchan-idle.py derives
+its servo signs (PITCH_UP_SIGN/YAW_RIGHT_SIGN) from it. The IMU tool would
+still be strictly better (no tray required, instant, works mid-air while
+being remounted), so keep it on this list — but the ArUco path removes the
+urgency. Batch the IMU tool with the other reflash items.

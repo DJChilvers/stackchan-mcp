@@ -1051,7 +1051,10 @@ idf_component_register(SRCS ${SOURCES}
                         efuse
                         bt
                         fatfs
+                        esp_wifi
                         smooth_ui_toolkit
+                        espressif__bmi270_sensor
+                        espressif__i2c_bus
                         ${MAIN_PRIV_REQUIRES_EXTRA}
                     )
 

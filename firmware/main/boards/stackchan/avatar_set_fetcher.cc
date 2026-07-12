@@ -71,11 +71,32 @@ void AvatarSetFetcher::Fetch(
         return;
     }
 
+    // FREE-BEFORE-FETCH: a matrix avatar set's buffer is ~3.45 MB. Holding the
+    // old set's buffer while allocating the new staging buffer needs ~2× that in
+    // PSRAM at once, which OOMs — the reason matrix sets couldn't be replaced
+    // without a power-cycle. Release the previous set's buffer BEFORE allocating
+    // the replacement so the peak is ~one set, not two.
+    //
+    // Trade-off: if the alloc below then fails, the set is already torn down and
+    // the avatar is blank until the next successful fetch (and blank DURING the
+    // download too). Accepted: with ~one set of PSRAM headroom, free-before-alloc
+    // is the only way a matrix set fits. Unload() rewrites the lv_image_dsc_t
+    // entries the LVGL task reads, so take the display lock across it (it is NOT
+    // held on entry — Fetch takes it fresh at the swap below).
+    {
+        auto* display_pre = board.GetDisplay();
+        if (display_pre != nullptr) {
+            DisplayLockGuard lock(display_pre);
+            target_set.Unload();
+        } else {
+            target_set.Unload();
+        }
+    }
+
     // Allocate the PSRAM buffer that will become the AvatarSet's owned
     // image_buffer_ on success. We fill it via HTTP read, verify the SHA256,
     // then hand it off to AvatarSet::AdoptOwnedBuffer with ownership transfer
-    // (= no internal memcpy). PSRAM peak during a swap is therefore
-    // (old AvatarSet buffer + this buffer) and not 3× the set size.
+    // (= no internal memcpy). Peak is now ~one set (old freed above).
     uint8_t* buffer = static_cast<uint8_t*>(
         heap_caps_malloc(expected_size, MALLOC_CAP_SPIRAM));
     if (buffer == nullptr) {

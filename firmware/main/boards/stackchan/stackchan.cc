@@ -32,6 +32,13 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include "avatar_images.h"
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
+#include "rail_driver.h"
+#if CONFIG_IMU_ENABLED
+// Only used for the 8 KB init blob (bmi270_config_file) and the chip-id /
+// blob-size constants. The component's create API is NOT used: it hardcodes
+// I2C 0x68 while this board's BMI270 sits at 0x69 (see InitializeImu()).
+#include "bmi270_api.h"
+#endif
 
 #include <smooth_ui_toolkit.hpp>
 #include <esp_log.h>
@@ -44,6 +51,7 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <esp_lcd_ili9341.h>
 #include <esp_timer.h>
 #include <esp_random.h>
+#include <esp_rom_sys.h>   // esp_rom_delay_us for sub-tick IMU init delays
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -507,6 +515,13 @@ private:
     // audio codec / IMU). Direct on-board ICs only; not exposed through
     // self.i2c.* MCP tools.
     i2c_master_bus_handle_t i2c_bus_;
+#if CONFIG_IMU_ENABLED
+    i2c_master_dev_handle_t imu_dev_ = nullptr;  // BMI270 on internal bus at 0x69 (0x68 is the Si12T)
+    bool imu_ok_ = false;
+#endif
+#if CONFIG_LIGHT_ENABLED
+    bool light_ok_ = false;                  // LTR-553ALS present + enabled
+#endif
     // External I2C bus dedicated to Grove Port A. Exposed through self.i2c.*
     // MCP tools so the gateway can drive attached M5Stack Unit modules.
     i2c_master_bus_handle_t port_a_i2c_bus_;
@@ -2127,7 +2142,12 @@ private:
         power_save_timer_->OnShutdownRequest([this]() {
             pmic_->PowerOff();
         });
-        power_save_timer_->SetEnabled(true);
+        // Start DISABLED so Wheatley never sleeps on USB power. The battery
+        // handler re-enables it only on a discharging transition (GetBatteryLevel),
+        // so on USB (discharging always false) it stays off; on battery it still
+        // sleeps. Fixes the old bug where the init `true` + change-only handler
+        // left sleep enabled forever on USB. See firmware/TODO.md "No sleep mode".
+        power_save_timer_->SetEnabled(false);
     }
 
     void InitializeI2c() {
@@ -2146,6 +2166,140 @@ private:
         };
         ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_cfg, &i2c_bus_));
     }
+
+#if CONFIG_IMU_ENABLED
+    // ---- BMI270 at 0x69, raw-register driver --------------------------------
+    // This board's BMI270 has SDO strapped high, so it answers at 0x69; the
+    // 0x68 slot is the Si12T touch IC (the old probe there read id=0xC0).
+    // The espressif__bmi270_sensor component cannot be retargeted: its
+    // bmi270_sensor_create() takes no address and hardcodes 0x68 internally
+    // (verified by disassembling the prebuilt libbmi270_sensor.a). So we
+    // drive the chip directly on the existing i2c_master bus, reusing only
+    // the component's mandatory 8 KB init blob (bmi270_config_file).
+    // Sequence per Bosch BMI270 datasheet sec 4.2 (initialisation).
+    static constexpr uint8_t kImuAddr         = 0x69;  // BMI2_I2C_SEC_ADDR
+    static constexpr uint8_t kImuRegChipId    = 0x00;  // reads 0x24
+    static constexpr uint8_t kImuRegAccXLsb   = 0x0C;  // 6 bytes: X/Y/Z int16 LE
+    static constexpr uint8_t kImuRegIntStatus = 0x21;  // INTERNAL_STATUS[3:0]==1 -> init OK
+    static constexpr uint8_t kImuRegAccConf   = 0x40;
+    static constexpr uint8_t kImuRegAccRange  = 0x41;
+    static constexpr uint8_t kImuRegInitCtrl  = 0x59;
+    static constexpr uint8_t kImuRegInitAddr0 = 0x5B;  // +0x5C: blob offset in words
+    static constexpr uint8_t kImuRegInitData  = 0x5E;
+    static constexpr uint8_t kImuRegPwrConf   = 0x7C;
+    static constexpr uint8_t kImuRegPwrCtrl   = 0x7D;
+    static constexpr uint8_t kImuRegCmd       = 0x7E;  // 0xB6 = soft reset
+
+    bool ImuWrite(uint8_t reg, const uint8_t* data, size_t len) {
+        // Register write = one transaction of [reg, data...].
+        uint8_t buf[1 + 64];
+        if (imu_dev_ == nullptr || len > 64) return false;
+        buf[0] = reg;
+        for (size_t i = 0; i < len; ++i) buf[1 + i] = data[i];
+        return i2c_master_transmit(imu_dev_, buf, len + 1, 100) == ESP_OK;
+    }
+    bool ImuWrite1(uint8_t reg, uint8_t val) { return ImuWrite(reg, &val, 1); }
+    bool ImuRead(uint8_t reg, uint8_t* data, size_t len) {
+        if (imu_dev_ == nullptr) return false;
+        return i2c_master_transmit_receive(imu_dev_, &reg, 1, data, len, 100) == ESP_OK;
+    }
+
+    void InitializeImu() {
+        // Safety gate: raw-probe 0x69 for the BMI270 chip-id (0x24) BEFORE any
+        // write. If something else answers or nothing does, skip — no bus
+        // disruption, no writes.
+        i2c_device_config_t pc = {};
+        pc.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        pc.device_address  = kImuAddr;
+        pc.scl_speed_hz    = 400000;
+        if (i2c_master_bus_add_device(i2c_bus_, &pc, &imu_dev_) != ESP_OK) {
+            ESP_LOGW(TAG, "IMU: probe add_device failed; IMU disabled");
+            imu_dev_ = nullptr;
+            return;
+        }
+        uint8_t reg = kImuRegChipId, id = 0x00;
+        esp_err_t e = i2c_master_transmit_receive(imu_dev_, &reg, 1, &id, 1, 100);
+        if (e != ESP_OK || id != BMI270_CHIP_ID) {
+            ESP_LOGW(TAG, "IMU: no BMI270 at 0x%02X (e=%s id=0x%02X); IMU disabled",
+                     kImuAddr, esp_err_to_name(e), id);
+            i2c_master_bus_rm_device(imu_dev_);
+            imu_dev_ = nullptr;
+            return;
+        }
+
+        // Confirmed BMI270. Soft reset, upload the 8 KB config blob (the chip
+        // stays in configuration mode and never produces data without it),
+        // then enable the accel: 100 Hz, +/-2 g, performance mode — the same
+        // settings the component path used to apply.
+        auto fail = [this](const char* what) {
+            ESP_LOGE(TAG, "IMU: %s; IMU disabled", what);
+            i2c_master_bus_rm_device(imu_dev_);
+            imu_dev_ = nullptr;
+        };
+        if (!ImuWrite1(kImuRegCmd, 0xB6)) { fail("soft reset failed"); return; }
+        esp_rom_delay_us(2000);                      // POR settle (>= 2 ms)
+        if (!ImuWrite1(kImuRegPwrConf, 0x00)) { fail("PWR_CONF write failed"); return; }
+        esp_rom_delay_us(450);                       // adv_power_save off (>= 450 us)
+        if (!ImuWrite1(kImuRegInitCtrl, 0x00)) { fail("INIT_CTRL=0 failed"); return; }
+        for (uint32_t idx = 0; idx < BMI270_CONFIG_FILE_SIZE; idx += 64) {
+            uint8_t a[2] = { (uint8_t)((idx / 2) & 0x0F), (uint8_t)((idx / 2) >> 4) };
+            if (!ImuWrite(kImuRegInitAddr0, a, 2) ||
+                !ImuWrite(kImuRegInitData, bmi270_config_file + idx, 64)) {
+                fail("config blob upload failed");
+                return;
+            }
+        }
+        if (!ImuWrite1(kImuRegInitCtrl, 0x01)) { fail("INIT_CTRL=1 failed"); return; }
+        uint8_t st = 0;
+        bool init_ok = false;
+        for (int i = 0; i < 25 && !init_ok; ++i) {   // datasheet: done in < 20 ms typ
+            vTaskDelay(pdMS_TO_TICKS(20));           // >= 1 tick at 100 Hz tick rate
+            init_ok = ImuRead(kImuRegIntStatus, &st, 1) && (st & 0x0F) == 0x01;
+        }
+        if (!init_ok) {
+            ESP_LOGE(TAG, "IMU: config not accepted (INTERNAL_STATUS=0x%02X)", st);
+            fail("init status timeout");
+            return;
+        }
+        if (!ImuWrite1(kImuRegPwrCtrl, 0x04) ||      // acc_en
+            !ImuWrite1(kImuRegAccConf, 0xA8) ||      // odr=100 Hz | bwp=normal | filter_perf
+            !ImuWrite1(kImuRegAccRange, 0x00) ||     // +/-2 g (16384 LSB/g)
+            !ImuWrite1(kImuRegPwrConf, 0x02)) {      // adv_power_save off, fifo_self_wakeup
+            fail("accel enable failed");
+            return;
+        }
+        imu_ok_ = true;
+        ESP_LOGI(TAG, "IMU READY (BMI270 at 0x69, raw driver)");
+    }
+#endif
+
+#if CONFIG_LIGHT_ENABLED
+    void InitializeLightSensor() {
+        // Gate on LTR-553 PART_ID (reg 0x86, part-number nibble 0x9) before any
+        // write. If absent/different, skip — no harm.
+        i2c_device_config_t c = {};
+        c.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+        c.device_address  = 0x23;
+        c.scl_speed_hz    = 400000;
+        i2c_master_dev_handle_t dev;
+        if (i2c_master_bus_add_device(i2c_bus_, &c, &dev) != ESP_OK) {
+            ESP_LOGW(TAG, "Light: add_device failed; disabled"); return;
+        }
+        uint8_t reg = 0x86, pid = 0x00;
+        esp_err_t e = i2c_master_transmit_receive(dev, &reg, 1, &pid, 1, 100);
+        if (e != ESP_OK || (pid & 0xF0) != 0x90) {
+            ESP_LOGW(TAG, "Light: no LTR-553 at 0x23 (e=%s pid=0x%02X); disabled",
+                     esp_err_to_name(e), pid);
+            i2c_master_bus_rm_device(dev); return;
+        }
+        uint8_t en[2] = { 0x80, 0x01 };   // ALS_CONTR: active mode, gain x1
+        e = i2c_master_transmit(dev, en, 2, 100);
+        i2c_master_bus_rm_device(dev);
+        if (e != ESP_OK) { ESP_LOGE(TAG, "Light: enable failed (%s)", esp_err_to_name(e)); return; }
+        light_ok_ = true;
+        ESP_LOGI(TAG, "Light sensor (LTR-553) enabled");
+    }
+#endif
 
     void InitializePortAI2c() {
         // Grove Port A bus. Uses I2C controller 0 (the internal bus above
@@ -5115,6 +5269,83 @@ private:
     void RegisterMcpTools() {
         auto& mcp_server = McpServer::GetInstance();
         ESP_LOGI(TAG, "Registering StackChan MCP tools...");
+#if CONFIG_RAIL_ENABLED
+        RegisterRailMcpTools();   // self.rail.* — ESP-NOW sender to the rail bridge
+#endif
+#if CONFIG_IMU_ENABLED
+        mcp_server.AddTool(
+            "self.imu.read",
+            "Read the on-board BMI270 accelerometer. Returns {ok, accel:{x,y,z} "
+            "(raw int16 counts), orientation:\"upright\"|\"inverted\"}. Orientation "
+            "is the sign of gravity on Z and is used to auto-detect the rail's "
+            "inverted mount (verify the axis/sign empirically on first bring-up).",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                if (!imu_ok_ || imu_dev_ == nullptr) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "imu_not_initialized");
+                    return root;
+                }
+                uint8_t d[6] = {0};
+                if (!ImuRead(kImuRegAccXLsb, d, 6)) {   // burst ACC_X_LSB..ACC_Z_MSB
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "acc_read_failed");
+                    return root;
+                }
+                int16_t ax = (int16_t)((uint16_t)d[0] | ((uint16_t)d[1] << 8));
+                int16_t ay = (int16_t)((uint16_t)d[2] | ((uint16_t)d[3] << 8));
+                int16_t az = (int16_t)((uint16_t)d[4] | ((uint16_t)d[5] << 8));
+                cJSON* accel = cJSON_CreateObject();
+                cJSON_AddNumberToObject(accel, "x", ax);
+                cJSON_AddNumberToObject(accel, "y", ay);
+                cJSON_AddNumberToObject(accel, "z", az);
+                cJSON_AddItemToObject(root, "accel", accel);
+                cJSON_AddStringToObject(root, "orientation", az >= 0 ? "upright" : "inverted");
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+#endif
+#if CONFIG_LIGHT_ENABLED
+        mcp_server.AddTool(
+            "self.light.read",
+            "Read the on-board LTR-553ALS ambient-light sensor. Returns {ok, ch0 "
+            "(visible+IR), ch1 (IR)} as raw 16-bit counts (higher ch0 = brighter). "
+            "Lux conversion is left to the caller.",
+            PropertyList(),
+            [this](const PropertyList&) -> ReturnValue {
+                cJSON* root = cJSON_CreateObject();
+                if (!light_ok_) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "light_not_initialized");
+                    return root;
+                }
+                i2c_device_config_t c = {};
+                c.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+                c.device_address  = 0x23;
+                c.scl_speed_hz    = 400000;
+                i2c_master_dev_handle_t dev;
+                if (i2c_master_bus_add_device(i2c_bus_, &c, &dev) != ESP_OK) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", "add_device_failed");
+                    return root;
+                }
+                uint8_t reg = 0x88; uint8_t d[4] = {0};
+                esp_err_t e = i2c_master_transmit_receive(dev, &reg, 1, d, 4, 100);
+                i2c_master_bus_rm_device(dev);
+                if (e != ESP_OK) {
+                    cJSON_AddBoolToObject(root, "ok", false);
+                    cJSON_AddStringToObject(root, "error", esp_err_to_name(e));
+                    return root;
+                }
+                uint16_t ch1 = (uint16_t)d[0] | ((uint16_t)d[1] << 8);
+                uint16_t ch0 = (uint16_t)d[2] | ((uint16_t)d[3] << 8);
+                cJSON_AddNumberToObject(root, "ch0", ch0);
+                cJSON_AddNumberToObject(root, "ch1", ch1);
+                cJSON_AddBoolToObject(root, "ok", true);
+                return root;
+            });
+#endif
 
         mcp_server.AddTool(
             "self.gateway_config.get",
@@ -6604,6 +6835,12 @@ public:
         InitializeServo();
         InitializeTouchSettings();
         InitializeSi12tTouch();
+#if CONFIG_IMU_ENABLED
+        InitializeImu();
+#endif
+#if CONFIG_LIGHT_ENABLED
+        InitializeLightSensor();
+#endif
         I2cDetect();
         // Avatar auto-display disabled: WiFi config UI needs to be visible.
         // Avatar is shown on-demand via MCP set_avatar command.
