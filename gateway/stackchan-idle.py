@@ -1084,6 +1084,37 @@ def _check_orientation(session, pose) -> None:
         pose["on_rail"] = inverted
 
 
+# ── listening acknowledgment (head perk) ────────────────────────────────────
+# The bench is bright, LEDs are invisible — he must visibly SHOW he heard the
+# wake word (user 2026-07-12). The devicechat busy marker (written by the
+# gateway the moment the device enters listening/voice-chat) doubles as the
+# trigger: marker appears -> wide-eye + head perk; conversation over -> ease
+# back to rest. Cheap mtime checks every tick.
+DEVICECHAT_MARKER = os.path.join(_TEMP, "stackchan-busy-devicechat")
+LISTEN_PERK_ENABLED = os.environ.get("STACKCHAN_LISTEN_PERK", "1") != "0"
+
+
+def _check_listen_perk(session, pose) -> None:
+    if not LISTEN_PERK_ENABLED:
+        return
+    try:
+        active = (time.time() - os.path.getmtime(DEVICECHAT_MARKER)) < 120
+    except OSError:
+        active = False
+    if active and not pose.get("perk_active"):
+        pose["perk_active"] = True
+        _face(session, "surprised")
+        np_ = _clamp(pose["p"] + PITCH_UP_SIGN * 8, PITCH_MIN, PITCH_MAX)
+        session.move(pose["y"], np_)
+        pose.update(p=np_)
+    elif not active and pose.get("perk_active"):
+        pose["perk_active"] = False
+        _face(session, REST)
+        ry = pose.get("rest_y", NEUTRAL_YAW); rp = pose.get("rest_p", NEUTRAL_PITCH)
+        session.move(ry, rp)
+        pose.update(y=ry, p=rp)
+
+
 def _check_battery(session, pose) -> None:
     """Polled on its own interval (BATTERY_CHECK_INTERVAL_S), independent
     of the wander() cadence/busy gating — see the constants above for why.
@@ -1512,6 +1543,7 @@ def main():
                 have_session = True
             _check_battery(session, pose)
             _check_orientation(session, pose)
+            _check_listen_perk(session, pose)
         except Exception:
             have_session = False
 

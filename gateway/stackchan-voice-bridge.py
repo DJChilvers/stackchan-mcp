@@ -15,6 +15,13 @@ as an Ogg/Opus POST. This script is the HTTP receiver for that POST:
          system prompt) using STACKCHAN_VOICE_ANTHROPIC_API_KEY
       -> speaks the reply back through the gateway's `say` MCP tool
 
+Replies stream by default: the Claude response is read as SSE and spoken
+sentence-by-sentence, so the first words land while the rest is still
+generating (STACKCHAN_VOICE_STREAMING=0 restores the original batch
+behaviour). Each turn also injects one live-telemetry line (battery +
+rail position, 30s cache) into the system prompt so questions like
+"how's your battery?" get true answers in character.
+
 Setup:
     1. Add your Anthropic API key to .env:
            STACKCHAN_VOICE_ANTHROPIC_API_KEY=sk-ant-...
@@ -87,6 +94,19 @@ WHISPER_MODEL_NAME = os.environ.get("STACKCHAN_VOICE_WHISPER_MODEL", "base.en")
 ANTHROPIC_MODEL = os.environ.get("STACKCHAN_VOICE_MODEL", "claude-haiku-4-5-20251001")
 ANTHROPIC_API_KEY_ENV = "STACKCHAN_VOICE_ANTHROPIC_API_KEY"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+
+# Sentence-streaming replies (2026-07-13): stream the Claude response (SSE
+# over the same raw-urllib path — no SDK dependency) and speak it sentence
+# by sentence instead of waiting for the full reply, so the first words
+# land a few seconds sooner. STACKCHAN_VOICE_STREAMING=0 is the kill
+# switch — it restores the original batch behaviour exactly. Default ON.
+STREAMING_ENABLED = os.environ.get(
+    "STACKCHAN_VOICE_STREAMING", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+# Speak a chunk at each sentence boundary (. ! ?) or once the pending text
+# exceeds this many characters (split at a word gap), whichever comes first.
+SENTENCE_MAX_CHARS = 140
 
 SYSTEM_PROMPT = (
     "You are Wheatley, the AI core from Portal 2, but here you're acting as "
@@ -531,16 +551,138 @@ def _transcribe(ogg_path: str) -> str:
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
-def _call_claude_api(messages: list, api_key: str, tools: list | None = None) -> dict:
+# ─── live self-status for the system prompt ─────────────────────────────────
+# One compact telemetry line (battery + rail) injected into the system
+# prompt each turn so "how's your battery?" / "where are you on the rail?"
+# get TRUE answers in character. Cached for 30s; every fetch is bounded by
+# short timeouts and degrades to omitting itself on any failure.
+
+STATUS_CACHE_TTL_S = 30.0
+STATUS_FETCH_TIMEOUT_S = 2.0
+# The rail bridge's `linked` flag means "ever heard a status this boot" —
+# status_age_ms is the real freshness signal (same gate as stackchan-idle.py).
+RAIL_STATUS_MAX_AGE_MS = 10_000
+# The home end of the rail IS the charge dock (see the charge-dock build
+# notes): homed + parked within this many mm of home = "on the dock".
+DOCKED_POS_MM = 3.0
+
+_status_cache_lock = threading.Lock()
+_status_cache: dict = {"ts": 0.0, "line": None}
+
+
+def _tool_result_json(resp) -> dict:
+    """Parse a gateway tools/call JSON-RPC response into the tool's own JSON
+    payload — same extraction shape as stackchan-idle.py / rail_dance.py."""
+    try:
+        content = ((resp or {}).get("result") or {}).get("content") or []
+        if content:
+            return json.loads(content[0].get("text", "") or "{}") or {}
+    except Exception:
+        pass
+    return {}
+
+
+def _fetch_live_status_line() -> str | None:
+    """Battery + rail snapshot as one system-prompt line, or None.
+
+    Battery and rail are fetched independently so one failing doesn't drop
+    the other; anything missing is simply omitted from the line.
+    """
+    parts: list[str] = []
+    try:
+        sess = MCPSession(GATEWAY_URL, timeout=STATUS_FETCH_TIMEOUT_S)
+        sess.initialize()
+    except Exception:
+        logger.warning("live status: gateway unreachable, omitting status line")
+        return None
+
+    try:
+        info = _tool_result_json(sess.call_tool("get_device_info", {}))
+        battery = info.get("battery") or {}
+        level = battery.get("level")
+        charging = battery.get("charging")
+        if isinstance(level, (int, float)):
+            seg = f"battery {int(level)}%"
+            if charging is True:
+                seg += ", charging"
+            elif charging is False:
+                seg += ", on battery power"
+            parts.append(seg)
+    except Exception:
+        logger.info("live status: get_device_info failed", exc_info=True)
+
+    try:
+        st = _tool_result_json(sess.call_tool("self.rail.status", {}))
+        age = st.get("status_age_ms")
+        if st.get("linked") and isinstance(age, (int, float)) \
+                and age <= RAIL_STATUS_MAX_AGE_MS:
+            pos = st.get("pos_mm")
+            homed = bool(st.get("homed"))
+            seg = "rail "
+            seg += (
+                f"{pos:.0f}mm from home"
+                if isinstance(pos, (int, float)) else "position unknown"
+            )
+            seg += ", homed" if homed else ", not homed"
+            if (
+                homed
+                and isinstance(pos, (int, float))
+                and abs(pos) <= DOCKED_POS_MM
+                and st.get("moving") is False
+            ):
+                seg += ", parked on the charge dock"
+            parts.append(seg)
+    except Exception:
+        logger.info("live status: rail status failed", exc_info=True)
+
+    if not parts:
+        return None
+    return (
+        "Live status (your real telemetry right now): "
+        + " | ".join(parts)
+        + ". Use this to answer truthfully about your battery, charging, "
+        "or rail position."
+    )
+
+
+def _cached_status_line() -> str | None:
+    """30s-cached wrapper around _fetch_live_status_line. Also the target of
+    the prefetch thread in _handle_capture — warming the cache while
+    transcription runs means the Claude call almost never waits on it."""
+    now = time.time()
+    with _status_cache_lock:
+        if now - _status_cache["ts"] <= STATUS_CACHE_TTL_S:
+            return _status_cache["line"]
+    line = _fetch_live_status_line()
+    with _status_cache_lock:
+        _status_cache["ts"] = time.time()
+        _status_cache["line"] = line
+    return line
+
+
+def _system_prompt_with_status() -> str:
+    line = _cached_status_line()
+    return SYSTEM_PROMPT if not line else f"{SYSTEM_PROMPT}\n\n{line}"
+
+
+def _claude_request(
+    messages: list,
+    api_key: str,
+    tools: list | None = None,
+    system: str | None = None,
+    stream: bool = False,
+) -> urllib.request.Request:
     payload = {
         "model": ANTHROPIC_MODEL,
         "max_tokens": 300,
-        "system": SYSTEM_PROMPT,
+        "system": system or SYSTEM_PROMPT,
         "messages": messages,
     }
     if tools:
         payload["tools"] = tools
-    req = urllib.request.Request(
+    if stream:
+        payload["stream"] = True
+    return urllib.request.Request(
         ANTHROPIC_URL,
         data=json.dumps(payload).encode(),
         headers={
@@ -550,6 +692,15 @@ def _call_claude_api(messages: list, api_key: str, tools: list | None = None) ->
         },
         method="POST",
     )
+
+
+def _call_claude_api(
+    messages: list,
+    api_key: str,
+    tools: list | None = None,
+    system: str | None = None,
+) -> dict:
+    req = _claude_request(messages, api_key, tools=tools, system=system)
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read())
 
@@ -629,9 +780,10 @@ def _ask_claude(transcript: str) -> str:
     if not api_key:
         return _pick("no-key", NO_KEY_PHRASES)
 
+    system = _system_prompt_with_status()
     messages = [{"role": "user", "content": transcript}]
     try:
-        data = _call_claude_api(messages, api_key, tools=[VISION_TOOL])
+        data = _call_claude_api(messages, api_key, tools=[VISION_TOOL], system=system)
     except urllib.error.HTTPError as exc:
         body_snippet = exc.read().decode(errors="replace")[:300]
         logger.warning("Claude API HTTP error %s: %s", exc.code, body_snippet)
@@ -673,7 +825,7 @@ def _ask_claude(transcript: str) -> str:
                 }],
             })
             try:
-                data = _call_claude_api(messages, api_key)
+                data = _call_claude_api(messages, api_key, system=system)
                 content = data.get("content", [])
             except urllib.error.HTTPError as exc:
                 body_snippet = exc.read().decode(errors="replace")[:300]
@@ -685,6 +837,241 @@ def _ask_claude(transcript: str) -> str:
 
     text = _extract_text(content)
     return text or "Er, got an empty answer back. Not sure what happened there."
+
+
+# ─── sentence-streaming reply path ───────────────────────────────────────────
+# The Claude call streams as SSE and each sentence is spoken the moment it
+# completes, while the rest of the reply is still generating.
+#
+# Serialization: the gateway's `say` tool only returns after the device has
+# played the audio (synthesize_and_send pushes Opus frames paced at
+# real-time under gateway.esp32.tts_lock), so sequential blocking say calls
+# here guarantee ordered, gap-free-but-never-overlapping sentences — and
+# the tts_lock additionally serializes us against any other concurrent
+# speaker (idle loop, sensor reactor). No client-side queue needed: the
+# already-generated SSE bytes just sit in the socket buffer while a chunk
+# plays.
+
+
+def _iter_sse_events(resp):
+    """Yield parsed JSON data payloads from an Anthropic SSE response.
+
+    Every Anthropic data payload carries its own "type" field, so the
+    "event:" lines are redundant and skipped. `resp` is the file-like
+    urllib response; iterating it yields lines (urllib de-chunks).
+    """
+    data_lines: list[str] = []
+    for raw in resp:
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                try:
+                    yield json.loads("\n".join(data_lines))
+                except json.JSONDecodeError:
+                    logger.warning("stream: unparseable SSE data: %r", data_lines[:1])
+                data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    if data_lines:  # trailing event without a final blank line
+        try:
+            yield json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            pass
+
+
+# Sentence end: . ! or ? (optionally run-on like "..."), optionally followed
+# by a closing quote/bracket, then whitespace. Whitespace is REQUIRED so a
+# mid-stream "3." (of "3.5") or a not-yet-complete sentence at the buffer's
+# edge never splits early; end-of-reply text is handled by flush().
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?]+[\"')\]]*\s")
+
+
+class _SentenceChunker:
+    """Accumulates streamed text deltas; emits speakable chunks at sentence
+    boundaries, or at a word gap once SENTENCE_MAX_CHARS is pending."""
+
+    def __init__(self):
+        self._buf = ""
+
+    @staticmethod
+    def _split_once(buf: str) -> tuple[str | None, str]:
+        m = _SENTENCE_SPLIT_RE.search(buf)
+        if m:
+            return buf[: m.end()].strip(), buf[m.end():]
+        if len(buf) > SENTENCE_MAX_CHARS:
+            cut = buf.rfind(" ", 0, SENTENCE_MAX_CHARS)
+            if cut <= 0:
+                cut = SENTENCE_MAX_CHARS
+            return buf[:cut].strip(), buf[cut:].lstrip()
+        return None, buf
+
+    def feed(self, text: str) -> list[str]:
+        self._buf += text
+        out: list[str] = []
+        while True:
+            chunk, rest = self._split_once(self._buf)
+            if chunk is None:
+                break
+            self._buf = rest
+            if chunk:  # drop empty splits (e.g. stray leading punctuation)
+                out.append(chunk)
+        return out
+
+    def flush(self) -> str | None:
+        chunk = self._buf.strip()
+        self._buf = ""
+        return chunk or None
+
+
+class _StreamSpeaker:
+    """Speaks reply chunks in order through one gateway MCP session.
+
+    Mirrors _speak's shape, split across the stream: face is set once
+    before the first chunk, every chunk goes out via `say` (blocking until
+    played — see the serialization note above), and finish() does the
+    idle-face + look-at-user reset exactly once at the end.
+    """
+
+    def __init__(self):
+        self._sess: MCPSession | None = None
+        self.spoke = False
+
+    def _session(self) -> MCPSession:
+        if self._sess is None:
+            sess = MCPSession(GATEWAY_URL)
+            sess.initialize()
+            self._sess = sess
+        return self._sess
+
+    def speak_chunk(self, text: str, face: str | None = None) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        sess = self._session()
+        if not self.spoke:
+            # Speech is starting: stop the LED thinking chase and put the
+            # emotion-tag face up, same as the batch path's _speak.
+            _clear_thinking_marker()
+            sess.call_tool("set_avatar", {"face": face or "idle"})
+        self.spoke = True
+        sess.call_tool("say", {"text": text}, timeout=30)
+
+    def finish(self) -> None:
+        if not self.spoke:
+            return
+        try:
+            sess = self._session()
+            sess.call_tool("set_avatar", {"face": "idle"})
+            sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH + 6})
+        except Exception:
+            logger.exception("stream finish (pose reset) failed")
+
+
+def _ask_claude_streaming(transcript: str, session_id: str = "") -> bool:
+    """Stream the reply and speak it sentence-by-sentence.
+
+    Returns True when the turn was fully handled (all speech done, pose
+    reset). Returns False when the caller should run the batch path
+    instead — safe in every False case because either nothing has been
+    spoken yet, or (tool-use fallback) only preamble text from the first
+    response, which the batch path never speaks (it only speaks the
+    post-photo follow-up's text).
+    """
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        return False  # batch path speaks the no-key phrase
+
+    system = _system_prompt_with_status()
+    messages = [{"role": "user", "content": transcript}]
+    t0 = time.time()
+    try:
+        resp = urllib.request.urlopen(
+            _claude_request(
+                messages, api_key, tools=[VISION_TOOL], system=system, stream=True
+            ),
+            timeout=30,
+        )
+    except Exception:
+        # Batch retry reproduces the exact current error phrasing
+        # (HTTP-error vs network-error) — don't duplicate it here.
+        logger.warning("stream open failed; falling back to batch", exc_info=True)
+        return False
+
+    speaker = _StreamSpeaker()
+    chunker = _SentenceChunker()
+    reply_parts: list[str] = []  # full text, for the log
+    first_say_at: float | None = None
+
+    def _speak_next(chunk: str) -> None:
+        nonlocal first_say_at
+        if not speaker.spoke:
+            # The emotion tag rides in front of the first sentence; strip
+            # it and apply the face with the first chunk (batch parity).
+            face, spoken = _split_emotion(chunk)
+            if first_say_at is None:
+                first_say_at = time.time()
+            speaker.speak_chunk(spoken, face or "idle")
+        else:
+            speaker.speak_chunk(chunk)
+
+    try:
+        try:
+            for data in _iter_sse_events(resp):
+                dtype = data.get("type")
+                if dtype == "content_block_start":
+                    block = data.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        # Vision turn — the batch path owns the photo
+                        # round-trip. Abandon the stream for this turn.
+                        logger.info(
+                            "session=%s stream: tool_use started, deferring to batch",
+                            session_id,
+                        )
+                        return False
+                elif dtype == "content_block_delta":
+                    delta = data.get("delta") or {}
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        reply_parts.append(text)
+                        for chunk in chunker.feed(text):
+                            _speak_next(chunk)
+                elif dtype == "error":
+                    raise RuntimeError(f"stream error event: {data.get('error')}")
+                elif dtype == "message_stop":
+                    break
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+        tail = chunker.flush()
+        if tail:
+            _speak_next(tail)
+    except Exception:
+        logger.exception("session=%s streaming reply failed", session_id)
+        if not speaker.spoke:
+            return False  # clean slate — batch retry
+        # Mid-utterance failure: end gracefully rather than re-asking and
+        # double-speaking the start of the reply via the batch path.
+        speaker.finish()
+        return True
+
+    if not speaker.spoke:
+        # Empty reply — rare; let batch retry once and speak its own
+        # empty-answer phrase if it repeats.
+        logger.info("session=%s stream produced no speakable text", session_id)
+        return False
+
+    logger.info(
+        "session=%s streamed reply (first say at +%.1fs, total %.1fs): %r",
+        session_id,
+        (first_say_at - t0) if first_say_at is not None else -1.0,
+        time.time() - t0,
+        "".join(reply_parts),
+    )
+    speaker.finish()
+    return True
 
 
 def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
@@ -699,6 +1086,10 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
     """
     _set_thinking_pose()
     _start_thinking_marker()
+    # Warm the live-status cache while transcription runs so the status
+    # line adds ~zero latency to the Claude call (30s cache, ~2s timeouts;
+    # a concurrent fetch at ask-time is harmless, just redundant).
+    threading.Thread(target=_cached_status_line, daemon=True).start()
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as f:
@@ -793,6 +1184,16 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
             logger.exception("dance intent hook failed; falling through to chat")
 
         t1 = time.time()
+        # Streaming path first (unless killed via STACKCHAN_VOICE_STREAMING=0):
+        # speaks the reply itself, sentence by sentence. False = fall through
+        # to the batch path (no key / tool-use turn / early failure — safe,
+        # see _ask_claude_streaming's contract).
+        if STREAMING_ENABLED and _ask_claude_streaming(transcript, session_id):
+            logger.info(
+                "session=%s reply handled via streaming in %.1fs",
+                session_id, time.time() - t1,
+            )
+            return
         reply = _ask_claude(transcript)
         logger.info(
             "session=%s claude reply in %.1fs: %r",
