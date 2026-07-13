@@ -32,6 +32,7 @@ Configuration via env vars:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -58,6 +59,56 @@ AUDIO_PROBE_INTERVAL = 3.0   # seconds between audio probes
 # _behavior_recognize. Unknown-face handling (ASK_NAME_PHRASES, the
 # enrollment flow) is unaffected either way.
 OWNER_NAME = os.environ.get("STACKCHAN_OWNER_NAME", "Dominic")
+
+# Dream-loop morning brag (2026-07-13): the nightly DREAM_LOOP.md run
+# writes learned.json — a JSON array of {ts, summary_spoken, announced} —
+# for things it taught Wheatley overnight. The first OWNER greeting that
+# finds announced==false entries speaks them ("while you slept, I did
+# some homework...") and rewrites the file with announced: true, so each
+# result is bragged about exactly once. A missing/malformed file simply
+# means no brag — it can never break the greeting itself.
+LEARNED_JSON_PATH = os.environ.get(
+    "STACKCHAN_LEARNED_JSON",
+    r"C:\Users\domin\Documents\StackChan\dream\learned.json",
+)
+
+
+def _take_unannounced_learned() -> list[str]:
+    """Pop unannounced Dream Loop results from learned.json.
+
+    Returns their summary_spoken lines and atomically rewrites the file
+    (tmp + os.replace) with ALL previously-unannounced entries marked
+    announced: true — including any past the spoken-aloud limit, since
+    they get summarised as "...and N other things". Any error — missing
+    file, malformed JSON, unwritable disk — returns [] so the caller's
+    greeting proceeds exactly as before. Marking happens BEFORE speech,
+    deliberately: a lost brag beats a brag repeated on every greeting.
+    """
+    try:
+        with open(LEARNED_JSON_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        summaries: list[str] = []
+        changed = False
+        for item in data:
+            if isinstance(item, dict) and not item.get("announced"):
+                line = str(item.get("summary_spoken") or "").strip()
+                if line:
+                    summaries.append(line)
+                item["announced"] = True
+                changed = True
+        if not summaries:
+            return []
+        if changed:
+            tmp_path = LEARNED_JSON_PATH + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, LEARNED_JSON_PATH)
+        return summaries
+    except Exception:
+        logger.info("learned.json brag skipped (unreadable/unwritable)", exc_info=True)
+        return []
 
 # Speed presets (degrees/sec) forwarded to self.robot.set_head_angles
 _SPD = {"slow": 30, "mid": 120, "fast": 240, "max": 500}
@@ -582,6 +633,37 @@ class SensorReactor:
                 # happen (vision-loop always forwards it for "known"), fall
                 # back to the generic (nameless) owner-style lines.
                 await self._say(_pick("greeting", self.GREETING_PHRASES))
+            # Dream-loop morning brag: overnight homework results waiting
+            # in learned.json get announced once, to the owner only,
+            # riding on the greeting he was getting anyway. Placed BEFORE
+            # the learn-confirm ask below so that ask (which expects the
+            # next tap-to-talk as its yes/no answer) stays the last thing
+            # spoken. Double-guarded: the helper never raises, and this
+            # try/except means even a brag-composition bug can't break
+            # the greeting behaviour.
+            if is_owner:
+                try:
+                    summaries = _take_unannounced_learned()
+                    if summaries:
+                        brag = (
+                            "Oh! While you slept, I did some homework: "
+                            + summaries[0]
+                        )
+                        if len(summaries) >= 2:
+                            brag += " Also: " + summaries[1]
+                        if len(summaries) > 2:
+                            n = len(summaries) - 2
+                            brag += (
+                                f" ...and {n} other "
+                                f"thing{'s' if n != 1 else ''}. Big night."
+                            )
+                        await asyncio.sleep(0.25)
+                        await self._say(brag)
+                except Exception:
+                    logger.warning(
+                        "morning brag failed; greeting unaffected",
+                        exc_info=True,
+                    )
             if propose_learn and person_name:
                 await asyncio.sleep(0.3)
                 phrase = _pick("learn-confirm-ask", self.LEARN_CONFIRM_ASK_PHRASES)

@@ -117,6 +117,19 @@ COLOUR_CHECK_ENABLED = os.environ.get(
     "STACKCHAN_COLOUR_CHECK", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
+# Dream-loop failure capture (2026-07-13): SYSTEM_PROMPT asks the LLM to
+# append a literal [CANT] token to any reply that amounts to "can't do
+# that / don't know / don't have that capability or information". The
+# token is stripped before speaking (batch, streaming and colour paths
+# all strip it) and the failed turn is appended to the Dream Loop
+# wishlist, which the nightly DREAM_LOOP.md run consumes to teach him
+# the missing trick overnight. Kill switch: STACKCHAN_DREAM_CAPTURE=0.
+# Default ON. Capture is fire-and-forget — it can never break a turn.
+DREAM_CAPTURE_ENABLED = os.environ.get(
+    "STACKCHAN_DREAM_CAPTURE", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+WISHLIST_PATH = r"C:\Users\domin\Documents\StackChan\dream\wishlist.jsonl"
+
 SYSTEM_PROMPT = (
     "You are Wheatley, the AI core from Portal 2, but here you're acting as "
     "a helpful desk assistant for the user's coding and maker projects. Stay "
@@ -143,7 +156,13 @@ SYSTEM_PROMPT = (
     "[happy] pleased or amused, [surprised] alarmed or excited, [thinking] "
     "unsure or working it out, [sad] apologetic or disappointed, [embarrassed] "
     "self-deprecating or awkward (very you), [idle] neutral. "
-    "Example: [happy] Oh, brilliant — that actually worked."
+    "Example: [happy] Oh, brilliant — that actually worked.\n\n"
+    "One more marker: if your reply amounts to declining — 'I can't do "
+    "that', 'I don't know', 'I don't have that capability or information' "
+    "— ALSO append the literal token [CANT] at the very END of the reply, "
+    "after all the spoken words. Never mention or explain it; it is "
+    "stripped before speaking. "
+    "Example: [sad] Honestly, no idea — I can't check that from in here. [CANT]"
 )
 
 NO_KEY_PHRASES = [
@@ -512,6 +531,74 @@ def _split_emotion(reply: str):
     face = _EMOTION_TO_FACE.get(m.group(1).lower())
     spoken = reply[m.end():].lstrip()
     return face, (spoken or reply)
+
+
+# The [CANT] failure token (see the SYSTEM_PROMPT addition + the
+# DREAM_CAPTURE_ENABLED block above). Matched case-insensitively anywhere
+# in the text — the prompt asks for end-of-reply, but the model
+# occasionally misplaces markers — so TTS can never read it aloud.
+_CANT_TOKEN_RE = re.compile(r"\s*\[CANT\]", re.IGNORECASE)
+
+
+def _strip_cant(text: str) -> tuple[str, bool]:
+    """(clean_text, found): remove every [CANT] token from text.
+
+    Collapses the leftover whitespace so a stripped mid-text token can't
+    leave a double space for TTS to trip on. clean_text may come back
+    empty if the text was ONLY the token — callers must not speak that.
+    """
+    if not text or "[" not in text:
+        return text, False
+    clean, n = _CANT_TOKEN_RE.subn(" ", text)
+    if not n:
+        return text, False
+    return " ".join(clean.split()), True
+
+
+def _capture_cant(transcript: str, reply_tagless: str, session_id: str = "") -> None:
+    """Append a [CANT] turn to the Dream Loop wishlist. Never raises.
+
+    Line format matches dream/wishlist_add.py and DREAM_LOOP.md's contract:
+    one JSON object per line, {ts, source, transcript, reply, note, photo},
+    ts = epoch float. The append is a single write() of one complete line
+    in append mode, so concurrent turns can't interleave mid-line. Light
+    dedupe: skip when the LAST line already has this transcript
+    (case-folded) — re-asking the same thing shouldn't stack duplicates.
+    """
+    if not DREAM_CAPTURE_ENABLED:
+        return
+    try:
+        try:
+            last_line = None
+            with open(WISHLIST_PATH, encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        last_line = line
+            if last_line:
+                prev = json.loads(last_line)
+                prev_transcript = str(prev.get("transcript") or "")
+                if prev_transcript.strip().casefold() == transcript.strip().casefold():
+                    logger.info(
+                        "session=%s dream capture deduped (same transcript as last): %r",
+                        session_id, transcript,
+                    )
+                    return
+        except Exception:
+            pass  # missing file / unreadable last line never blocks the append
+        os.makedirs(os.path.dirname(WISHLIST_PATH), exist_ok=True)
+        entry = {
+            "ts": time.time(),
+            "source": "voice-cant",
+            "transcript": transcript,
+            "reply": reply_tagless,
+            "note": None,
+            "photo": None,
+        }
+        with open(WISHLIST_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        logger.info("session=%s dream capture: wishlisted %r", session_id, transcript)
+    except Exception:
+        logger.exception("dream capture failed (turn unaffected)")
 
 
 def _speak(text: str, face_before: str | None = None) -> None:
@@ -978,6 +1065,13 @@ def _answer_colour_question(transcript: str, session_id: str) -> None:
     logger.info("session=%s colour answer: %r", session_id, reply)
     _clear_thinking_marker()
     face, spoken = _split_emotion(reply)
+    # This path shares SYSTEM_PROMPT, so a can't-tell answer may carry
+    # [CANT] too — strip (never speak it) and wishlist it the same way.
+    spoken, cant = _strip_cant(spoken)
+    if cant:
+        _capture_cant(transcript, spoken, session_id)
+        if not spoken:
+            spoken = _pick("colour-vision-fail", COLOUR_VISION_FAIL_PHRASES)
     _speak(spoken, face_before=(face or "idle"))
 
 
@@ -1147,6 +1241,16 @@ def _ask_claude_streaming(transcript: str, session_id: str = "") -> bool:
 
     def _speak_next(chunk: str) -> None:
         nonlocal first_say_at
+        # [CANT] rides at the very END of the reply, and the chunker only
+        # splits at sentence-punctuation-plus-whitespace or at a word gap,
+        # so the token always arrives whole inside a single chunk — in
+        # practice the flush() tail (it has no trailing whitespace, so no
+        # sentence split ever fires after it). Stripping each chunk on its
+        # accumulated text before speaking is therefore split-proof;
+        # detection/capture runs once on the full reply after the stream.
+        chunk, _ = _strip_cant(chunk)
+        if not chunk:
+            return  # chunk was only the token — nothing speakable
         if not speaker.spoke:
             # The emotion tag rides in front of the first sentence; strip
             # it and apply the face with the first chunk (batch parity).
@@ -1201,9 +1305,17 @@ def _ask_claude_streaming(transcript: str, session_id: str = "") -> bool:
 
     if not speaker.spoke:
         # Empty reply — rare; let batch retry once and speak its own
-        # empty-answer phrase if it repeats.
+        # empty-answer phrase if it repeats. (Also covers a reply that was
+        # ONLY tags: the batch retry does its own strip + capture.)
         logger.info("session=%s stream produced no speakable text", session_id)
         return False
+
+    # Wishlist capture on the accumulated full reply (chunks were only
+    # stripped for speech above; this is the authoritative detection).
+    _, spoken_full = _split_emotion("".join(reply_parts))
+    reply_clean, cant = _strip_cant(spoken_full)
+    if cant:
+        _capture_cant(transcript, reply_clean, session_id)
 
     logger.info(
         "session=%s streamed reply (first say at +%.1fs, total %.1fs): %r",
@@ -1405,7 +1517,14 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
         # Fall back to idle so a neutral answer doesn't linger on the
         # thinking/"sad" concentrating face left over from _set_thinking_pose.
         face, spoken = _split_emotion(reply)
-        logger.info("session=%s reply emotion=%r", session_id, face)
+        # [CANT] = the reply is a can't-do-that / don't-know — wishlist it
+        # for the nightly Dream Loop, and never let TTS read the token.
+        spoken, cant = _strip_cant(spoken)
+        if cant:
+            _capture_cant(transcript, spoken, session_id)
+            if not spoken:  # reply was effectively only tags — rare
+                spoken = "Yeah — that one's a bit beyond me right now, honestly."
+        logger.info("session=%s reply emotion=%r cant=%s", session_id, face, cant)
         _speak(spoken, face_before=(face or "idle"))
     except Exception:
         logger.exception("capture handling failed (session=%s)", session_id)
