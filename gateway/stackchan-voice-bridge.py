@@ -1183,6 +1183,39 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
         except Exception:
             logger.exception("dance intent hook failed; falling through to chat")
 
+        # "Where are my earplugs?" — inventory lookup intent, answered
+        # straight from the local HomeBox instance via
+        # stackchan_mcp/inventory.py (same hook shape as the dance intent
+        # above). Wrapped so it can NEVER break a turn. Deliberately does
+        # NOT fire on "desk"/"bench" phrasing (extract_query returns None
+        # there) — rail-findable "on the desk" questions belong to the
+        # find_item.py concept and fall through to normal chat.
+        try:
+            from stackchan_mcp import inventory
+            inv_query = inventory.extract_query(transcript)
+            if inv_query:
+                try:
+                    inv_results = inventory.find_items(inv_query)
+                    inv_speech = inventory.format_speech(inv_query, inv_results)
+                except inventory.InventoryUnavailable as exc:
+                    inv_results = None
+                    inv_speech = inventory.format_unavailable()
+                    logger.warning(
+                        "session=%s inventory unavailable for %r: %s",
+                        session_id, inv_query, exc,
+                    )
+                logger.info(
+                    "session=%s inventory intent query=%r hits=%s: %r",
+                    session_id, inv_query,
+                    "n/a" if inv_results is None else len(inv_results),
+                    transcript,
+                )
+                _clear_thinking_marker()
+                _speak(inv_speech)
+                return
+        except Exception:
+            logger.exception("inventory intent hook failed; falling through to chat")
+
         t1 = time.time()
         # Streaming path first (unless killed via STACKCHAN_VOICE_STREAMING=0):
         # speaks the reply itself, sentence by sentence. False = fall through

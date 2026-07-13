@@ -19,6 +19,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Notification, TextContent, Tool
 
 from . import __version__
+from . import inventory
 from .gateway import get_gateway
 from .notify_config import NotifyConfig, load_notify_config
 from .user_defaults import resolve_default
@@ -535,6 +536,50 @@ async def _dispatch_mcp_tool(
 
     if name == "stackchan_follow_pose_stream":
         return await _handle_follow_pose_stream(gateway, arguments)
+
+    if name == "inventory_find":
+        # Gateway-local (HomeBox lives on this host) — works even with no
+        # ESP32 connected, so it is handled here rather than in tool_map.
+        # find_items is blocking urllib with a ~4s budget; keep it off the
+        # event loop.
+        query = arguments.get("query")
+        if not isinstance(query, str) or not query.strip():
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"ok": False, "error": "query is required"}),
+                )
+            ]
+        query = query.strip()
+        try:
+            results = await anyio.to_thread.run_sync(inventory.find_items, query)
+        except inventory.InventoryUnavailable as exc:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "ok": False,
+                            "error": f"inventory unavailable: {exc}",
+                            "speech": inventory.format_unavailable(),
+                        }
+                    ),
+                )
+            ]
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "ok": True,
+                        "query": query,
+                        "results": results,
+                        "speech": inventory.format_speech(query, results),
+                    },
+                    indent=2,
+                ),
+            )
+        ]
 
     if not gateway.esp32.device_connected:
         return [
@@ -1976,6 +2021,32 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "wifi_channel."
                 ),
                 inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="inventory_find",
+                description=(
+                    "Search the local HomeBox home inventory for an item "
+                    "(gateway-local, no device needed). Returns up to 3 "
+                    "Item matches as {name, quantity, location_path "
+                    "(root→leaf names)} plus a ready-to-say Wheatley-style "
+                    "'speech' summary, e.g. query='earplugs' → 'Your "
+                    "earplugs are in the Main Loft, Tub 12.' On HomeBox "
+                    "down / stale token returns ok=false with a polite "
+                    "'can't reach the inventory' speech line."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": (
+                                "Item name or short phrase to search for "
+                                "(e.g. 'earplugs', 'hdmi cable')."
+                            ),
+                        },
+                    },
+                    "required": ["query"],
+                },
             ),
             Tool(
                 name="self.imu.read",
