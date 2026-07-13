@@ -966,17 +966,26 @@ def _dock_to_charge(session, pose) -> None:
     pose["last_dock_attempt_ts"] = time.time()
     if pose.get("on_rail") is False:
         return   # he's on a desk, not the rail — never fire rail commands
-    # warm the bridge link (parked scan wakes on our pings)
+    # warm the bridge link (parked scan wakes on our pings). We require only
+    # that the bridge is REACHABLE + powered — NOT that it's uncrashed. A
+    # crashed rail must NEVER abort the low-battery rescue: being stranded off
+    # the charger is worse than a crash, and rail_home() below re-homes AND
+    # clears the crash on the bridge, driving him onto the contacts. (2026-07-14
+    # fix: the old `not crashed` gate here let a dance-crash disable the very
+    # rescue that should charge him, so he drained flat. See task: crash must
+    # not strand him off-dock.)
     st = session.rail_status()
     for _ in range(3):
         if st and isinstance(st.get("status_age_ms"), (int, float)) \
-                and st["status_age_ms"] <= 3000 and not st.get("crashed") \
-                and st.get("power_12v"):
+                and st["status_age_ms"] <= 3000 and st.get("power_12v"):
             break
         time.sleep(2.5)
         st = session.rail_status()
     else:
-        return   # rail unreachable/unhealthy — leave it to the warn path
+        return   # rail bridge truly unreachable — leave it to the warn path
+    if st.get("crashed"):
+        print("dock-to-charge: rail CRASHED but battery low — re-homing to "
+              "clear the crash and rescue onto the dock")
     try:
         session.say(_pick_phrase("dock-to-charge", DOCK_PHRASES))
     except Exception:
