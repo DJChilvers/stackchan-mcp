@@ -2140,7 +2140,12 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() {
-            pmic_->PowerOff();
+            // NEVER power off (2026-07-13). This fired repeatedly with power
+            // attached: at 100% the charger IC rests, IsDischarging() flips
+            // true, the battery handler armed this timer, and 5 idle minutes
+            // later a fully-charged, plugged-in Wheatley shut himself down.
+            // He lives on powered infrastructure (dock/USB) — log and refuse.
+            ESP_LOGW(TAG, "PowerSaveTimer shutdown request IGNORED (auto power-off disabled)");
         });
         // Start DISABLED so Wheatley never sleeps on USB power. The battery
         // handler re-enables it only on a discharging transition (GetBatteryLevel),
@@ -6877,7 +6882,11 @@ public:
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
         if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
+            // Do NOT arm the power-save timer here (2026-07-13). "Discharging"
+            // includes the charger RESTING at 100% on USB/dock, which armed
+            // sleep+shutdown on a fully-powered device (the recurring
+            // "turned off with power attached" deaths). Timer stays as
+            // initialized (disabled); shutdown is separately neutered.
             last_discharging = discharging;
         }
 
