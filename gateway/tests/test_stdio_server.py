@@ -838,7 +838,7 @@ async def test_port_b_ws2812_set_strip_relays_colors_as_json_string(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_list_tools_move_head_declares_recommended_pitch_range():
-    """move_head schema mirrors M5Stack-recommended 5..85 / yaw -90..90."""
+    """move_head schema mirrors M5Stack-recommended pitch 5..85 / calibrated yaw -130..160."""
     server = create_server()
 
     result = await server.request_handlers[ListToolsRequest](
@@ -853,8 +853,8 @@ async def test_list_tools_move_head_declares_recommended_pitch_range():
     assert pitch_schema["maximum"] == 85
 
     yaw_schema = tool.inputSchema["properties"]["yaw"]
-    assert yaw_schema["minimum"] == -90
-    assert yaw_schema["maximum"] == 90
+    assert yaw_schema["minimum"] == -130
+    assert yaw_schema["maximum"] == 160
 
     # The description should mention the escape-hatch tool name so an LLM
     # reading it can pick the right alternative for permissive use cases.
@@ -998,9 +998,9 @@ async def test_move_head_rejects_pitch_above_recommended(monkeypatch, pitch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("yaw", [-91, 91, 200, -1000])
+@pytest.mark.parametrize("yaw", [-131, 161, 200, -1000])
 async def test_move_head_rejects_yaw_out_of_range(monkeypatch, yaw):
-    """yaw values outside -90..+90 are refused."""
+    """yaw values outside the calibrated -130..160 range are refused."""
     calls = _make_fake_gateway(monkeypatch)
     server = create_server()
 

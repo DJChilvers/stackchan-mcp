@@ -42,6 +42,8 @@ import threading
 import time
 import urllib.request
 
+from .movement import MovementController
+
 logger = logging.getLogger(__name__)
 
 GATEWAY_MCP_URL = "http://127.0.0.1:8767/mcp"
@@ -145,6 +147,25 @@ class _McpClient:
 # ─── rail helpers ────────────────────────────────────────────────────────────
 
 
+# One shared MovementController for the whole routine — this is the single path
+# for head + rail motion (Phase-1 behaviour engine). It owns the calibrated
+# limits, orientation signs and crash-aware rail waits, so the choreography just
+# asks for poses and the controller does the clamping/mapping. The old inline
+# head helper called ``self.robot.set_head_angles`` — a DEVICE tool NOT exposed
+# at the gateway MCP boundary — so every head move here silently failed; routing
+# through the controller's ``move_head`` path is the fix.
+_mc: MovementController | None = None
+
+
+def _controller() -> MovementController:
+    global _mc
+    if _mc is None:
+        # verify_feedback off (fast choreography); respect_quiesce off (a dance
+        # is an explicit request — it should run even mid-idle-chatter).
+        _mc = MovementController(url=GATEWAY_MCP_URL)
+    return _mc
+
+
 def _rail_status(c: _McpClient) -> dict:
     return c.call("self.rail.status")
 
@@ -180,36 +201,37 @@ def _wait_parked(c: _McpClient, timeout_s: float = 8.0) -> bool:
 
 
 def _move(c: _McpClient, mm: int) -> bool:
-    c.call("self.rail.move_mm", {"mm": int(mm)})
-    return _wait_parked(c)
+    # Absolute rail move via the controller (crash-aware park wait built in).
+    return _controller().roll_to(int(mm))
 
 
 def _move_with_sweep(
     c: _McpClient, mm: int, sweep: tuple[tuple[int, int], ...],
     timeout_s: float = 10.0,
 ) -> bool:
-    """Glide the rail while sweeping the head through (yaw, pitch) poses."""
-    c.call("self.rail.move_mm", {"mm": int(mm)})
-    i = 0
-    for _ in range(int(timeout_s * 2)):
-        if i < len(sweep):
-            yaw, pitch = sweep[i]
-            _head(c, yaw, pitch)
-            i += 1
+    """Glide the rail while sweeping the head through (yaw, pitch) poses.
+
+    Kicks off the move without blocking, sweeps the head through the poses as
+    the carriage travels, then waits for it to park (crash-aware) — all through
+    the shared controller.
+    """
+    mc = _controller()
+    if not mc.roll_to(int(mm), wait=False):
+        return False
+    for (yaw, pitch) in sweep:
+        _head(c, yaw, pitch)
         time.sleep(0.5)
-        st = _rail_status(c)
-        if st.get("crashed"):
+        if mc.is_crashed():
             return False
-        if st.get("moving") is False:
-            return True
-    return True
+    return mc._wait_parked(timeout_s)
 
 
 def _head(c: _McpClient, yaw: int, pitch: int) -> None:
-    c.call(
-        "self.robot.set_head_angles",
-        {"yaw": int(yaw), "pitch": int(pitch), "speed_dps": 0},
-    )
+    # Choreography poses are PHYSICAL servo values -> look_physical (clamped +
+    # gated centrally). This is THE fix: the old call used the device-only
+    # ``self.robot.set_head_angles`` name, which isn't an MCP tool at the
+    # gateway, so head moves silently no-op'd.
+    _controller().look_physical(int(yaw), int(pitch), speed="mid")
 
 
 def _face(c: _McpClient, name: str) -> None:
@@ -268,10 +290,9 @@ _DANCE_YAW = int(os.environ.get("STACKCHAN_DANCE_MAX_YAW", "88"))
 
 
 def _whip(c: "_McpClient", yaw: int, pitch: int) -> None:
-    """A fast head throw — same tool, max speed."""
+    """A fast head throw — physical pose at high speed, via the controller."""
     try:
-        c.call("self.robot.set_head_angles",
-               {"yaw": int(yaw), "pitch": int(pitch), "speed_dps": 400})
+        _controller().look_physical(int(yaw), int(pitch), speed=400)
     except Exception:
         pass
 
