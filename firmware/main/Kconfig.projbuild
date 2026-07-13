@@ -1163,6 +1163,18 @@ config LIGHT_ENABLED
         Expose the LTR-553ALS ambient-light sensor as self.light.read. Init is
         gated on the LTR-553 part-id, so it skips cleanly if not present.
 
+config RADAR_ENABLED
+    bool "HLK-LD2450 radar on Grove Port C (self.presence.read)"
+    default y
+    help
+        Compiles in the HLK-LD2450 24 GHz multi-target radar reader (Grove
+        Port C, UART2 at 256000 baud) and registers the self.presence.read
+        MCP tool. The module streams tracking frames autonomously; a FreeRTOS
+        task decodes them into a latest-snapshot. Safe with no module
+        attached: no valid frame ever arrives, the absence is logged once,
+        and the tool returns ok:false ("no radar frames"). Disable to compile
+        the radar feature out entirely.
+
 endif # BOARD_TYPE_STACKCHAN
 
 endmenu

@@ -82,4 +82,17 @@
 #define SERVO_YAW_ID 1
 #define SERVO_PITCH_ID 2
 
+// Grove Port C (blue HY2.0-4P, UART) — HLK-LD2450 24 GHz presence radar.
+// CoreS3 Port C pin map per the official M5Stack CoreS3 spec ("PORT C
+// (UART)" row: G17=TXD, G18=RXD, board-side naming):
+//   G17 = board TX  -> module RX  (config/command direction, rarely used)
+//   G18 = board RX  <- module TX  (the ~10 Hz tracking-data stream)
+// UART controller budget: UART0 = console, UART1 = SCS0009 servo bus
+// (tx=6/rx=7 above), so the radar takes UART2. The LD2450 factory default
+// framing is 256000 baud 8N1.
+#define RADAR_UART_NUM   UART_NUM_2
+#define PORT_C_TX_PIN    GPIO_NUM_17
+#define PORT_C_RX_PIN    GPIO_NUM_18
+#define RADAR_BAUDRATE   256000
+
 #endif // _BOARD_CONFIG_H_

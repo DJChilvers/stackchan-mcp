@@ -33,6 +33,7 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
 #include "rail_driver.h"
+#include "radar_ld2450.h"
 #if CONFIG_IMU_ENABLED
 // Only used for the 8 KB init blob (bmi270_config_file) and the chip-id /
 // blob-size constants. The component's create API is NOT used: it hardcodes
@@ -903,6 +904,19 @@ private:
     static constexpr int RECOMMENDED_PITCH_MIN = 5;   // M5Stack official docs
     static constexpr int RECOMMENDED_PITCH_MAX = 85;  // M5Stack official docs
 
+    // Yaw limit — widened from the historical ±90 to ±135 (firmware batch
+    // #4). The yaw servo itself is 360°-capable (SCS0009 positional mode
+    // spans 0..300° / 0..1023 units), so the servo imposes no ±90 restriction;
+    // the binding constraint is the HEAD WIRING (display FPC + servo leads
+    // routed through the neck), which makes ±135° the deliberate safe limit
+    // beyond which the harness starts to wind. Enforced at the
+    // self.robot.set_head_angles schema boundary (Property range), matching
+    // the pre-existing yaw contract of schema-level rejection rather than
+    // silent clamping. YawDegToPos() maps ±135 well inside its 0..1000 rail
+    // clamp (see the comment there), so no internal writer path re-narrows it.
+    static constexpr int SAFE_YAW_MIN = -135;
+    static constexpr int SAFE_YAW_MAX = 135;
+
     // Issue #115: boot-time initialization target. Fall-safe neutral pose
     // well clear of both mechanical end-stops, in the centre of the
     // M5Stack-recommended 5..85° pitch range. Design follows the
@@ -976,6 +990,13 @@ private:
     static constexpr int BOOT_INIT_TARGET_DEG_PER_SEC = 15;
 
     static int YawDegToPos(int deg) {
+        // SCS0009 positional range is 0..300° over 0..1023 units
+        // (0.3125°/unit = 16/5 units per degree); this board's yaw midpoint
+        // (head straight ahead) is calibrated at pos=460. The SAFE_YAW range
+        // therefore maps to pos 460±432 = 28..892 — comfortably inside both
+        // the 0..1000 rail clamp below and the servo's 0..1023 addressable
+        // range, so ±135° never hits a rail (the clamp only guards
+        // out-of-contract callers).
         int pos = 460 + deg * 16 / 5;
         if (pos < 0) pos = 0;
         if (pos > 1000) pos = 1000;
@@ -2303,6 +2324,19 @@ private:
         if (e != ESP_OK) { ESP_LOGE(TAG, "Light: enable failed (%s)", esp_err_to_name(e)); return; }
         light_ok_ = true;
         ESP_LOGI(TAG, "Light sensor (LTR-553) enabled");
+    }
+#endif
+
+#if CONFIG_RADAR_ENABLED
+    void InitializeRadar() {
+        // HLK-LD2450 presence radar on Grove Port C (UART2, see config.h for
+        // the pin map). Fully self-contained: installs the UART driver and
+        // starts the frame-reader task. Safe with no module attached — the
+        // reader just never sees a valid frame, logs the absence once, and
+        // self.presence.read reports {ok:false, error:"no radar frames"}.
+        if (!RadarLd2450::GetInstance().Init()) {
+            ESP_LOGW(TAG, "Radar init failed; self.presence.read will report ok:false");
+        }
     }
 #endif
 
@@ -5277,6 +5311,9 @@ private:
 #if CONFIG_RAIL_ENABLED
         RegisterRailMcpTools();   // self.rail.* — ESP-NOW sender to the rail bridge
 #endif
+#if CONFIG_RADAR_ENABLED
+        RegisterRadarMcpTools();  // self.presence.read — HLK-LD2450 on Port C
+#endif
 #if CONFIG_IMU_ENABLED
         mcp_server.AddTool(
             "self.imu.read",
@@ -5507,13 +5544,15 @@ private:
 
         // Set head angles (yaw, pitch in degrees)
         // SCS0009: 1 step = 0.3125 degrees, so 1 degree = 3.2 steps (= 16/5)
-        // yaw: -90..90 degrees (no hardware restriction). pitch: two-tier
-        // guard — see SAFE_PITCH_MIN/MAX (hard clamp for mechanical safety)
-        // and RECOMMENDED_PITCH_MIN/MAX (M5Stack-documented operating sweet
+        // yaw: SAFE_YAW_MIN..SAFE_YAW_MAX (±135; the servo is 360°-capable
+        // but the head wiring makes ±135 the deliberate safe limit — see the
+        // SAFE_YAW_MIN/MAX comment block above). pitch: two-tier guard — see
+        // SAFE_PITCH_MIN/MAX (hard clamp for mechanical safety) and
+        // RECOMMENDED_PITCH_MIN/MAX (M5Stack-documented operating sweet
         // spot) above, plus Issue #80 / #98.
         mcp_server.AddTool(
             "self.robot.set_head_angles",
-            "Set the head angles of the robot. yaw: horizontal (-90 to 90). pitch: vertical. M5Stack-recommended operating range is 5 to 85 degrees per https://docs.m5stack.com/en/StackChan (\"Motion Angle Notice\"). The firmware also accepts values up to 88 degrees (the hard clamp guards against the audible sub-stall observed at pitch=89 on real hardware), but values outside 5-85 degrees are not officially endorsed and may stress the servo over time. Requests below 0 degrees or above 88 degrees are silently clamped with an ESP_LOGW. Optional speed_dps: angular speed in degrees per second. If omitted or zero, the existing duration-based default applies; positive values below 15 dps are clamped to the step-safe floor. See README \"Hardware safety notes\".",
+            "Set the head angles of the robot. yaw: horizontal (-135 to 135; the yaw servo is 360-degree-capable but the head wiring makes +/-135 the deliberate safe limit — requests outside it are rejected at the schema). pitch: vertical. M5Stack-recommended operating range is 5 to 85 degrees per https://docs.m5stack.com/en/StackChan (\"Motion Angle Notice\"). The firmware also accepts values up to 88 degrees (the hard clamp guards against the audible sub-stall observed at pitch=89 on real hardware), but values outside 5-85 degrees are not officially endorsed and may stress the servo over time. Requests below 0 degrees or above 88 degrees are silently clamped with an ESP_LOGW. Optional speed_dps: angular speed in degrees per second. If omitted or zero, the existing duration-based default applies; positive values below 15 dps are clamped to the step-safe floor. See README \"Hardware safety notes\".",
             // Pitch schema range is intentionally permissive across the
             // entire `int` value range (std::numeric_limits<int>::min/max):
             // the authoritative Tier 1 enforcement lives in the handler
@@ -5529,7 +5568,7 @@ private:
             // PR #81's defense-in-depth requirement that every servo-write
             // boundary be guarded inside the firmware regardless of
             // caller behavior.
-            PropertyList({Property("yaw", kPropertyTypeInteger, 0, -90, 90),
+            PropertyList({Property("yaw", kPropertyTypeInteger, 0, SAFE_YAW_MIN, SAFE_YAW_MAX),
                           Property("pitch", kPropertyTypeInteger, 0,
                                    std::numeric_limits<int>::min(),
                                    std::numeric_limits<int>::max()),
@@ -6845,6 +6884,9 @@ public:
 #endif
 #if CONFIG_LIGHT_ENABLED
         InitializeLightSensor();
+#endif
+#if CONFIG_RADAR_ENABLED
+        InitializeRadar();
 #endif
         I2cDetect();
         // Avatar auto-display disabled: WiFi config UI needs to be visible.

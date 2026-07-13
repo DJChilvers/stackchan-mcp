@@ -12,6 +12,7 @@
 
 #include <cstring>
 #include <esp_log.h>
+#include <esp_ota_ops.h>
 #include <cJSON.h>
 #include <driver/gpio.h>
 #include <arpa/inet.h>
@@ -470,6 +471,38 @@ void Application::CheckNewVersion() {
     }
 }
 
+void Application::MarkFirmwareValidOnGatewayConnected() {
+    // Deliberately does NOT go through ota_ (it is reset once activation
+    // completes, and gateway (re)connects keep firing long after that);
+    // mirrors Ota::MarkCurrentVersionValid() with direct esp_ota_ops calls.
+    //
+    // One-shot latch: OnConnected fires on every successful reconnect, but
+    // cancelling rollback is only meaningful once per boot. The latch only
+    // engages on a definitive outcome, so a transient partition-state read
+    // failure retries on the next connect. (No atomics needed: a racing
+    // double-run would just call the idempotent mark-valid twice.)
+    static bool checked = false;
+    if (checked) {
+        return;
+    }
+    auto partition = esp_ota_get_running_partition();
+    if (partition == nullptr || strcmp(partition->label, "factory") == 0) {
+        checked = true;  // factory image: rollback does not apply
+        return;
+    }
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(partition, &state) != ESP_OK) {
+        ESP_LOGW(TAG, "Gateway connected but partition state read failed; will retry on next connect");
+        return;
+    }
+    checked = true;
+    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+        ESP_LOGI(TAG, "Gateway hello completed on partition %s; marking firmware valid (rollback cancelled)",
+                 partition->label);
+        esp_ota_mark_app_valid_cancel_rollback();
+    }
+}
+
 void Application::InitializeProtocol() {
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
@@ -482,6 +515,19 @@ void Application::InitializeProtocol() {
 
     protocol_->OnConnected([this]() {
         DismissAlert();
+        // OTA self-confirm repoint: a freshly OTA'd image must call
+        // esp_ota_mark_app_valid_cancel_rollback() or the bootloader rolls
+        // back to the previous image on the next reboot. The original (and
+        // kept) path does that in CheckNewVersion() only after the upstream
+        // version check against CONFIG_OTA_URL returns 200 — an
+        // internet-dependent signal, so a router blip could silently revert
+        // good firmware. For this fork the real "firmware works" signal is
+        // completing the WebSocket hello with OUR gateway, which is exactly
+        // when this callback fires (websocket_protocol.cc invokes
+        // on_connected_ only after ParseServerHello() accepts the server
+        // hello). Whichever of the two paths runs first wins; both are
+        // idempotent.
+        MarkFirmwareValidOnGatewayConnected();
     });
 
     protocol_->OnNetworkError([this](const std::string& message) {

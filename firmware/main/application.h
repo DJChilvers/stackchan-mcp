@@ -172,6 +172,10 @@ private:
     // Helper methods
     void CheckAssetsVersion();
     void CheckNewVersion();
+    // OTA self-confirm on gateway connect: cancels the OTA rollback watchdog
+    // once the WebSocket hello with our gateway has completed (see the
+    // OnConnected hook in InitializeProtocol()). One-shot per boot.
+    void MarkFirmwareValidOnGatewayConnected();
     void InitializeProtocol();
     void ShowActivationCode(const std::string& code, const std::string& message);
     void SetListeningMode(ListeningMode mode);
