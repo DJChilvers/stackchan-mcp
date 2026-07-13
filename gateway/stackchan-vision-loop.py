@@ -282,6 +282,35 @@ GESTURE_REACTABLE = set(
     ).split(",") if x.strip()
 )
 
+# ── ambient object-location memory (ArUco tool markers) ───────────────────
+# Every ARUCO_EVERY_N-th executed tick, a near-free DICT_4X4_50 pass runs on
+# the SAME frame this tick already captured/decoded for faces. Any marker
+# that's in marker_registry.json (the shared id->name map find_item.py owns)
+# upserts object_locations.json — {name: {station_mm, ts, method,
+# seen_count}} — with the rail carriage's CURRENT station, so Wheatley
+# passively learns where tools live just by looking around, and
+# find_item.py's memory-first lookup becomes a one-move affair. A sighting is
+# only recorded when the rail status is trustworthy (fresh + homed + not
+# mid-move): a location without a reliable station is useless — find_item
+# drives to that number. File formats and the atomic-write convention are
+# find_item.py's; it writes object_locations.json too (last-write-wins is
+# fine for a slow-moving inventory). Kill switch: STACKCHAN_VISION_ARUCO=0.
+ARUCO_ENABLED = os.environ.get("STACKCHAN_VISION_ARUCO", "1").strip().lower() not in ("0", "false", "no", "off")
+ARUCO_EVERY_N = max(1, int(os.environ.get("STACKCHAN_VISION_ARUCO_EVERY_N", "3") or "3"))
+MARKER_REGISTRY_PATH = os.environ.get(
+    "STACKCHAN_MARKER_REGISTRY", r"C:\Users\domin\Documents\StackChan\marker_registry.json"
+)
+OBJECT_LOCATIONS_PATH = os.environ.get(
+    "STACKCHAN_OBJECT_LOCATIONS", r"C:\Users\domin\Documents\StackChan\object_locations.json"
+)
+# Trust the bridge's cached rail status only when it's this fresh — the same
+# 3s bar stackchan-idle.py applies everywhere it acts on pos_mm (`linked`
+# alone just means "ever heard a status this boot").
+ARUCO_RAIL_FRESH_MS = float(os.environ.get("STACKCHAN_VISION_ARUCO_RAIL_FRESH_MS", "3000"))
+# find_item.py's STATION_DEDUPE_MM convention: within this radius it's the
+# "same place" (re-sighting stays silent); beyond it the item MOVED (INFO).
+ARUCO_SAME_STATION_MM = 25.0
+
 # Written every tick — stackchan-idle.py reads this to decide whether to
 # track a face, search for one, or glance toward motion. See the module
 # docstring for why movement lives there and not here.
@@ -1412,6 +1441,165 @@ def _call_arbiter(new_frame_path: str, reference_photo_path: str) -> dict:
         return fail_safe
 
 
+# ─── ambient object-location memory (see ARUCO_* config above) ─────────────
+
+def _load_marker_registry() -> dict:
+    """{marker_id:int -> item name} from the shared marker_registry.json.
+    Same lenient parse as find_item.py's load_registry: string keys that
+    aren't ints ("_readme") are skipped, a bare-string value is a name.
+    Missing/unreadable file -> {} — the pass just has nothing to match."""
+    reg: dict = {}
+    try:
+        with open(MARKER_REGISTRY_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        return reg
+    if not isinstance(raw, dict):
+        return reg
+    for key, val in raw.items():
+        try:
+            mid = int(key)
+        except (TypeError, ValueError):
+            continue  # "_readme" and friends
+        if isinstance(val, str):
+            val = {"name": val}
+        if isinstance(val, dict) and val.get("name"):
+            reg[mid] = str(val["name"])
+    return reg
+
+
+def _detect_aruco_ids(img) -> list[int]:
+    """All DICT_4X4_50 marker ids visible in the frame (sorted). Same 4.7+/
+    legacy API fallback as _detect_marker_rotations / find_item.py. ArUco
+    detection is rotation-invariant, so the oriented frame is fine either
+    way up (find_item runs on the raw frame for the same reason)."""
+    import cv2
+
+    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    try:  # OpenCV >= 4.7 API (this venv has 4.11)
+        detector = cv2.aruco.ArucoDetector(adict, cv2.aruco.DetectorParameters())
+        _corners, ids, _ = detector.detectMarkers(img)
+    except AttributeError:  # older API
+        _corners, ids, _ = cv2.aruco.detectMarkers(img, adict)
+    if ids is None:
+        return []
+    return sorted({int(i) for i in ids.flatten()})
+
+
+def _rail_station_mm(sess: MCPSession) -> float | None:
+    """The rail carriage's current pos_mm, or None unless it's TRUSTWORTHY:
+    status fresh (< ARUCO_RAIL_FRESH_MS), homed (pos is anchored to a real
+    origin), and not mid-move (a gliding carriage would stamp a station the
+    frame wasn't taken at — the head-settle gate only covers the first
+    ~1.2s of a multi-second rail glide). Any failure -> None: better to
+    remember nothing than a station find_item would drive to and miss at.
+    self.rail.status reads the gateway's bridge cache — no device wake."""
+    try:
+        resp = sess.call_tool("self.rail.status", {}, timeout=6)
+        text = (((resp or {}).get("result") or {}).get("content") or [{}])[0].get("text", "{}")
+        st = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(st, dict):
+        return None
+    age = st.get("status_age_ms")
+    pos = st.get("pos_mm")
+    if not isinstance(age, (int, float)) or age > ARUCO_RAIL_FRESH_MS:
+        return None
+    if not st.get("homed") or st.get("moving") is not False:
+        return None
+    if not isinstance(pos, (int, float)):
+        return None
+    return float(pos)
+
+
+def _load_locations() -> dict:
+    """object_locations.json as a dict, {} on any problem — find_item.py's
+    load_locations semantics (a missing file just means no memory yet)."""
+    try:
+        with open(OBJECT_LOCATIONS_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_locations(mem: dict) -> None:
+    """Atomic write (temp + os.replace), same file shape find_item.py writes
+    (indent=2, sorted keys). The temp name is pid-suffixed so a concurrent
+    find_item.py save (fixed ".tmp") can never interleave inside OUR temp
+    file on Windows; whichever os.replace lands last wins — fine for a
+    slow-moving inventory."""
+    tmp = f"{OBJECT_LOCATIONS_PATH}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(mem, f, indent=2, sort_keys=True)
+    os.replace(tmp, OBJECT_LOCATIONS_PATH)
+
+
+def _ambient_marker_pass(sess: MCPSession, img, aruco_state: dict) -> None:
+    """Ambient object-location memory: upsert object_locations.json for every
+    registry-known ArUco marker visible in this tick's frame (see the ARUCO_*
+    config comment). Runs every ARUCO_EVERY_N-th executed tick, and re-checks
+    the busy/head-moved markers at pass time (they can appear mid-tick).
+    Upserts bump seen_count and refresh ts/station/method (find_item.py's
+    remember() semantics, method="ambient"); a NEW or MOVED (>
+    ARUCO_SAME_STATION_MM) item gets one INFO line, same-place re-sightings
+    stay silent. An existing entry's pitch is preserved but never invented —
+    this loop does no servo control (module docstring) so it does not know
+    the head's pitch; find_item defaults a missing pitch to its desk pitch.
+    Never raises — any failure just means no memory update this tick."""
+    if not ARUCO_ENABLED:
+        return
+    try:
+        aruco_state["tick"] = aruco_state.get("tick", 0) + 1
+        if aruco_state["tick"] % ARUCO_EVERY_N:
+            return
+        if _should_skip_tick() or _head_settling():
+            return
+        registry = _load_marker_registry()
+        if not registry:
+            return
+        hits = [(mid, registry[mid]) for mid in _detect_aruco_ids(img) if mid in registry]
+        if not hits:
+            return
+        station = _rail_station_mm(sess)
+        if station is None:
+            return  # no trustworthy station -> nothing worth remembering
+        mem = _load_locations()
+        changed = False
+        for mid, name in hits:
+            key = str(name).strip().lower()
+            if not key or key.startswith("_"):
+                continue  # find_item.py remember() guard
+            old = mem.get(key) if isinstance(mem.get(key), dict) else {}
+            entry = {
+                "station_mm": int(round(station)),
+                "ts": time.time(),
+                "method": "ambient",
+                "seen_count": int(old.get("seen_count", 0) or 0) + 1,
+            }
+            if isinstance(old.get("pitch"), (int, float)):
+                entry["pitch"] = int(old["pitch"])
+            mem[key] = entry
+            changed = True
+            old_station = old.get("station_mm")
+            if not isinstance(old_station, (int, float)):
+                logger.info("ambient: %s spotted at %dmm (marker %d, first sighting)",
+                            key, entry["station_mm"], mid)
+            elif abs(float(old_station) - station) > ARUCO_SAME_STATION_MM:
+                logger.info("ambient: %s moved %dmm -> %dmm (marker %d)",
+                            key, int(old_station), entry["station_mm"], mid)
+        if changed:
+            _save_locations(mem)
+    except Exception:
+        if aruco_state.get("warned"):
+            logger.debug("ambient marker pass failed", exc_info=True)
+        else:
+            aruco_state["warned"] = True
+            logger.warning("ambient marker pass failed (first occurrence — "
+                           "further failures logged at DEBUG)", exc_info=True)
+
+
 # ─── main polling loop ──────────────────────────────────────────────────────
 
 def _tick(
@@ -1421,6 +1609,7 @@ def _tick(
     last_seen_ts: dict, missed_looks: dict, last_encourage: dict,
     object_model, object_last_seen: dict, last_object_comment: list,
     messy_state: dict, gesture_model, gesture_state: dict, guard_state: dict,
+    aruco_state: dict,
 ) -> None:
     """One perception step: capture, detect/classify, write state, maybe react.
 
@@ -1468,6 +1657,11 @@ def _tick(
     # the companion server + idle loop. See SETTINGS_PATH above.
     if _is_upside_down():
         img = cv2.rotate(img, cv2.ROTATE_180)
+
+    # Ambient object-location memory: every Nth tick, a near-free ArUco pass
+    # on this same frame updates the shared object map (never raises — see
+    # _ambient_marker_pass and the ARUCO_* config comment).
+    _ambient_marker_pass(sess, img, aruco_state)
 
     # Local object pass on the SAME oriented frame (no extra capture). Runs
     # every executed tick so novelty tracking (_pick_new_object stamps every
@@ -1740,15 +1934,20 @@ def _loop(once: bool) -> None:
         "challenges": 0,
         "last_challenge_ts": 0.0,
     }
+    # Ambient ArUco object-location memory: executed-tick counter (the pass
+    # runs every ARUCO_EVERY_N-th) + one-shot failure-warned flag.
+    aruco_state: dict = {"tick": 0}
     logger.info(
         "starting vision loop (poll=%.0fs unknown_cooldown=%.0fs absence_greet=%.0fs "
         "encourage=%.0fs objects=%s obj_cooldown=%.0fs clutter=%s edge_thr=%.3f "
-        "gestures=%s guard=%s(away=%.0fs cd=%.0fs) threshold=%.3f uncertain=%.2f-%.2f)",
+        "gestures=%s guard=%s(away=%.0fs cd=%.0fs) aruco=%s(every_n=%d) "
+        "threshold=%.3f uncertain=%.2f-%.2f)",
         POLL_INTERVAL_S, COOLDOWN_S, ABSENCE_GREET_S, ENCOURAGE_COOLDOWN_S,
         object_model is not None, OBJECT_COOLDOWN_S,
         CLUTTER_ENABLED and object_model is not None, CLUTTER_EDGE_THRESHOLD,
         gesture_model is not None,
         GUARD_ENABLED, GUARD_OWNER_AWAY_S, GUARD_COOLDOWN_S,
+        ARUCO_ENABLED, ARUCO_EVERY_N,
         MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
     )
     # Boot-time orientation auto-detect: figure out which way up he is now
@@ -1778,6 +1977,7 @@ def _loop(once: bool) -> None:
                 last_seen_ts, missed_looks, last_encourage,
                 object_model, object_last_seen, last_object_comment,
                 messy_state, gesture_model, gesture_state, guard_state,
+                aruco_state,
             )
         except Exception:
             logger.exception("tick failed")
