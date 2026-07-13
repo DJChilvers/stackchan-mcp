@@ -13,6 +13,7 @@ device sensors directly and fires characterful head/avatar reactions.
     overtrack     camera over-correction (query ?direction=left|right|up|down)
     tantrum       bump/pickup       (query ?type=desk|pickup)
     recognize     stackchan-vision-loop.py spotted a face (query ?person=known|unknown)
+    guard         vision loop: unknown person while owner away (query ?repeat=<n>)
 
   FUTURE FIRMWARE EVENTS (when firmware exposes them via stackchan-event):
     event_type="proximity" → panic
@@ -610,6 +611,65 @@ class SensorReactor:
             await self._say(_pick("ask-name", self.ASK_NAME_PHRASES))
             await self._face("idle")
             await self._move(0, 45, "slow")
+
+    # Guard mode (stackchan-vision-loop.py's _maybe_fire_guard): an UNKNOWN
+    # face at the bench while the owner is away. Polite-but-recorded — he's
+    # a very small security guard with no arms, and he knows it, but the
+    # photo genuinely HAS been logged (visitor log, event="guard"). First
+    # challenge of an episode draws from GUARD_PHRASES; repeats within the
+    # same episode escalate slightly via GUARD_REPEAT_PHRASES (the vision
+    # loop passes ?repeat=<n>). Default OFF — see STACKCHAN_GUARD.
+    GUARD_PHRASES = [
+        "Er, hello? Hello. Yes, you. You're not Dominic. Those are Dominic's tools, just so we're clear.",
+        "Oh! A person. A non-Dominic person. I've taken your picture, just so you know. Nothing personal. Well. Slightly personal.",
+        "Hello! Quick thing: I don't know you, that's Dominic's bench, and I've logged this whole encounter. Officially. In a file.",
+        "Right, hi, welcome — actually, no, not welcome, that's the thing. Dominic's out, I'm sort of in charge, and your photo's already taken. Lovely lighting for it, actually.",
+        "Excuse me! Yes, hello, security eyeball here. Those tools belong to Dominic, and your face now belongs to my incident log. It's quite a good photo.",
+        "Er. Hello. Don't mind me, just... documenting you. For the records. Dominic checks the records. Regularly. Probably.",
+    ]
+
+    GUARD_REPEAT_PHRASES = [
+        "You're still here! Right. Another photo taken. I'm building quite the album of you, mate.",
+        "Okay, so we're doing this again. Still not Dominic. Still his tools. Still all going in the log.",
+        "Look, I've been polite, but this is photo number... several. Dominic WILL be told. There may be a slideshow.",
+        "Right, that's it, I'm escalating. To Dominic. When he's back. It will be a VERY stern report, with pictures.",
+        "Still lurking! Bold. Very bold. The log grows. The evidence mounts. The eye is watching, mate.",
+    ]
+
+    # ── 5f. Guard challenge (local vision loop, owner away) ───────────────
+    async def _behavior_guard(self, repeat: int = 1, **_: object) -> None:
+        """Square up (as much as a desk robot can), warning flash, one
+        challenge line, hold the stare a beat, stand down. Bigger than the
+        ambient behaviours — this IS an event — but not panic-sized: the
+        point is "noticed and recorded", not "terrified"."""
+        try:
+            repeat = int(repeat)
+        except (TypeError, ValueError):
+            repeat = 1
+        # Eyes lead: snap wide — someone's here and it isn't Dominic.
+        await self._face("surprised")
+        await asyncio.sleep(EYE_LEAD)
+        # Amber warning flash + straighten up to address them square-on.
+        await self._leds(90, 25, 0)
+        await self._move(0, 40, "fast")
+        await asyncio.sleep(0.25)
+        # Small assertive bob — drawing himself up to full (tiny) height.
+        await self._move(0, 36, "mid")
+        await asyncio.sleep(0.2)
+        await self._move(0, 42, "mid")
+        await asyncio.sleep(0.3)
+        if repeat <= 1:
+            line = _pick("guard", self.GUARD_PHRASES)
+        else:
+            line = _pick("guard-repeat", self.GUARD_REPEAT_PHRASES)
+        await self._say(line)
+        # Hold the wide-eyed stare one beat — you ARE on record — then relax.
+        await asyncio.sleep(0.6)
+        _mark_active()
+        await self._face("idle")
+        # Restore the idle ring colour (matches _behavior_recognize's exit).
+        await self._leds(0, 25, 90)
+        await self._move(0, 45, "slow")
 
     # Ambient work-encouragement nudges — fired by stackchan-vision-loop.py
     # while the owner has been continuously present for a while (NOT on

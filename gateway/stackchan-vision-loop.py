@@ -418,6 +418,31 @@ LEARN_SAMPLE_CAP = int(os.environ.get("STACKCHAN_VISION_LEARN_SAMPLE_CAP", "8"))
 # stackchan-voice-bridge.py checks this on the next tap-to-talk answer.
 PENDING_LEARN_CONFIRM_MARKER = os.path.join(TEMP, "stackchan-pending-learn-confirm")
 
+# ── guard mode: challenge unknown people while the owner is away ───────────
+# When an UNKNOWN face turns up AND the owner is absent (no known-face
+# sighting AND no keyboard/mouse input for GUARD_OWNER_AWAY_S), Wheatley
+# challenges them (sensor_reactor's _behavior_guard via /react/guard), saves
+# the full frame, and appends a reviewable entry to the visitor log
+# (stackchan_mcp/visitor_log.py — event="guard", note, full-frame photo).
+# DEFAULT OFF — guests shouldn't get challenged before the user opts in.
+# Enable with STACKCHAN_GUARD=1 (gateway/.env or the loop's environment).
+# Busy/voice-chat ticks are skipped wholesale by _should_skip_tick, so a
+# challenge can never talk over an active conversation by construction.
+GUARD_ENABLED = os.environ.get("STACKCHAN_GUARD", "0").strip().lower() not in ("0", "false", "no", "off")
+# The owner counts as AWAY only when BOTH signals agree for this long: the
+# camera hasn't seen a known face, and the keyboard/mouse have been idle
+# (GetLastInputInfo — the same "human at the computer" signal the absence
+# greeting uses, so low light alone can't fake a departure).
+GUARD_OWNER_AWAY_S = float(os.environ.get("STACKCHAN_GUARD_OWNER_AWAY_S", "300"))
+# At most one challenge per this many seconds (global, so rapid episode
+# churn can't machine-gun a visitor). Repeats within one episode escalate
+# the phrasing (see sensor_reactor.GUARD_REPEAT_PHRASES).
+GUARD_COOLDOWN_S = float(os.environ.get("STACKCHAN_GUARD_COOLDOWN_S", "120"))
+# An episode (and its phrase escalation counter) resets once NO person has
+# been visible for this long; a known face ends it immediately.
+GUARD_EPISODE_RESET_S = float(os.environ.get("STACKCHAN_GUARD_EPISODE_RESET_S", "60"))
+GUARD_REACT_URL = f"http://127.0.0.1:{CAPTURE_PORT}/react/guard"
+
 # Shared with the idle loop / led-chase / voice bridge — skip a tick rather
 # than fight Claude Code's active work or an in-progress voice exchange.
 BUSY_MARKER = os.path.join(TEMP, "stackchan-busy")
@@ -771,6 +796,111 @@ def _log_visitor_safe(recognizer, img, face, name, known, score) -> None:
         visitor_log.append(name, known, float(score), thumb)
     except Exception:
         logger.debug("visitor log append failed", exc_info=True)
+
+
+# ─── guard mode (see GUARD_* config above) ──────────────────────────────────
+
+def _guard_note_tick(guard_state: dict, now: float,
+                     person_visible: bool, known_seen: bool) -> None:
+    """Per-tick guard bookkeeping, called on every EXECUTED tick (skipped
+    busy/paused ticks bump nothing, same reasoning as _note_look).
+
+    `person_visible` = any face OR a YOLO 'person' box this tick — keeps the
+    episode alive while someone is demonstrably still at the bench even if
+    their face turns away. `known_seen` = an enrolled face was recognized,
+    which both refreshes the owner-presence clock and ends any active
+    episode immediately (the owner returning stands the guard down)."""
+    if person_visible:
+        guard_state["last_person_seen_ts"] = now
+    if known_seen:
+        guard_state["last_known_seen_ts"] = now
+        if guard_state["episode_active"]:
+            logger.info("guard: known face seen — standing down (episode over)")
+        guard_state["episode_active"] = False
+        guard_state["challenges"] = 0
+    elif (
+        guard_state["episode_active"]
+        and now - guard_state["last_person_seen_ts"] >= GUARD_EPISODE_RESET_S
+    ):
+        logger.info(
+            "guard: nobody visible for %.0fs — episode reset", GUARD_EPISODE_RESET_S
+        )
+        guard_state["episode_active"] = False
+        guard_state["challenges"] = 0
+
+
+def _guard_owner_away(guard_state: dict, now: float) -> bool:
+    """True when the owner reads as ABSENT: no known-face sighting AND no
+    keyboard/mouse input for GUARD_OWNER_AWAY_S. Input reading failing
+    (non-Windows/API error) counts as no input evidence — same 'can't prove
+    presence' semantics as _user_present_hint, erring here toward the
+    challenge only because the known-face clock must ALSO agree."""
+    if now - guard_state["last_known_seen_ts"] < GUARD_OWNER_AWAY_S:
+        return False
+    idle = _seconds_since_user_input()
+    if idle is not None and idle < GUARD_OWNER_AWAY_S:
+        return False
+    return True
+
+
+def _fire_guard(repeat: int) -> None:
+    url = GUARD_REACT_URL + (f"?repeat={repeat}" if repeat > 1 else "")
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            logger.info("fired react/guard repeat=%d -> %s", repeat, resp.status)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 409:
+            logger.info("react/guard skipped (reactor busy)")
+        else:
+            logger.warning("react/guard failed: HTTP %s", exc.code)
+    except Exception:
+        logger.exception("react/guard failed")
+
+
+def _maybe_fire_guard(guard_state: dict, recognizer, img, face,
+                      score: float, now: float) -> bool:
+    """Fire one guard challenge if the per-challenge cooldown allows.
+
+    Caller has already established: guard enabled, unknown face in frame,
+    owner away (_guard_owner_away). This function owns the cooldown, the
+    episode escalation counter, the evidence (full oriented frame + aligned
+    face crop into the visitor log, event="guard" + note) and the
+    /react/guard trigger. Evidence failures never block the spoken
+    challenge — the deterrent matters more than the paperwork."""
+    if now - guard_state["last_challenge_ts"] < GUARD_COOLDOWN_S:
+        return False
+    guard_state["episode_active"] = True
+    guard_state["challenges"] += 1
+    guard_state["last_challenge_ts"] = now
+    challenge_n = guard_state["challenges"]
+    away_for = now - guard_state["last_known_seen_ts"]
+    try:
+        import cv2
+        from stackchan_mcp import visitor_log
+
+        ok_full, full_buf = cv2.imencode(".jpg", img)
+        crop = recognizer.alignCrop(img, face)
+        ok_thumb, thumb_buf = cv2.imencode(".jpg", crop)
+        note = (
+            f"guard challenge #{challenge_n}: unknown person at the bench, "
+            f"owner unseen for {away_for / 60.0:.0f} min"
+        )
+        entry = visitor_log.append(
+            None, False, float(score),
+            thumb_buf.tobytes() if ok_thumb else None,
+            event="guard",
+            note=note,
+            photo_jpeg=full_buf.tobytes() if ok_full else None,
+        )
+        logger.info(
+            "guard: challenge #%d (owner unseen %.0fs) — logged entry id=%s photo=%s",
+            challenge_n, away_for,
+            (entry or {}).get("id"), (entry or {}).get("photo"),
+        )
+    except Exception:
+        logger.exception("guard: evidence capture/log failed (still challenging)")
+    _fire_guard(challenge_n)
+    return True
 
 
 def _write_vision_state(
@@ -1290,7 +1420,7 @@ def _tick(
     brightness_history: list, last_lights_out_ts: dict,
     last_seen_ts: dict, missed_looks: dict, last_encourage: dict,
     object_model, object_last_seen: dict, last_object_comment: list,
-    messy_state: dict, gesture_model, gesture_state: dict,
+    messy_state: dict, gesture_model, gesture_state: dict, guard_state: dict,
 ) -> None:
     """One perception step: capture, detect/classify, write state, maybe react.
 
@@ -1399,6 +1529,11 @@ def _tick(
             " (present: recent input/motion — not counting absence)" if present_hint else "",
         )
         _note_look(None, last_seen_ts, missed_looks, suppress_absence=present_hint)
+        # Guard bookkeeping still runs on face-less ticks: a YOLO 'person'
+        # box keeps an episode alive (face turned away ≠ gone); a genuinely
+        # empty bench lets the 60s episode reset tick down.
+        _guard_note_tick(guard_state, obj_now, person_visible=person_present,
+                         known_seen=False)
         _write_vision_state(False, None, None, 0.0, 0.0, motion_detected, present=user_present)
         # Nobody's here to greet, but a new object / a fridge-hallucination /
         # a cluttered desk still earns a remark — unless a gesture already
@@ -1471,6 +1606,12 @@ def _tick(
     now = time.time()
     reacted = False
     absent_for = 0.0
+    # Guard bookkeeping: any face this tick = a person is visible; a "known"
+    # match refreshes the owner clock and stands down any active episode.
+    # (The arbiter's stay-quiet verdict — person None — still counts as a
+    # person being visible, just not a known one.)
+    _guard_note_tick(guard_state, now, person_visible=True,
+                     known_seen=(person == "known"))
     if person == "known" and key:
         absent_for = now - last_seen_ts.get(key, now)
         # Greet on FIRST sight since process start, or on return from a real
@@ -1493,7 +1634,20 @@ def _tick(
         suppress_absence=(person != "known" and present_hint),
     )
 
-    if key and should_react:
+    # Guard mode: an unknown face while the owner is away gets the challenge
+    # (photo + visitor-log entry + /react/guard) INSTEAD of the friendly
+    # who-are-you ask below — and while owner-away holds, guard OWNS the
+    # unknown-face interaction entirely, so a cooldown-blocked challenge
+    # doesn't fall through to a chummy "tap the screen and introduce
+    # yourself" mid-episode. Busy/voice-chat ticks never get this far
+    # (_should_skip_tick), so a challenge can't interrupt a conversation.
+    guard_owns_unknown = False
+    if GUARD_ENABLED and person == "unknown" and _guard_owner_away(guard_state, now):
+        guard_owns_unknown = True
+        if _maybe_fire_guard(guard_state, recognizer, img, face, score, now):
+            reacted = True
+
+    if key and should_react and not guard_owns_unknown:
         last_reaction_ts[key] = now
         logger.info(
             "face detected: person=%s key=%s score=%.3f absent_for=%.0fs",
@@ -1576,14 +1730,25 @@ def _loop(once: bool) -> None:
         "ts": time.time(),
         "gap": ENCOURAGE_COOLDOWN_S * random.uniform(1.0, 1.5),
     }
+    # Guard mode state. last_known_seen_ts starts at PROCESS START —
+    # conservatively "the owner might have just been here" — so a fresh boot
+    # can never challenge anyone during its first GUARD_OWNER_AWAY_S window.
+    guard_state: dict = {
+        "last_known_seen_ts": time.time(),
+        "last_person_seen_ts": 0.0,
+        "episode_active": False,
+        "challenges": 0,
+        "last_challenge_ts": 0.0,
+    }
     logger.info(
         "starting vision loop (poll=%.0fs unknown_cooldown=%.0fs absence_greet=%.0fs "
         "encourage=%.0fs objects=%s obj_cooldown=%.0fs clutter=%s edge_thr=%.3f "
-        "gestures=%s threshold=%.3f uncertain=%.2f-%.2f)",
+        "gestures=%s guard=%s(away=%.0fs cd=%.0fs) threshold=%.3f uncertain=%.2f-%.2f)",
         POLL_INTERVAL_S, COOLDOWN_S, ABSENCE_GREET_S, ENCOURAGE_COOLDOWN_S,
         object_model is not None, OBJECT_COOLDOWN_S,
         CLUTTER_ENABLED and object_model is not None, CLUTTER_EDGE_THRESHOLD,
         gesture_model is not None,
+        GUARD_ENABLED, GUARD_OWNER_AWAY_S, GUARD_COOLDOWN_S,
         MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
     )
     # Boot-time orientation auto-detect: figure out which way up he is now
@@ -1612,7 +1777,7 @@ def _loop(once: bool) -> None:
                 prev_small_box, brightness_history, last_lights_out_ts,
                 last_seen_ts, missed_looks, last_encourage,
                 object_model, object_last_seen, last_object_comment,
-                messy_state, gesture_model, gesture_state,
+                messy_state, gesture_model, gesture_state, guard_state,
             )
         except Exception:
             logger.exception("tick failed")
