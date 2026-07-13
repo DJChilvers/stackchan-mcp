@@ -292,6 +292,54 @@ async def handle_avatar_set_fetch(request: web.Request) -> web.Response:
     )
 
 
+# OTA firmware serving: read-only, single-file endpoint used by
+# Documents/StackChan/ota_update.py. The ESP32's Ota::Upgrade()
+# (firmware/main/ota.cc) fetches the image with a bare GET — no
+# Authorization header can be attached — so this endpoint is
+# deliberately unauthenticated. It can only ever serve the one file
+# configured via STACKCHAN_FIRMWARE_BIN (no user-supplied path is
+# joined into the filesystem, so traversal is impossible by
+# construction), and the path is resolved at request time so a fresh
+# build is picked up without a gateway restart.
+#
+# The device-side fetch requires HTTP 200 plus a non-zero
+# Content-Length (it aborts on chunked responses without one);
+# aiohttp's FileResponse supplies both.
+FIRMWARE_BIN_ENV = "STACKCHAN_FIRMWARE_BIN"
+FIRMWARE_BIN_DEFAULT = r"D:\wheatley\build\xiaozhi.bin"
+
+
+def _firmware_bin_path() -> str:
+    return os.getenv(FIRMWARE_BIN_ENV, "") or FIRMWARE_BIN_DEFAULT
+
+
+async def handle_firmware_fetch(request: web.Request) -> web.StreamResponse:
+    """Serve the staged OTA firmware image (``GET /firmware/{name}``).
+
+    ``{name}`` must equal the basename of the configured image, e.g.
+    ``GET /firmware/xiaozhi.bin`` for the default path. Anything else
+    is a 404 — the endpoint only exposes that single file.
+    """
+    path = _firmware_bin_path()
+    name = request.match_info.get("name", "")
+    if not name or name != os.path.basename(path):
+        return web.Response(status=404, text="unknown firmware file")
+    if not os.path.isfile(path):
+        logger.warning("Firmware fetch: staged image missing: %s", path)
+        return web.Response(status=404, text="firmware image not staged")
+
+    logger.info(
+        "Serving firmware image %s (%d bytes) to %s",
+        path,
+        os.path.getsize(path),
+        request.remote,
+    )
+    return web.FileResponse(
+        path,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+
+
 async def _pcm_chunks_from_request(
     request: web.Request,
 ) -> AsyncIterator[bytes]:
@@ -514,6 +562,7 @@ def create_capture_app(
     app[GATEWAY_KEY] = gateway
     app.router.add_post("/capture", handle_capture)
     app.router.add_get("/avatar_set/{short_id}", handle_avatar_set_fetch)
+    app.router.add_get("/firmware/{name}", handle_firmware_fetch)
     app.router.add_post("/pcm", handle_pcm)
     app.router.add_post("/react/{behavior}", handle_react)
     app.router.add_get("/react/{behavior}", handle_react)

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -260,6 +261,21 @@ def try_start_dance(*, intro: bool = False, start_delay_s: float = 0.0) -> str:
     return "started"
 
 
+# Max yaw amplitude for the whips/spin-gag. Firmware currently clamps yaw to
+# +/-90; the yaw-unlock flash raises that to +/-135 — bump the env then
+# (STACKCHAN_DANCE_MAX_YAW=130) and the choreography grows into it.
+_DANCE_YAW = int(os.environ.get("STACKCHAN_DANCE_MAX_YAW", "88"))
+
+
+def _whip(c: "_McpClient", yaw: int, pitch: int) -> None:
+    """A fast head throw — same tool, max speed."""
+    try:
+        c.call("self.robot.set_head_angles",
+               {"yaw": int(yaw), "pitch": int(pitch), "speed_dps": 400})
+    except Exception:
+        pass
+
+
 def _dance_worker(intro: bool, start_delay_s: float) -> None:
     global _dancing
     c: _McpClient | None = None
@@ -282,25 +298,38 @@ def _dance_worker(intro: bool, start_delay_s: float) -> None:
 
         logger.info("rail_dance: taking the stage")
         _face(c, "happy")
-        # Warm-up head wiggle while still parked (feedback: more head).
-        _head(c, -30, 50)
-        time.sleep(0.4)
-        _head(c, 30, 50)
-        time.sleep(0.4)
-        _head(c, 0, 45)
+        Y = _DANCE_YAW
+        # Warm-up: three fast full whips while still parked (v2: BIG head).
+        for wy in (-Y, Y, -Y):
+            _whip(c, wy, 50)
+            time.sleep(0.35)
+        _whip(c, 0, 45)
         if not _move(c, 250):
             raise RuntimeError("rail crashed during opening glide")
 
         logger.info("rail_dance: shimmy")
         _say(c, "And a one, and a two...")
-        # Nudge + big yaw swing + a bob (dip then up) between every nudge.
-        for delta, yaw in ((60, -30), (-60, 30), (45, -25), (-45, 25),
-                           (30, -20), (-30, 20)):
+        # Nudge + FULL yaw throw + a deep bob between every nudge (v2 tempo).
+        for delta, yaw in ((60, -Y), (-60, Y), (45, -(Y - 15)), (-45, Y - 15),
+                           (30, -(Y - 30)), (-30, Y - 30)):
             c.call("self.rail.nudge_mm", {"mm": delta})
-            _head(c, yaw, 32)          # swing across + dip
-            time.sleep(0.55)
-            _head(c, yaw, 55)          # bob back up
-            time.sleep(0.55)
+            _whip(c, yaw, 25)          # throw across + deep dip
+            time.sleep(0.4)
+            _whip(c, yaw, 60)          # bob right back up
+            time.sleep(0.4)
+
+        # The spin gag: he TRIES to spin — three violent alternating whips —
+        # then admits the neck only goes so far. Peak Wheatley.
+        logger.info("rail_dance: spin attempt")
+        _say(c, "Right — SPIN! Spinning! Here we go!")
+        for wy in (-Y, Y, -Y, Y):
+            _whip(c, wy, 45)
+            time.sleep(0.32)
+        _whip(c, 0, 45)
+        _face(c, "sad")
+        _say(c, "...Nope. That's the whole neck. That's all of it.")
+        time.sleep(0.6)
+        _face(c, "happy")
 
         logger.info("rail_dance: the big glide")
         _say(c, "Daaa, da-da-daaaa! I'm a robot on raaails!")
@@ -308,12 +337,12 @@ def _dance_worker(intro: bool, start_delay_s: float) -> None:
         if not _move_with_sweep(c, 520,
                                 sweep=((-45, 50), (45, 40), (-30, 55), (30, 45))):
             raise RuntimeError("rail crashed during big glide")
-        # Brief full-tilt flourish (+/-60 is the "briefly" ceiling).
-        _head(c, -60, 50)
-        time.sleep(0.45)
-        _head(c, 60, 50)
-        time.sleep(0.45)
-        _head(c, 0, 45)
+        # Full-tilt flourish at max amplitude.
+        _whip(c, -_DANCE_YAW, 50)
+        time.sleep(0.4)
+        _whip(c, _DANCE_YAW, 50)
+        time.sleep(0.4)
+        _whip(c, 0, 45)
 
         logger.info("rail_dance: glide home-ish")
         if not _move_with_sweep(c, 280, sweep=((25, 55), (-25, 35), (15, 50))):

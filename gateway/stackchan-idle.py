@@ -1115,6 +1115,41 @@ def _check_listen_perk(session, pose) -> None:
         pose.update(y=ry, p=rp)
 
 
+# ── idle return-to-dock ──────────────────────────────────────────────────────
+# The dock is his armchair (user 2026-07-13: "we should be going back to dock,
+# not turning off, when idle"): after RETURN_S of genuine quiet — no face, no
+# recent input, no chat — he takes himself home to the charge rails instead of
+# loitering mid-rail. Battery dock-at-30% still covers the hungry case; this
+# covers the bored case. Silent trundle (the charging line fires by itself if
+# the 5V greets him).
+RETURN_TO_DOCK_AFTER_S = float(os.environ.get("STACKCHAN_IDLE_DOCK_RETURN_S", str(15 * 60)))
+
+
+def _check_return_to_dock(session, pose) -> None:
+    if not (DOCK_ENABLED and RETURN_TO_DOCK_AFTER_S > 0):
+        return
+    now = time.time()
+    if now - pose.get("last_dock_return_ts", 0) < RETURN_TO_DOCK_AFTER_S:
+        return
+    if pose.get("on_rail") is False or pose.get("last_known_charging"):
+        return
+    if now - pose.get("last_face_seen_ts", now) < RETURN_TO_DOCK_AFTER_S:
+        return
+    if seconds_since_activity() < RETURN_TO_DOCK_AFTER_S or is_busy():
+        return
+    st = session.rail_status() or {}
+    age = st.get("status_age_ms")
+    if not (isinstance(age, (int, float)) and age < 3000):
+        return
+    if not st.get("homed") or st.get("crashed") or st.get("moving"):
+        return
+    pos = st.get("pos_mm")
+    if not isinstance(pos, (int, float)) or pos < 60:
+        return                      # already home-ish
+    pose["last_dock_return_ts"] = now
+    session.rail_home()
+
+
 def _check_battery(session, pose) -> None:
     """Polled on its own interval (BATTERY_CHECK_INTERVAL_S), independent
     of the wander() cadence/busy gating — see the constants above for why.
@@ -1544,6 +1579,7 @@ def main():
             _check_battery(session, pose)
             _check_orientation(session, pose)
             _check_listen_perk(session, pose)
+            _check_return_to_dock(session, pose)
         except Exception:
             have_session = False
 

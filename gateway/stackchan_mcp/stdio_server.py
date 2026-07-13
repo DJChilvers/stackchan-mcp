@@ -766,6 +766,28 @@ async def _dispatch_mcp_tool(
             "self.wifi.set_power_save",
             arguments,
         ),
+        # OTA maintenance pass-throughs, used by Documents/StackChan/
+        # ota_update.py. Both map to firmware "user-only" MCP tools:
+        # hidden from the device's default tools/list, but the firmware's
+        # DoToolCall searches the full tool vector, so calling them by
+        # name works. They are deliberately NOT advertised in this
+        # gateway's list_tools() either — a reflash tool should not be
+        # discoverable by ordinary MCP clients, only callable by an
+        # operator who already knows its name.
+        "self.get_system_info": (
+            "self.get_system_info",
+            {},
+        ),
+        # upgrade_firmware {"url": ...} returns true immediately; the
+        # device downloads/flashes asynchronously, then reboots (the
+        # WebSocket drops and re-establishes). Progress is only visible
+        # on the device screen. Rollback: sdkconfig has
+        # CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y, so a bad image that
+        # crashes on boot auto-reverts to the previous OTA slot.
+        "self.upgrade_firmware": (
+            "self.upgrade_firmware",
+            arguments,
+        ),
     }
 
     if name not in tool_map:
