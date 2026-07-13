@@ -77,6 +77,12 @@ NEEDS_ATTENTION_MARKER = os.path.join(TEMP, "stackchan-needs-attention")
 # user actually deals with it, but must still self-heal if orphaned.
 BUSY_STALE_S = 30 * 60
 THINKING_STALE_S = 90
+# The gateway's stackchan-busy-devicechat (device mid voice-chat turn) is
+# refreshed every ~15s while live, so it gets a tight 120s window instead
+# of the 30-minute Claude Code one — an older copy is an orphan from a
+# killed gateway and must not keep the chase animating.
+DEVICECHAT_MARKER_NAME = "stackchan-busy-devicechat"
+DEVICECHAT_STALE_S = 120.0
 NEEDS_ATTENTION_STALE_S = 60 * 60
 
 NUM_LEDS = 12
@@ -119,7 +125,12 @@ def _any_busy() -> bool:
     marker. One marker file per session_id — see module docstring."""
     any_active = False
     for path in glob.glob(BUSY_MARKER_GLOB):
-        if _marker_active(path, BUSY_STALE_S):
+        stale_s = (
+            DEVICECHAT_STALE_S
+            if os.path.basename(path) == DEVICECHAT_MARKER_NAME
+            else BUSY_STALE_S
+        )
+        if _marker_active(path, stale_s):
             any_active = True
         # _marker_active already self-heals (deletes) stale ones as it goes
     return any_active

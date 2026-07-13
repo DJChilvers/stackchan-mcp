@@ -423,6 +423,12 @@ async def listen_and_transcribe(
                 try:
                     await gateway.esp32.send_listen_state("start", mode="manual")
                     listen_start_sent = True
+                    # Voice-chat busy marker for the background loops
+                    # (idle wander / vision / LED chase): an MCP-driven
+                    # listen() is a real voice-capture turn, unlike the
+                    # sensor reactor's 0.2s ambient probes — hence noted
+                    # here rather than inside send_listen_state itself.
+                    gateway.esp32.note_chat_listen_start()
                 except ConnectionError as exc:
                     raise RuntimeError(
                         f"Device disconnected before listen.start: {exc}"
@@ -470,6 +476,12 @@ async def listen_and_transcribe(
                         logger.warning(
                             "best-effort listen.stop failed: %s", exc
                         )
+                    # End of the capture window; the marker lingers to
+                    # cover the STT -> LLM thinking gap and is refreshed
+                    # again when the reply's TTS starts. Sync call, so
+                    # cancellation unwinding cannot skip it once the
+                    # start was noted.
+                    gateway.esp32.note_chat_listen_stop()
                 frames = stop_recording()
 
             frame_count = len(frames)

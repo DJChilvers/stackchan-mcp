@@ -895,3 +895,16 @@ class SensorReactor:
         await self._say(_pick("lights-out", self.LIGHTS_OUT_PHRASES))
         await self._face("idle")
         await self._move(0, 45, "slow")
+
+    # ── 7. Rail Dance (companion app / /react/dance) ──────────────────────
+    async def _behavior_dance(self, **_: object) -> None:
+        """Kick off the rail dance on its own daemon thread (see
+        stackchan_mcp/rail_dance.py). try_start_dance() only does a quick
+        rail-status check before spawning, so the behaviour lock releases
+        almost immediately; the dance module's own single-flight flag
+        prevents overlapping dances."""
+        from .rail_dance import try_start_dance
+        outcome = await asyncio.to_thread(try_start_dance, intro=True)
+        logger.info("SensorReactor: dance trigger -> %s", outcome)
+        if outcome == "not_ready":
+            await self._say("I would, but the rail's not feeling it right now.")

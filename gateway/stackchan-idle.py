@@ -98,6 +98,14 @@ _TEMP = os.environ.get("TEMP", os.environ.get("TMP", "."))
 BUSY_MARKER_GLOB = os.path.join(_TEMP, "stackchan-busy-*")
 NEEDS_ATTENTION_MARKER = os.path.join(_TEMP, "stackchan-needs-attention")
 BUSY_STALE_S = 30 * 60
+# 2026-07-12: the gateway writes stackchan-busy-devicechat while the device
+# is in a voice-chat turn (wake-word/tap-to-talk listening, thinking, TTS)
+# and REFRESHES it every ~15s for as long as the turn is live, so a much
+# tighter staleness applies to that one: anything older than 120s is an
+# orphan (gateway killed mid-turn) and must not freeze wander for the full
+# 30-minute Claude Code window.
+DEVICECHAT_MARKER_NAME = "stackchan-busy-devicechat"
+DEVICECHAT_STALE_S = 120.0
 NEEDS_ATTENTION_STALE_S = 60 * 60
 # Set by stackchan-vision-loop.py while its boot orientation sweep is moving
 # the head — hold still so we don't fight it for the servo.
@@ -449,7 +457,15 @@ def is_busy() -> bool:
         try:
             with open(path) as f:
                 age = time.time() - float(f.read().strip())
-            if age < BUSY_STALE_S:
+            # Gateway-refreshed voice-turn marker gets the tight window;
+            # Claude Code session markers (written once per turn) keep
+            # the wide one. See DEVICECHAT_STALE_S comment.
+            stale_s = (
+                DEVICECHAT_STALE_S
+                if os.path.basename(path) == DEVICECHAT_MARKER_NAME
+                else BUSY_STALE_S
+            )
+            if age < stale_s:
                 return True
         except Exception:
             continue
@@ -931,7 +947,7 @@ CHARGING_RECONNECTED_PHRASES = [
 # the pins the PMIC flips to charging and the existing CHARGING_RECONNECTED
 # line fires by itself.
 DOCK_ENABLED = os.environ.get("STACKCHAN_IDLE_DOCK", "1") != "0"
-DOCK_AT_LEVEL = int(os.environ.get("STACKCHAN_IDLE_DOCK_AT_LEVEL", "25"))
+DOCK_AT_LEVEL = int(os.environ.get("STACKCHAN_IDLE_DOCK_AT_LEVEL", "30"))  # 25->30 2026-07-12: PS_NONE drains faster + WiFi roams blind the loop; dock earlier
 DOCK_RETRY_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_DOCK_RETRY_COOLDOWN_S", str(10 * 60)))
 RAIL_WANDER_MIN_LEVEL = int(os.environ.get("STACKCHAN_IDLE_RAIL_WANDER_MIN_LEVEL", "40"))
 
@@ -1040,7 +1056,25 @@ def _check_orientation(session, pose) -> None:
     r = session.imu_read()
     if not r or not r.get("ok"):
         return                      # IMU unavailable -> leave state unknown
-    inverted = r.get("orientation") == "inverted"
+    # Decide inverted from RAW accel, not the firmware's z-sign guess — his
+    # tilted mount poses put gravity mostly in Y, so the discriminating axis
+    # is a calibration fact. Runtime-configurable via companion_settings.json
+    # keys rail_imu_axis ("x"|"y"|"z") + rail_imu_sign (1|-1): inverted when
+    # accel[axis]*sign < 0. Calibrate by reading self.imu.read once upright
+    # and once mounted; pick the axis that flips. Defaults keep old behaviour.
+    axis = "z"; sign = 1.0
+    try:
+        with open(_SETTINGS_PATH, encoding="utf-8") as f:
+            _s = json.load(f)
+        axis = str(_s.get("rail_imu_axis", os.environ.get("STACKCHAN_RAIL_IMU_AXIS", "z"))).lower()
+        sign = float(_s.get("rail_imu_sign", 1))
+    except Exception:
+        pass
+    acc = r.get("accel") or {}
+    try:
+        inverted = float(acc.get(axis, 0)) * sign < 0
+    except Exception:
+        return
     if pose.get("pending_orientation") == inverted:
         if pose.get("on_rail") != inverted:
             pose["on_rail"] = inverted

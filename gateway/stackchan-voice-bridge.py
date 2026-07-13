@@ -773,6 +773,25 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                 _speak(_pick("learn-declined", LEARN_CONFIRM_DECLINED_PHRASES))
             return
 
+        # "Do a dance" — intent shortcut to the rail choreography in
+        # stackchan_mcp/rail_dance.py (rebuilt 2026-07-13; the original hook
+        # was lost to a git revert). Wrapped so it can NEVER break a turn.
+        try:
+            from stackchan_mcp import rail_dance
+            if rail_dance.is_dance_request(transcript):
+                outcome = rail_dance.try_start_dance(start_delay_s=2.5)
+                logger.info("session=%s dance intent (%s): %r", session_id, outcome, transcript)
+                _clear_thinking_marker()
+                if outcome == "started":
+                    _speak("Oh! Right! Dancing. Yes! Watch this—")
+                elif outcome == "busy":
+                    _speak("I'm already dancing! One routine at a time, please.")
+                else:
+                    _speak("I would, honestly, but the rail's not feeling it right now.")
+                return
+        except Exception:
+            logger.exception("dance intent hook failed; falling through to chat")
+
         t1 = time.time()
         reply = _ask_claude(transcript)
         logger.info(

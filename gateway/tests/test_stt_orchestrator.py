@@ -62,6 +62,10 @@ class _FakeESP32:
         self.listen_states: list[tuple[str, str | None]] = []
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self.events: list[tuple[str, Any]] = []
+        # Voice-chat busy-marker notes (stackchan-busy-devicechat): the
+        # orchestrator flags genuine voice-capture turns to the manager
+        # around listen.start/stop — see ESP32Manager.note_chat_listen_*.
+        self.chat_notes: list[str] = []
         self.listen_lock = asyncio.Lock()
         self.head_yaw = 12.0
         self.head_pitch = 24.0
@@ -77,6 +81,12 @@ class _FakeESP32:
             # injection runs concurrently with the orchestrator's
             # asyncio.sleep(duration_ms).
             asyncio.create_task(self._inject_frames())
+
+    def note_chat_listen_start(self) -> None:
+        self.chat_notes.append("listen_start")
+
+    def note_chat_listen_stop(self) -> None:
+        self.chat_notes.append("listen_stop")
 
     async def _inject_frames(self) -> None:
         # Delay slightly so the orchestrator has had time to mark

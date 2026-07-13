@@ -34,6 +34,7 @@ from .notify_config import (
     render_template,
 )
 from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
+from .wake_vad import WakeVad, arm_wake_vad
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,159 @@ def _retrieve_future_exception(future: asyncio.Future[Any]) -> None:
     """Mark a completed Future exception as observed, if it has one."""
     if future.done() and not future.cancelled():
         future.exception()
+
+
+# ── device-chat busy marker ──────────────────────────────────────────────
+# While the device is in a voice-chat turn (listening after a wake word /
+# tap-to-talk, thinking, or speaking TTS) the background loops (idle
+# wander, vision captures, LED chase) should hold off rather than move the
+# head or grab the camera mid-conversation. Those loops already pause on
+# ``%TEMP%\stackchan-busy-*`` marker files (see stackchan-idle.py
+# BUSY_MARKER_GLOB), so the gateway joins that convention with one file of
+# its own. Content is a float unix timestamp — the readers parse the
+# content, not the mtime (same format the Claude Code hook writes).
+#
+# Never-stick guarantees:
+#   * content/mtime refreshed every ``_CHAT_MARKER_REFRESH_S`` while the
+#     turn is active (maintenance task);
+#   * removed when the turn ends (listen stop + TTS done, after a short
+#     linger), on device disconnect/replacement, and on gateway startup;
+#   * readers additionally ignore markers older than ~120s as a final
+#     backstop, so even a SIGKILLed gateway can only pause the loops for
+#     two minutes.
+_CHAT_MARKER_PATH = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")),
+    "stackchan-busy-devicechat",
+)
+_CHAT_MARKER_REFRESH_S = 15.0
+# After listen.stop the turn usually continues (STT -> LLM -> TTS); keep
+# the marker up through that thinking gap so the loops don't twitch
+# mid-turn. If no TTS ever arrives (empty transcription, hook failure),
+# the linger expiring is what removes the marker.
+_CHAT_LINGER_AFTER_LISTEN_S = 60.0
+# After tts.stop the firmware may auto re-listen (conversation mode)
+# within a beat; bridge that with a short linger instead of flapping.
+_CHAT_LINGER_AFTER_TTS_S = 5.0
+
+
+class _DeviceChatMarker:
+    """Owns ``%TEMP%\\stackchan-busy-devicechat`` for this process.
+
+    All state transitions are invoked from the single asyncio event-loop
+    thread (WebSocket read loop, manager wrappers, orchestrators), so
+    plain attributes are safe. File I/O is a few bytes to the temp dir —
+    cheap enough to do inline.
+    """
+
+    def __init__(self) -> None:
+        self._listening = False
+        self._speaking = False
+        self._linger_until = 0.0  # time.monotonic() deadline
+        self._task: asyncio.Task[None] | None = None
+        self._wake = asyncio.Event()
+        # Gateway startup: a marker orphaned by a previous process (crash,
+        # hard kill) must not keep pausing the loops.
+        self._remove()
+
+    # -- state transitions ------------------------------------------------
+
+    def listen_start(self) -> None:
+        self._listening = True
+        self._linger_until = 0.0
+        self._touch()
+        self._ensure_task()
+
+    def listen_stop(self) -> None:
+        if not self._active():
+            return  # stray stop while already idle — don't resurrect
+        self._listening = False
+        if not self._speaking:
+            self._linger_until = (
+                time.monotonic() + _CHAT_LINGER_AFTER_LISTEN_S
+            )
+        self._touch()
+        self._wake.set()
+
+    def tts_start(self) -> None:
+        self._speaking = True
+        self._linger_until = 0.0
+        self._touch()
+        self._ensure_task()
+
+    def tts_stop(self) -> None:
+        if not self._active():
+            return
+        self._speaking = False
+        if not self._listening:
+            self._linger_until = time.monotonic() + _CHAT_LINGER_AFTER_TTS_S
+        self._touch()
+        self._wake.set()
+
+    def reset(self) -> None:
+        """Device disconnected / replaced: the turn is over, full stop."""
+        self._listening = False
+        self._speaking = False
+        self._linger_until = 0.0
+        self._remove()
+        self._wake.set()
+
+    # -- internals ---------------------------------------------------------
+
+    def _active(self) -> bool:
+        return (
+            self._listening
+            or self._speaking
+            or time.monotonic() < self._linger_until
+        )
+
+    def _touch(self) -> None:
+        try:
+            with open(_CHAT_MARKER_PATH, "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            logger.debug("could not write %s", _CHAT_MARKER_PATH, exc_info=True)
+
+    def _remove(self) -> None:
+        try:
+            os.remove(_CHAT_MARKER_PATH)
+        except OSError:
+            pass
+
+    def _ensure_task(self) -> None:
+        """Start (or wake) the refresh/cleanup task for the current turn."""
+        if self._task is not None and not self._task.done():
+            self._wake.set()
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Not on the event loop (shouldn't happen in practice). The
+            # marker file is already written; the readers' 120s staleness
+            # backstop bounds the damage if nothing ever refreshes it.
+            return
+        self._task = loop.create_task(self._run())
+
+    async def _run(self) -> None:
+        try:
+            while True:
+                self._wake.clear()
+                if not self._active():
+                    break
+                self._touch()
+                delay = _CHAT_MARKER_REFRESH_S
+                if not self._listening and not self._speaking:
+                    # Lingering only: wake right when the linger expires
+                    # so removal is prompt.
+                    remaining = self._linger_until - time.monotonic()
+                    delay = max(0.2, min(delay, remaining))
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            # Turn over (or task cancelled at shutdown): drop the marker
+            # so the loops resume. Never leave it behind.
+            self._remove()
 
 
 class ESP32Connection:
@@ -415,6 +569,19 @@ class ESP32Manager:
         # session (e.g., a fresh reconnection or an MCP-driven listen()
         # that already took the slot).
         self._device_driven_session_id: str | None = None
+        # Trailing-silence endpointer for the device-driven listen
+        # (wake word / button / touch). Armed alongside
+        # _device_driven_session_id; its ONLY side effect is a
+        # best-effort listen.stop send, so a VAD failure can never
+        # break the capture path — the firmware's own 30 s listen
+        # timeout remains the fallback stop boundary. See
+        # :mod:`stackchan_mcp.wake_vad`.
+        self._wake_vad: WakeVad | None = None
+        # Voice-chat busy marker for the background loops (idle wander /
+        # vision / LED chase): written while the device is listening,
+        # thinking or speaking; see _DeviceChatMarker. Constructing it
+        # also removes any marker orphaned by a previous gateway process.
+        self._chat_marker = _DeviceChatMarker()
         self._tool_lane_locks = {
             "servo": asyncio.Lock(),
             "wifi": asyncio.Lock(),
@@ -431,6 +598,24 @@ class ESP32Manager:
     def set_notify_config(self, notify_config: NotifyConfig) -> None:
         """Replace the startup notification config used for future events."""
         self._notify_config = notify_config
+
+    def _close_wake_vad(self, session_id: str | None = None) -> None:
+        """Tear down the wake-word VAD, if any. Never raises.
+
+        With ``session_id`` given, only closes a VAD belonging to that
+        session (mirrors the session guards on the recording-slot
+        cleanup); with ``None`` closes unconditionally.
+        """
+        vad = self._wake_vad
+        if vad is None:
+            return
+        if session_id is not None and vad.session_id != session_id:
+            return
+        self._wake_vad = None
+        try:
+            vad.close()
+        except Exception:  # pragma: no cover - close() is defensive already
+            logger.debug("wake VAD close failed", exc_info=True)
 
     @property
     def device_connected(self) -> bool:
@@ -560,6 +745,22 @@ class ESP32Manager:
                     # listen() on protocol_version=1 so v2/v3 frames
                     # cannot reach this point with recording active.
                     await handle_audio_frame(message, session_id)
+                    # Feed the wake-word VAD (device-driven listen
+                    # endpointing) AFTER buffering, so a VAD bug can
+                    # never lose a frame. Any failure disables the VAD
+                    # for this capture; the firmware's own listen
+                    # timeout still ends it.
+                    vad = self._wake_vad
+                    if vad is not None:
+                        try:
+                            vad.feed(message, session_id)
+                        except Exception:
+                            self._close_wake_vad()
+                            logger.exception(
+                                "wake VAD feed failed; endpointing "
+                                "disabled for this capture (device "
+                                "listen timeout still applies)"
+                            )
                     continue
 
                 try:
@@ -608,6 +809,10 @@ class ESP32Manager:
                         if self._connection and self._connection.connected:
                             logger.warning("Replacing existing ESP32 connection")
                             self._connection.disconnect()
+                            # Any voice turn on the old connection is moot
+                            # (device rebooted / reconnected) — don't leave
+                            # its busy marker pausing the loops.
+                            self._chat_marker.reset()
                         self._connection = connection
 
                     # Start initialization as a separate task so the read loop
@@ -646,6 +851,11 @@ class ESP32Manager:
                     # forwarding pipeline.
                     state = data.get("state", "")
                     if state == "start":
+                        # A voice-chat turn is starting on the device
+                        # (wake word / button / LCD touch): flag it for
+                        # the background loops regardless of whether we
+                        # also capture the audio below.
+                        self._chat_marker.listen_start()
                         if not self._audio_hook_url:
                             logger.debug(
                                 "device-driven listen.start session=%s "
@@ -670,7 +880,24 @@ class ESP32Manager:
                                 "session=%s mode=%s",
                                 session_id, data.get("mode", ""),
                             )
+                            # Arm trailing-silence endpointing so the
+                            # user isn't stuck waiting out the
+                            # firmware's fixed 30 s window. arm_wake_vad
+                            # never raises; None simply means "device
+                            # timeout only" (kill switch / arm failure).
+                            self._close_wake_vad()
+                            self._wake_vad = arm_wake_vad(
+                                connection, session_id
+                            )
                     elif state == "stop":
+                        # Listening ended; the turn usually continues
+                        # (STT -> LLM -> TTS), so the marker lingers —
+                        # see _CHAT_LINGER_AFTER_LISTEN_S.
+                        self._chat_marker.listen_stop()
+                        # The capture is over (whether the device timed
+                        # out on its own or our VAD asked it to stop) —
+                        # the endpointer has nothing left to watch.
+                        self._close_wake_vad(session_id)
                         if self._device_driven_session_id == session_id:
                             self._device_driven_session_id = None
                             frames = stop_recording()
@@ -717,6 +944,7 @@ class ESP32Manager:
             # reconnection or an MCP-driven listen() that took over).
             # The audio_stream layer also tracks the recording session,
             # so we double-check via is_recording_session().
+            self._close_wake_vad(session_id)
             if self._device_driven_session_id == session_id and (
                 is_recording_session(session_id)
             ):
@@ -737,6 +965,10 @@ class ESP32Manager:
             async with self._lock:
                 if self._connection is connection:
                     self._connection = None
+                    # The active device went away mid-turn: the chat is
+                    # over, so drop the voice-chat busy marker rather
+                    # than leaving the background loops paused.
+                    self._chat_marker.reset()
 
     async def _init_device(self, connection: ESP32Connection, device_id: str) -> None:
         """Initialize MCP session with a newly connected device."""
@@ -1109,6 +1341,31 @@ class ESP32Manager:
         if not self._connection or not self._connection.connected:
             raise ConnectionError("No ESP32 device connected")
         await self._connection.send_tts_state(state)
+        # Voice-turn busy marker for the background loops: every say()
+        # (voice reply or MCP-driven speech) routes through here, so this
+        # is the one chokepoint for "device is speaking". Only exact
+        # start/stop matter; other states (sentence_*) pass through.
+        if state == "start":
+            self._chat_marker.tts_start()
+        elif state == "stop":
+            self._chat_marker.tts_stop()
+
+    def note_chat_listen_start(self) -> None:
+        """Mark a genuine voice-capture listen as active for the loops.
+
+        Called by the STT orchestrator around the MCP ``listen()`` tool
+        (tap-to-talk via the voice bridge). Deliberately NOT wired into
+        :meth:`send_listen_state` itself: the sensor reactor's ambient
+        probe does a 0.2s listen start/stop every few seconds, and
+        marking that busy would pause the background loops permanently.
+        Device-driven listens (wake word / button / touch) are hooked in
+        the WebSocket handler instead.
+        """
+        self._chat_marker.listen_start()
+
+    def note_chat_listen_stop(self) -> None:
+        """Counterpart of :meth:`note_chat_listen_start` (with linger)."""
+        self._chat_marker.listen_stop()
 
     async def send_listen_state(self, state: str, mode: str = "manual") -> None:
         """Send a listen state notification to put the device into /

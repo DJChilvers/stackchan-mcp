@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import glob
 import json
 import logging
 import os
@@ -421,6 +422,14 @@ PENDING_LEARN_CONFIRM_MARKER = os.path.join(TEMP, "stackchan-pending-learn-confi
 # than fight Claude Code's active work or an in-progress voice exchange.
 BUSY_MARKER = os.path.join(TEMP, "stackchan-busy")
 BUSY_STALE_S = 30 * 60
+# Per-session Claude Code markers (stackchan-busy-<session_id>, written by
+# stackchan-hook.py) AND the gateway's stackchan-busy-devicechat (device is
+# LISTENING / mid voice-chat turn) — same glob convention as
+# stackchan-idle.py's BUSY_MARKER_GLOB. Only markers younger than 120s
+# count here: the gateway refreshes its marker every ~15s while a turn is
+# live, so anything older is an orphan and must not freeze captures.
+BUSY_MARKER_GLOB = os.path.join(TEMP, "stackchan-busy-*")
+BUSY_GLOB_STALE_S = 120.0
 VOICE_THINKING_MARKER = os.path.join(TEMP, "stackchan-voice-thinking")
 VOICE_STALE_S = 90
 # Convenience pause switch — touch this file to stop captures without
@@ -443,10 +452,35 @@ def _marker_active(path: str, stale_s: float) -> bool:
     return True
 
 
+def _any_recent_busy_marker() -> bool:
+    """True if any stackchan-busy-* marker is younger than 120s.
+
+    Unlike :func:`_marker_active` this never deletes the files — they
+    belong to other processes (Claude Code sessions, the gateway) which
+    manage their own lifecycles. Content is a float unix timestamp; fall
+    back to mtime if it isn't (stale-proof either way).
+    """
+    now = time.time()
+    for path in glob.glob(BUSY_MARKER_GLOB):
+        try:
+            with open(path) as f:
+                written_at = float(f.read().strip())
+        except (OSError, ValueError):
+            try:
+                written_at = os.path.getmtime(path)
+            except OSError:
+                continue
+        if now - written_at < BUSY_GLOB_STALE_S:
+            return True
+    return False
+
+
 def _should_skip_tick() -> bool:
     if os.path.exists(PAUSE_MARKER):
         return True
     if _marker_active(BUSY_MARKER, BUSY_STALE_S):
+        return True
+    if _any_recent_busy_marker():
         return True
     if _marker_active(VOICE_THINKING_MARKER, VOICE_STALE_S):
         return True
@@ -833,6 +867,27 @@ def _check_lights_out(brightness: float, history: list, last_lights_out_ts: dict
     history.append(brightness)
     del history[:-LIGHTS_OUT_HISTORY_LEN]
     return triggered
+
+
+# Real-lux veto for lights-out (2026-07-12): the camera's mean-brightness guess
+# false-triggers (auto-exposure dips, hand over lens, dark corners). When the
+# camera THINKS the lights went out, ask the LTR-553 (self.light.read, firmware
+# 2026-07-12+) before firing. ch0 counts >= this = room actually lit -> veto.
+# Calibrate once real dark/lit samples exist (evening lit bench read ch0≈4-6).
+LUX_LIT_MIN_CH0 = float(os.environ.get("STACKCHAN_VISION_LUX_LIT_MIN", "3"))
+
+
+def _lux_says_lit(sess: "MCPSession") -> bool:
+    """True when the ambient-light sensor says the room is LIT (veto a camera
+    lights-out). Sensor missing / old firmware / any error -> False (fall back
+    to trusting the camera, i.e. today's behaviour)."""
+    try:
+        resp = sess.call_tool("self.light.read", {}, timeout=6)
+        text = (((resp or {}).get("result") or {}).get("content") or [{}])[0].get("text", "{}")
+        d = json.loads(text)
+        return bool(d.get("ok")) and float(d.get("ch0", 0)) >= LUX_LIT_MIN_CH0
+    except Exception:
+        return False
 
 
 def _fire_lights_out() -> None:
@@ -1330,8 +1385,11 @@ def _tick(
 
     brightness = _brightness(small)
     if _check_lights_out(brightness, brightness_history, last_lights_out_ts):
-        logger.info("tick: lights-out transition detected (brightness=%.1f)", brightness)
-        _fire_lights_out()
+        if _lux_says_lit(sess):
+            logger.info("tick: camera thought lights-out (brightness=%.1f) but lux says LIT - vetoed", brightness)
+        else:
+            logger.info("tick: lights-out transition detected (brightness=%.1f, lux agrees/unavailable)", brightness)
+            _fire_lights_out()
 
     face = _detect_largest_face(detector, img)
     if face is None:

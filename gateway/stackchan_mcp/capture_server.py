@@ -431,7 +431,7 @@ async def handle_react(request: web.Request) -> web.Response:
     """/react/<behavior>[?direction=left&type=desk] — fire a Wheatley reaction.
 
     Behaviors: panic, hacker, overtrack, tantrum, recognize, lights_out,
-    encourage, object_comment, messy
+    encourage, object_comment, messy, gesture, dance
     Query params forwarded to the behavior as kwargs:
       direction  left|right|up|down   (overtrack, object_comment, messy)
       type       desk|pickup           (tantrum)
@@ -451,7 +451,7 @@ async def handle_react(request: web.Request) -> web.Response:
         return web.json_response({"ok": False, "error": "gateway not available"}, status=503)
 
     behavior = request.match_info.get("behavior", "")
-    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize", "lights_out", "encourage", "object_comment", "messy", "gesture"}:
+    if behavior not in {"panic", "hacker", "overtrack", "tantrum", "recognize", "lights_out", "encourage", "object_comment", "messy", "gesture", "dance"}:
         return web.json_response({"ok": False, "error": f"unknown behavior: {behavior}"}, status=400)
 
     kwargs: dict = {}
