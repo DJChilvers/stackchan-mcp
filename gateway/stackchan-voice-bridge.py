@@ -641,9 +641,31 @@ def _get_whisper_model():
         return _whisper_model
 
 
+# Bias transcription toward Wheatley's actual command vocabulary + his name.
+# For a small fixed command set, an initial_prompt + beam search + VAD trimming
+# hugely improve short-utterance accuracy on base.en WITHOUT a bigger model
+# (which the xet CDN currently blocks downloading) — "do a dance" was landing as
+# "look down"/"tweet me". Env-overridable.
+WHISPER_PROMPT = os.environ.get(
+    "STACKCHAN_VOICE_WHISPER_PROMPT",
+    "A person is talking to Wheatley, a helpful robot assistant on a desk rail. "
+    "Likely phrases: Hey Wheatley; do a dance; come here; go home; go to your "
+    "dock; what time is it; how is your battery; what colour is this; where are "
+    "my tools; where is the multimeter; look at me; turn around; stop; hello.",
+)
+
+
 def _transcribe(ogg_path: str) -> str:
     model = _get_whisper_model()
-    segments, _info = model.transcribe(ogg_path, language="en")
+    segments, _info = model.transcribe(
+        ogg_path,
+        language="en",
+        beam_size=5,                       # beam search >> greedy on short commands
+        temperature=0.0,                   # deterministic
+        initial_prompt=WHISPER_PROMPT,     # bias toward the real command vocabulary
+        condition_on_previous_text=False,  # each turn independent (no carry-over hallucination)
+        vad_filter=True,                   # trim non-speech so whisper focuses on the words
+    )
     return " ".join(seg.text.strip() for seg in segments).strip()
 
 
