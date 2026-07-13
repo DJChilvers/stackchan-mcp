@@ -807,6 +807,10 @@ async def _dispatch_mcp_tool(
             "self.light.read",
             {},
         ),
+        "self.presence.read": (
+            "self.presence.read",
+            {},
+        ),
         "self.wifi.set_power_save": (
             "self.wifi.set_power_save",
             arguments,
@@ -2061,6 +2065,17 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                 description=(
                     "Read the LTR-553ALS ambient light sensor: {ok, ch0, "
                     "ch1} raw counts."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            Tool(
+                name="self.presence.read",
+                description=(
+                    "Read the LD2450 24GHz presence radar (Port C): {ok, "
+                    "age_ms, targets:[{x_mm, y_mm, distance_mm, angle_deg, "
+                    "speed_cms}]}. Empty targets = nobody detected; "
+                    "{ok:false, error:'no radar frames'} until the module is "
+                    "wired to Port C."
                 ),
                 inputSchema={"type": "object", "properties": {}},
             ),
