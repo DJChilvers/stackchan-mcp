@@ -904,18 +904,16 @@ private:
     static constexpr int RECOMMENDED_PITCH_MIN = 5;   // M5Stack official docs
     static constexpr int RECOMMENDED_PITCH_MAX = 85;  // M5Stack official docs
 
-    // Yaw limit — widened from the historical ±90 to ±135 (firmware batch
-    // #4). The yaw servo itself is 360°-capable (SCS0009 positional mode
-    // spans 0..300° / 0..1023 units), so the servo imposes no ±90 restriction;
-    // the binding constraint is the HEAD WIRING (display FPC + servo leads
-    // routed through the neck), which makes ±135° the deliberate safe limit
-    // beyond which the harness starts to wind. Enforced at the
-    // self.robot.set_head_angles schema boundary (Property range), matching
-    // the pre-existing yaw contract of schema-level rejection rather than
-    // silent clamping. YawDegToPos() maps ±135 well inside its 0..1000 rail
-    // clamp (see the comment there), so no internal writer path re-narrows it.
-    static constexpr int SAFE_YAW_MIN = -135;
-    static constexpr int SAFE_YAW_MAX = 135;
+    // Yaw limit — CALIBRATED 2026-07-13 from live servo-feedback sweep (not a
+    // guess). Commanded a full sweep and read get_head_angles back: actual
+    // saturates at -135° and +166° (the servo/mount hard stops); despite the
+    // "360° servo" spec sheet the rig delivers ~300° over the full 0..1023 unit
+    // range. Final limits set just INSIDE the stops so he never strains against
+    // them: -130 / +160 (~290° usable, up from the old ±135). Asymmetric
+    // because "straight ahead" is calibrated off the servo's physical centre
+    // (pos 460, not the 512 midpoint) — kept so his rest-forward stays put.
+    static constexpr int SAFE_YAW_MIN = -130;
+    static constexpr int SAFE_YAW_MAX = 160;
 
     // Issue #115: boot-time initialization target. Fall-safe neutral pose
     // well clear of both mechanical end-stops, in the centre of the
@@ -999,7 +997,7 @@ private:
         // out-of-contract callers).
         int pos = 460 + deg * 16 / 5;
         if (pos < 0) pos = 0;
-        if (pos > 1000) pos = 1000;
+        if (pos > 1023) pos = 1023;   // CALIBRATION TEST: full servo range (was 1000)
         return pos;
     }
 

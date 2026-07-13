@@ -597,7 +597,7 @@ async def _dispatch_mcp_tool(
         if (
             not isinstance(yaw_val, int)
             or isinstance(yaw_val, bool)
-            or not (-90 <= yaw_val <= 90)
+            or not (-130 <= yaw_val <= 160)   # CALIBRATED 2026-07-13 from servo-feedback sweep: real stops at -135/+166, clamp just inside
         ):
             return [
                 TextContent(
@@ -605,7 +605,7 @@ async def _dispatch_mcp_tool(
                     text=json.dumps(
                         {
                             "error": (
-                                "yaw must be an integer in -90..90 "
+                                "yaw must be an integer in -130..160 "
                                 f"(got {yaw_val!r})"
                             )
                         }
@@ -972,9 +972,9 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                     "properties": {
                         "yaw": {
                             "type": "integer",
-                            "description": "Horizontal angle in degrees (-90 to 90)",
-                            "minimum": -90,
-                            "maximum": 90,
+                            "description": "Horizontal angle in degrees (-130 to 160; calibrated servo range, ~290deg sweep)",
+                            "minimum": -130,
+                            "maximum": 160,
                         },
                         "pitch": {
                             "type": "integer",
