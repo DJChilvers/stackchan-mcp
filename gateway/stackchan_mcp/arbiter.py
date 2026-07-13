@@ -44,6 +44,7 @@ class Arbiter:
         self.catalog = catalog
         self.clock = clock
         self._pending = []          # queued transition behaviours
+        self._listening = False     # attentive pose commanded for this voice turn
         self.ctx.on_transition(self._on_transition)
 
     def _on_transition(self, old, new, snap):
@@ -83,9 +84,19 @@ class Arbiter:
         except Exception:
             logger.debug("arbiter: safety check failed", exc_info=True)
 
-        # 3) quiesce during a live voice turn (device owns attention)
+        # 3) live voice turn: hold an ATTENTIVE pose (look UP at the speaker),
+        # once per turn — do NOT sit at the rest pose (which stares at the floor
+        # when inverted). Then leave further attention to the device.
         if snap.get("voice_turn"):
-            return "quiesced"
+            if not self._listening:
+                self._listening = True
+                try:
+                    from .behaviours import listen_attend
+                    listen_attend(self.mv, snap)
+                except Exception:
+                    logger.debug("listen_attend failed", exc_info=True)
+            return "listening"
+        self._listening = False
 
         # 4) transition behaviours (greet etc.) — highest non-safety priority
         if self._pending:

@@ -17,6 +17,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -25,6 +26,14 @@ from typing import Callable, Optional
 from .context_engine import SocialContext as C
 
 logger = logging.getLogger(__name__)
+
+# Rail-assisted face-follow (user steer: rail first-class). When his head is
+# turned past this many degrees to hold the user in view, roll the carriage
+# that way so the head can recentre — he follows you along the desk. Flip the
+# sign live if he rolls the WRONG way.
+RAIL_ASSIST_YAW = float(os.environ.get("STACKCHAN_RAIL_ASSIST_YAW", "18"))
+RAIL_FOLLOW_MM = int(os.environ.get("STACKCHAN_RAIL_FOLLOW_MM", "55"))
+RAIL_FOLLOW_SIGN = int(os.environ.get("STACKCHAN_RAIL_FOLLOW_SIGN", "1"))
 
 
 # ── small helpers (say / face via the controller's MCP client) ──────────────
@@ -76,25 +85,39 @@ class Behaviour:
 
 
 # ── OWNER behaviours ────────────────────────────────────────────────────────
+def _rail_recenter(mv) -> None:
+    """Roll the carriage when his head is cocked far to hold the user in view,
+    so the head can recentre and he FOLLOWS the user along the desk. Uses the
+    measured head yaw (feedback). Non-blocking; skips while the rail is mid-move
+    so nudges don't stack. Sign is env-configurable — flip if he rolls away."""
+    try:
+        rs = mv.rail_state() or {}
+        if rs.get("moving") or rs.get("crashed") or rs.get("homed") is False:
+            return
+        pose = mv.pose() or {}
+        hy = pose.get("yaw")
+        if hy is None or abs(hy) < RAIL_ASSIST_YAW:
+            return
+        direction = 1 if hy > 0 else -1
+        mv.nudge(RAIL_FOLLOW_SIGN * direction * RAIL_FOLLOW_MM, wait=False)
+        logger.info("rail-follow: head yaw %s -> nudge %smm",
+                    hy, RAIL_FOLLOW_SIGN * direction * RAIL_FOLLOW_MM)
+    except Exception:
+        logger.debug("rail recenter failed", exc_info=True)
+
+
 def _b_face_follow(mv, snap) -> None:
-    """Keep looking at the owner. Head-proportional from the face offset; the
-    controller absorbs yaw beyond comfort into the rail internally via look_at
-    when the offset is large."""
+    """Keep looking at the owner: head tracks the face; the rail rolls to follow
+    once the head is turned a fair way (so he follows you along the desk)."""
     f = snap.get("face") or {}
     if not f.get("seen"):
         return
     dx, dy = _face_offset(snap)
-    if abs(dx) < 0.08 and abs(dy) < 0.08:
-        return  # already centred — hold still
-    dyaw = int(max(-14, min(14, dx * 20)))
-    dpitch = int(max(-10, min(10, -dy * 16)))
-    if abs(dx) > 0.45:
-        # far off to one side: let the coordinated controller use the rail too
-        gp = mv.gaze_pose() or {}
-        vy = gp.get("visual_yaw") or 0
-        mv.look_at(int(vy + dyaw), 0)
-    else:
-        mv.look_rel(dyaw, dpitch)
+    if abs(dx) >= 0.08 or abs(dy) >= 0.08:
+        dyaw = int(max(-14, min(14, dx * 20)))
+        dpitch = int(max(-10, min(10, -dy * 16)))
+        mv.look_rel(dyaw, dpitch)       # head tracks the face
+    _rail_recenter(mv)                  # rail follows when the head is turned far
 
 
 def _b_playful_idle(mv, snap) -> None:
@@ -171,8 +194,28 @@ def _b_settle_to_dock(mv, snap) -> None:
 
 
 # ── ENGAGED / STRANGER / COMPANY / CHARGING ─────────────────────────────────
+def _look_at_person(mv, snap) -> None:
+    """Track the person's face lightly (look AT them)."""
+    dx, dy = _face_offset(snap)
+    if abs(dx) >= 0.06 or abs(dy) >= 0.06:
+        mv.look_rel(int(max(-14, min(14, dx * 20))),
+                    int(max(-8, min(8, -dy * 14))))
+
+
+def listen_attend(mv, snap) -> None:
+    """Attentive LISTENING pose: turn toward the speaker and perk UP, instead of
+    sitting at the rest pose (which stares at the floor when inverted). Called by
+    the arbiter once per voice turn."""
+    dx, _ = _face_offset(snap)
+    if abs(dx) > 0.05:
+        mv.look_rel(int(max(-18, min(18, dx * 22))), 0)   # turn toward them
+    mv.perk()                                             # look up, attentive
+    _face(mv, "surprised")
+
+
 def _b_attend(mv, snap) -> None:
-    mv.perk()
+    # ENGAGED (owner around/talking): look AT them, don't just twitch a perk.
+    _look_at_person(mv, snap)
 
 
 def _orient_to_person(mv, snap) -> None:
