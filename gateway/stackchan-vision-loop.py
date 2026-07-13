@@ -932,15 +932,30 @@ def _maybe_fire_guard(guard_state: dict, recognizer, img, face,
     return True
 
 
+# Owner name for the is_owner flag written into the shared vision state — the
+# SAME convention sensor_reactor.py uses (STACKCHAN_OWNER_NAME, default
+# "Dominic"), compared case-insensitively, so the ContextEngine's OWNER context
+# and the reactor's greeting agree on who "the owner" is.
+OWNER_NAME = os.environ.get("STACKCHAN_OWNER_NAME", "Dominic")
+
+
 def _write_vision_state(
     face_visible: bool, person: str | None, name: str | None,
     dx: float, dy: float, motion_detected: bool, present: bool = False,
 ) -> None:
+    # is_owner is derived here (not passed in) so BOTH call sites populate it for
+    # free: true only when a recognised name equals OWNER_NAME. Guarded str ops
+    # so a malformed name can never break the vision tick's state write.
+    try:
+        is_owner = bool(name) and name.strip().lower() == OWNER_NAME.strip().lower()
+    except Exception:
+        is_owner = False
     state = {
         "ts": time.time(),
         "face_visible": face_visible,
         "person": person,
         "name": name,
+        "is_owner": is_owner,
         "dx": dx,
         "dy": dy,
         "motion_detected": motion_detected,
