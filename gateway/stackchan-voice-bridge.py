@@ -108,6 +108,15 @@ STREAMING_ENABLED = os.environ.get(
 # exceeds this many characters (split at a word gap), whichever comes first.
 SENTENCE_MAX_CHARS = 140
 
+# Colour-identification intent (2026-07-13): assistive feature — the user is
+# colour-blind, so "what colour is this?" must ALWAYS photograph and answer
+# from the photo, deterministically, rather than leaving camera use to the
+# LLM's judgement the way normal chat does (see VISION_TOOL). Kill switch:
+# STACKCHAN_COLOUR_CHECK=0. Default ON.
+COLOUR_CHECK_ENABLED = os.environ.get(
+    "STACKCHAN_COLOUR_CHECK", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
 SYSTEM_PROMPT = (
     "You are Wheatley, the AI core from Portal 2, but here you're acting as "
     "a helpful desk assistant for the user's coding and maker projects. Stay "
@@ -721,8 +730,15 @@ PHOTO_CUE_PHRASES = [
 ]
 
 
-def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
+def _take_photo_via_mcp(
+    question: str,
+    cue_phrases: list[str] | None = None,
+    cue_key: str = "photo-cue",
+) -> tuple[str, str] | None:
     """Call the gateway's take_photo tool; return (base64_jpeg, media_type) or None.
+
+    cue_phrases/cue_key override the spoken "hold it up" cue — the colour
+    intent passes its own ack lines so the promise matches the question.
 
     The camera is on the same physical unit as the head/screen, so whatever
     pose was showing during transcription (the down-left "thinking" squint)
@@ -756,7 +772,11 @@ def _take_photo_via_mcp(question: str) -> tuple[str, str] | None:
         sess.call_tool("set_avatar", {"face": "idle"})
         sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
         sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
-        sess.call_tool("say", {"text": _pick("photo-cue", PHOTO_CUE_PHRASES)}, timeout=15)
+        sess.call_tool(
+            "say",
+            {"text": _pick(cue_key, cue_phrases or PHOTO_CUE_PHRASES)},
+            timeout=15,
+        )
         result = sess.call_tool("take_photo", {"question": question}, timeout=20)
         content = ((result or {}).get("result") or {}).get("content", [])
         if not content:
@@ -837,6 +857,128 @@ def _ask_claude(transcript: str) -> str:
 
     text = _extract_text(content)
     return text or "Er, got an empty answer back. Not sure what happened there."
+
+
+# ─── colour-identification intent ────────────────────────────────────────────
+# Assistive feature: the user is colour-blind. "What colour is this Sharpie?"
+# must be answered deterministically — ALWAYS photograph, ALWAYS answer from
+# the photo — unlike normal chat, where Claude may or may not decide to use
+# the take_photo tool. Same hook shape as the dance/inventory intents in
+# _handle_capture; kill switch STACKCHAN_COLOUR_CHECK=0 (COLOUR_CHECK_ENABLED
+# above, next to the streaming switch).
+
+COLOUR_ACK_PHRASES = [
+    "Right — hold it up, let me have a look...",
+    "Ooh, colour check. Hold it up to the old eyeball, hang on...",
+    "Right, hold it up nice and steady — having a look now...",
+    "One sec — hold it where I can see it, doing a colour check...",
+]
+# Photo failure reuses CAMERA_FAIL_PHRASES; these cover "photo fine, vision
+# call fell over".
+COLOUR_VISION_FAIL_PHRASES = [
+    "Got the photo, then my brain fell over working out the colour. Give it another go?",
+    "Had a look, honestly did, but the thinking end's not cooperating. Ask me once more?",
+    "Photo's fine, analysis... less fine. Sorry. Try me again in a tick.",
+]
+
+COLOUR_VISION_PROMPT = (
+    "The user is colour-blind and needs colours identified reliably. Look at "
+    "the most prominent foreground/handheld object (likely held toward the "
+    "camera). Name its colour(s) plainly and specifically ('dark green', "
+    "'red-orange'). For pens/markers: the CAP and barrel-end colour indicates "
+    "the ink colour — state that explicitly. Reply as one short spoken "
+    "sentence in Wheatley's voice (British, chatty), no markdown."
+)
+
+_COLOUR_OBJECT_WORDS = r"(?:sharpie|pen|marker|wire|led|cable|tag)"
+_COLOUR_NAME_WORDS = (
+    r"(?:red|green|blue|yellow|orange|purple|pink|brown|black|grey|gray|white)"
+)
+# Generous on colour-question phrasings, conservative otherwise: every
+# pattern requires the word colo(u)r itself, except the last, which instead
+# requires an explicit colour name in the "is this the red one" form.
+_COLOUR_INTENT_RES = [
+    # "what colour is this/that/it", "what colour's that"
+    re.compile(r"\bwhat\s+colou?r(?:'s|\s+is)\s+(?:this|that|it)\b", re.IGNORECASE),
+    # "what's the colour of this ...", "what is the colour ..."
+    re.compile(r"\bwhat(?:'s|\s+is)\s+the\s+colou?r\b", re.IGNORECASE),
+    # "which colour ..." (any continuation)
+    re.compile(r"\bwhich\s+colou?r\b", re.IGNORECASE),
+    # "what colour sharpie is this", "what colour is this pen / the wire ..."
+    re.compile(rf"\bwhat\s+colou?r\b.*\b{_COLOUR_OBJECT_WORDS}s?\b", re.IGNORECASE),
+    # "is this the red one", "is that a green one"
+    re.compile(
+        rf"\bis\s+(?:this|that)\s+(?:the\s+|a\s+)?{_COLOUR_NAME_WORDS}\s+one\b",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _is_colour_question(transcript: str) -> bool:
+    return any(p.search(transcript) for p in _COLOUR_INTENT_RES)
+
+
+def _answer_colour_question(transcript: str, session_id: str) -> None:
+    """Photograph and answer a colour question, deterministically.
+
+    Never delegates the look-or-don't-look decision to the LLM: one photo,
+    one vision call, one spoken answer. Speaks its own apology on photo or
+    vision failure — by then the ack has already promised a look, so the
+    caller must NOT fall through to normal chat afterwards (the question
+    was handled, just unsuccessfully).
+    """
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        _clear_thinking_marker()
+        _speak(_pick("no-key", NO_KEY_PHRASES))
+        return
+
+    # The cue inside _take_photo_via_mcp is the ack — spoken BEFORE the
+    # capture, so "hold it up" lands while there's still time to comply.
+    photo = _take_photo_via_mcp(
+        f"What colour is the held-up object? (user asked: {transcript})",
+        cue_phrases=COLOUR_ACK_PHRASES,
+        cue_key="colour-ack",
+    )
+    if photo is None:
+        _clear_thinking_marker()
+        _speak(_pick("camera-fail", CAMERA_FAIL_PHRASES))
+        return
+
+    b64_data, media_type = photo
+    messages = [{
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": b64_data,
+                },
+            },
+            {
+                "type": "text",
+                "text": f'{COLOUR_VISION_PROMPT}\n\nThe user asked: "{transcript}"',
+            },
+        ],
+    }]
+    try:
+        # SYSTEM_PROMPT (not the telemetry-augmented variant) keeps Wheatley's
+        # voice + emotion tag; the colour brief rides in the user turn.
+        data = _call_claude_api(messages, api_key, system=SYSTEM_PROMPT)
+        reply = _extract_text(data.get("content", []))
+    except Exception:
+        logger.exception("session=%s colour vision call failed", session_id)
+        reply = ""
+    if not reply:
+        _clear_thinking_marker()
+        _speak(_pick("colour-vision-fail", COLOUR_VISION_FAIL_PHRASES))
+        return
+    logger.info("session=%s colour answer: %r", session_id, reply)
+    _clear_thinking_marker()
+    face, spoken = _split_emotion(reply)
+    _speak(spoken, face_before=(face or "idle"))
 
 
 # ─── sentence-streaming reply path ───────────────────────────────────────────
@@ -1215,6 +1357,32 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                 return
         except Exception:
             logger.exception("inventory intent hook failed; falling through to chat")
+
+        # "What colour is this Sharpie?" — assistive colour identification
+        # (the user is colour-blind; see the colour-intent section above).
+        # ALWAYS photographs and answers, unlike normal chat where Claude
+        # may or may not use the camera. Only intent DETECTION may fall
+        # through to chat on an unexpected bug; once matched, the handler
+        # owns the turn outright — photo/vision failures speak an apology
+        # and return, never re-ask via non-deterministic chat.
+        if COLOUR_CHECK_ENABLED:
+            try:
+                is_colour = _is_colour_question(transcript)
+            except Exception:
+                is_colour = False
+                logger.exception("colour intent match failed; falling through to chat")
+            if is_colour:
+                logger.info("session=%s colour intent: %r", session_id, transcript)
+                try:
+                    _answer_colour_question(transcript, session_id)
+                except Exception:
+                    logger.exception("session=%s colour handler failed", session_id)
+                    _clear_thinking_marker()
+                    _speak(
+                        "Tried a colour check there and it went properly "
+                        "sideways on my end. Sorry. Give it another go?"
+                    )
+                return
 
         t1 = time.time()
         # Streaming path first (unless killed via STACKCHAN_VOICE_STREAMING=0):
