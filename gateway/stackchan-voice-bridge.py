@@ -707,12 +707,21 @@ def _fetch_live_status_line() -> str | None:
     the other; anything missing is simply omitted from the line.
     """
     parts: list[str] = []
+    # Current local time from the gateway host's clock. The device itself has
+    # no RTC/NTP time (firmware doesn't sync it), so this is how "what time is
+    # it?" gets a TRUE answer. Always available, independent of the device.
+    try:
+        parts.append("the current time is "
+                     + time.strftime("%A %H:%M", time.localtime()))
+    except Exception:
+        pass
     try:
         sess = MCPSession(GATEWAY_URL, timeout=STATUS_FETCH_TIMEOUT_S)
         sess.initialize()
     except Exception:
-        logger.warning("live status: gateway unreachable, omitting status line")
-        return None
+        logger.warning("live status: gateway unreachable — time-only status line")
+        return ("Live status (your real telemetry right now): "
+                + " | ".join(parts) + ".") if parts else None
 
     try:
         info = _tool_result_json(sess.call_tool("get_device_info", {}))
@@ -758,8 +767,8 @@ def _fetch_live_status_line() -> str | None:
     return (
         "Live status (your real telemetry right now): "
         + " | ".join(parts)
-        + ". Use this to answer truthfully about your battery, charging, "
-        "or rail position."
+        + ". Use this to answer truthfully about the time, your battery, "
+        "charging, or rail position."
     )
 
 
