@@ -11,6 +11,7 @@ from collections.abc import Sequence
 import json
 import logging
 import os
+import random
 import time
 import uuid
 from typing import Any
@@ -65,6 +66,23 @@ def _hardware_lane(tool_name: str) -> str:
     return "default"
 
 
+# Global head-move pacer (the #36 command-rate freeze — CRASH_LOG.md A1 in
+# Documents/StackChan). Concurrent clients (radar look-at loop, vision loop,
+# idle wander, companion app) can aggregate move_head into a ~6 Hz storm that
+# hard-wedges the firmware (black screen, USB dead, physical power-cycle).
+# Enforcing a minimum interval between set_head_angles dispatches HERE — the
+# single chokepoint every client goes through — caps the aggregate rate no
+# matter how many loops run at once. Calls are PACED (briefly delayed), never
+# dropped, so command/read-back verify patterns still work. Reads
+# (get_head_angles) and safety calls (set_servo_torque, rail stop) are
+# deliberately NOT paced.
+_TOOL_MIN_INTERVAL_S: dict[str, float] = {
+    "self.robot.set_head_angles": float(
+        os.environ.get("STACKCHAN_HEAD_MIN_INTERVAL_S", "0.45")
+    ),
+}
+
+
 def _retrieve_future_exception(future: asyncio.Future[Any]) -> None:
     """Mark a completed Future exception as observed, if it has one."""
     if future.done() and not future.cancelled():
@@ -102,6 +120,39 @@ _CHAT_LINGER_AFTER_LISTEN_S = 60.0
 # After tts.stop the firmware may auto re-listen (conversation mode)
 # within a beat; bridge that with a short linger instead of flapping.
 _CHAT_LINGER_AFTER_TTS_S = 5.0
+
+# ── spoken wake-word acknowledgment ──────────────────────────────────────
+# On a COLD wake (the device enters listening while no voice-chat turn was
+# already active — i.e. "Hey Wheatley" from idle, not a mid-conversation
+# re-listen) speak a short greeting FIRST, then re-open listening to capture
+# the actual question. This gives the user an audible "I heard you" the
+# moment they wake him, instead of him silently recording while they wonder
+# whether he's listening (the visual head-perk cue is invisible on the bright
+# bench — user 2026-07-14). See ESP32Manager._run_wake_ack.
+#
+# OPT-IN (default off): it depends on the flashed firmware re-listening after
+# the injected greeting, so it's gated behind STACKCHAN_WAKE_ACK=1 while it's
+# validated live — leaving it unset keeps the proven record-on-wake flow and
+# the test suite untouched. Read at call time so toggling .env + a daemon
+# restart is all it takes.
+def _wake_ack_enabled() -> bool:
+    return os.getenv("STACKCHAN_WAKE_ACK", "0").strip().lower() not in (
+        "0", "false", "no", "off", "",
+    )
+
+
+# Short Wheatley-flavoured "yes, I'm listening" greetings. Kept brief so the
+# beat before the user asks stays snappy.
+WAKE_ACK_PHRASES = [
+    "Yeah? How can I help?",
+    "Yes! Hello. What do you need?",
+    "I'm here! Go on then.",
+    "Ah, yes — how can I help?",
+    "Right, I'm listening. What's up?",
+    "Hello! Yes. What can I do for you?",
+    "Yep, I'm all ears. Well — ear. Go ahead.",
+    "You rang? What do you need?",
+]
 
 
 class _DeviceChatMarker:
@@ -164,6 +215,17 @@ class _DeviceChatMarker:
         self._linger_until = 0.0
         self._remove()
         self._wake.set()
+
+    # -- queries -----------------------------------------------------------
+
+    def is_active(self) -> bool:
+        """Public view of the turn state for cold-wake detection.
+
+        A listen.start arriving while this is False is a COLD wake (nothing
+        listening/speaking/lingering) and eligible for the spoken ack; while
+        True it's a mid-conversation re-listen that must be captured directly.
+        """
+        return self._active()
 
     # -- internals ---------------------------------------------------------
 
@@ -582,6 +644,10 @@ class ESP32Manager:
         # thinking or speaking; see _DeviceChatMarker. Constructing it
         # also removes any marker orphaned by a previous gateway process.
         self._chat_marker = _DeviceChatMarker()
+        # Last dispatch timestamp (time.monotonic) per paced tool name; see
+        # _TOOL_MIN_INTERVAL_S. Accessed only while holding the tool's lane
+        # lock, so no extra synchronisation is needed.
+        self._tool_last_dispatch: dict[str, float] = {}
         self._tool_lane_locks = {
             "servo": asyncio.Lock(),
             "wifi": asyncio.Lock(),
@@ -616,6 +682,87 @@ class ESP32Manager:
             vad.close()
         except Exception:  # pragma: no cover - close() is defensive already
             logger.debug("wake VAD close failed", exc_info=True)
+
+    async def _run_wake_ack(self, session_id: str) -> None:
+        """Greet a cold wake, then re-open listening to catch the question.
+
+        Cold-wake UX (2026-07-14): the firmware starts recording the instant
+        the wake word fires, but with no audible confirmation the user can't
+        tell he heard them. So on a cold wake we DON'T capture that first
+        window — we stop it, speak a short greeting, then re-open
+        device-driven listening (mirroring the ``state=="start"`` capture
+        setup) so the user's ACTUAL question is what gets captured and pushed
+        to the voice bridge.
+
+        Dispatched as a fire-and-forget task so the WebSocket read loop keeps
+        pumping frames while the ~1-2s greeting plays. Speaks through the same
+        ``synthesize_and_send`` path as the ``say`` tool and re-drives
+        listening via ``send_listen_state`` (both proven live — the latter is
+        what the sensor reactor's ambient probes use).
+
+        Every failure path self-heals: a recording slot opened here but never
+        filled is bounded by the firmware's own 30s listen timeout, and
+        ``STACKCHAN_WAKE_ACK=0`` disables the whole path. Never raises.
+        """
+        conn = self._connection
+        if conn is None or not conn.connected or conn.session_id != session_id:
+            return
+        try:
+            # 1. Halt the premature wake capture (we deliberately skipped
+            #    recording it — the greeting comes first).
+            try:
+                await conn.send_listen_state("stop")
+            except Exception:
+                logger.debug(
+                    "wake-ack: initial listen.stop failed", exc_info=True
+                )
+
+            # 2. Speak the greeting through the same TTS path as `say`.
+            #    Lazy imports: gateway imports esp32_client (circular at
+            #    module scope), and the TTS stack is heavy.
+            from .gateway import get_gateway
+            from .tts import synthesize_and_send
+
+            greeting = random.choice(WAKE_ACK_PHRASES)
+            await synthesize_and_send({"text": greeting}, gateway=get_gateway())
+            logger.info(
+                "wake-ack: greeted %r session=%s", greeting, session_id
+            )
+
+            # 3. Re-open device-driven listening for the actual question.
+            #    Bail if the device vanished or another capture already grabbed
+            #    the slot (e.g. firmware conversation-mode auto-relisten fired
+            #    the state=="start" path in the meantime).
+            conn = self._connection
+            if (
+                conn is None
+                or not conn.connected
+                or conn.session_id != session_id
+            ):
+                return
+            if not self._audio_hook_url or is_recording():
+                return
+            start_recording(session_id)
+            self._device_driven_session_id = session_id
+            try:
+                await conn.send_listen_state("start", mode="manual")
+            except Exception:
+                logger.warning(
+                    "wake-ack: re-listen listen.start failed", exc_info=True
+                )
+                if self._device_driven_session_id == session_id:
+                    self._device_driven_session_id = None
+                    stop_recording()
+                return
+            self._chat_marker.listen_start()
+            self._close_wake_vad()
+            self._wake_vad = arm_wake_vad(conn, session_id)
+            logger.info(
+                "wake-ack: re-listening for the question session=%s",
+                session_id,
+            )
+        except Exception:
+            logger.exception("wake-ack failed session=%s", session_id)
 
     @property
     def device_connected(self) -> bool:
@@ -851,12 +998,36 @@ class ESP32Manager:
                     # forwarding pipeline.
                     state = data.get("state", "")
                     if state == "start":
+                        # Cold wake vs. mid-conversation re-listen: sample the
+                        # turn state BEFORE listen_start() flips it. A cold
+                        # wake (nothing already active) is eligible for the
+                        # spoken acknowledgment; a re-listen must be captured
+                        # straight away rather than greeted again.
+                        was_active = self._chat_marker.is_active()
                         # A voice-chat turn is starting on the device
                         # (wake word / button / LCD touch): flag it for
                         # the background loops regardless of whether we
                         # also capture the audio below.
                         self._chat_marker.listen_start()
-                        if not self._audio_hook_url:
+                        if (
+                            _wake_ack_enabled()
+                            and not was_active
+                            and self._audio_hook_url
+                            and not is_recording()
+                        ):
+                            # Cold wake: don't capture this first window —
+                            # greet the user, then re-open listening to catch
+                            # the actual question (see _run_wake_ack). The ack
+                            # task owns the recording slot for this turn.
+                            logger.info(
+                                "device-driven cold wake: acknowledging "
+                                "session=%s",
+                                session_id,
+                            )
+                            asyncio.create_task(
+                                self._run_wake_ack(session_id)
+                            )
+                        elif not self._audio_hook_url:
                             logger.debug(
                                 "device-driven listen.start session=%s "
                                 "ignored (STACKCHAN_AUDIO_HOOK_URL not "
@@ -984,6 +1155,7 @@ class ESP32Manager:
             )
             await self._disable_auto_torque_release(connection)
             await self._restore_default_avatar(connection)
+            await self._pose_perpendicular(connection)
         else:
             logger.error("ESP32 MCP initialization failed")
 
@@ -1028,6 +1200,27 @@ class ESP32Manager:
             logger.info(
                 "Auto torque release disabled: device=%s", connection.device_id
             )
+
+    async def _pose_perpendicular(self, connection: ESP32Connection) -> None:
+        """Face the system-wide perpendicular after (re)connect.
+
+        The firmware boots/reconnects at yaw 0, but the carriage-rotator
+        means 0 stares 25deg off the room. companion_settings.json
+        `perpendicular_yaw` is the single source of truth (user design
+        2026-07-14: "a system that sets what perpendicular is and have
+        things go there").
+        """
+        try:
+            import json as _json
+            _p = os.path.join(os.path.dirname(__file__), "..", "companion_settings.json")
+            with open(_p, encoding="utf-8") as f:
+                yaw = int(_json.load(f).get("perpendicular_yaw", 25))
+            await connection.call_tool(
+                "self.robot.set_head_angles", {"yaw": yaw, "pitch": 15}
+            )
+            logger.info("Posed to perpendicular yaw=%d on connect", yaw)
+        except Exception:
+            logger.warning("perpendicular pose on connect failed", exc_info=True)
 
     async def _restore_default_avatar(self, connection: ESP32Connection) -> None:
         """Re-push the configured default avatar set on every (re)connect.
@@ -1295,6 +1488,13 @@ class ESP32Manager:
         async with lock:
             if connection is not self._connection or not connection.connected:
                 return None, {"code": -32000, "message": "ESP32 not connected"}
+            min_interval = _TOOL_MIN_INTERVAL_S.get(name, 0.0)
+            if min_interval > 0.0:
+                now = time.monotonic()
+                wait = self._tool_last_dispatch.get(name, -min_interval) + min_interval - now
+                if wait > 0.0:
+                    await asyncio.sleep(wait)
+                self._tool_last_dispatch[name] = time.monotonic()
             return await connection.call_tool(name, arguments)
 
     async def send_avatar_set_fetch(

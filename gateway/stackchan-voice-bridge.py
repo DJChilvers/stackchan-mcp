@@ -213,10 +213,12 @@ VISION_TOOL = {
     },
 }
 
-# Reuse the same "concentrating" face/pose as the Claude Code busy hook —
-# squint + look down — so listening/thinking reads consistently across both
-# voice and coding-work contexts.
-THINKING_FACE = "sad"
+# Look-AT-the-user "thinking" face while working out a reply (changed
+# 2026-07-14). It used to be "sad" + a look-DOWN pose reused from the Claude
+# Code busy hook, but in a spoken conversation dropping his gaze reads as him
+# disengaging — the user wanted him to hold eye contact with a thinking face
+# instead. "thinking" is one of the six valid set_avatar faces.
+THINKING_FACE = "thinking"
 
 # Pitch convention (confirmed live 2026-07-01 by taking photos at various
 # values and checking what's actually in frame): LOW pitch is near-
@@ -224,6 +226,29 @@ THINKING_FACE = "sad"
 # vertical, pointed at the ceiling/sky. 8 is "looking at the user" — do
 # NOT increase this to "look up", that points at the sky instead.
 LOOK_AT_USER_PITCH = 8
+
+# Where to FACE when speaking: the radar tracker (look_at.py / calibrate.py)
+# publishes the person's last-known head-yaw here. Fresh hint -> face THEM;
+# stale/missing -> +25 = perpendicular to the rail (camera-verified 2026-07-14;
+# the old hardcoded yaw 0 stared 25deg off the room thanks to the carriage
+# rotator, and every spoken reply broke whatever pose the tracker held).
+PERSON_YAW_HINT = os.path.join(tempfile.gettempdir(), "stackchan-person-yaw.json")
+
+
+def _user_yaw() -> int:
+    try:
+        with open(PERSON_YAW_HINT, encoding="utf-8") as f:
+            d = json.load(f)
+        if time.time() - float(d.get("ts", 0)) <= 120.0:
+            return max(-90, min(90, int(d.get("yaw", 25))))
+    except Exception:
+        pass
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "companion_settings.json"), encoding="utf-8") as f:
+            return max(-90, min(90, int(json.load(f).get("perpendicular_yaw", 25))))
+    except Exception:
+        return 25
 
 # While this marker exists, stackchan-led-chase.py renders a rotating
 # rainbow chase on the LED ring (takes priority over the amber busy chase).
@@ -610,17 +635,72 @@ def _speak(text: str, face_before: str | None = None) -> None:
             sess.call_tool("set_avatar", {"face": face_before})
         sess.call_tool("say", {"text": text}, timeout=30)
         sess.call_tool("set_avatar", {"face": "idle"})
-        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH + 6})
+        sess.call_tool("move_head", {"yaw": _user_yaw(), "pitch": LOOK_AT_USER_PITCH + 6})
     except Exception:
         logger.exception("speak failed")
 
 
+# Thinking-sound filler (2026-07-14): a short spoken "hmm" the moment the
+# user finishes asking, before the LLM answer lands. The gap between their
+# question and his first word was reading as "is he even listening?" — the
+# LED thinking-chase is invisible on the bright bench, so an audible beat
+# closes that gap and makes the exchange feel like a real back-and-forth.
+# Only the general chat path uses it; the deterministic intents
+# (colour/tray/dance/inventory) already speak their own ack. `say` blocks
+# until the device finishes playing, so the filler and the answer never
+# overlap. Kill switch STACKCHAN_VOICE_THINKING_SOUND=0.
+THINKING_SOUND_ENABLED = os.environ.get(
+    "STACKCHAN_VOICE_THINKING_SOUND", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+THINKING_SOUND_PHRASES = [
+    "Hmm.",
+    "Hmmm, right.",
+    "Ooh, let me think.",
+    "Right, thinking...",
+    "Hmm, good question.",
+    "Let me have a think.",
+    "Right, hang on...",
+    "Hmm, one sec.",
+]
+
+
+def _speak_thinking_sound() -> None:
+    """Speak a short thinking filler while the answer generates.
+
+    Keeps the thinking face/pose already set by _set_thinking_pose (a bare
+    say() doesn't touch the avatar) and leaves the LED thinking-chase running
+    (the marker is still up). Never raises — a filler is never worth breaking
+    a turn over.
+    """
+    if not THINKING_SOUND_ENABLED:
+        return
+    try:
+        sess = MCPSession(GATEWAY_URL)
+        sess.initialize()
+        sess.call_tool(
+            "say",
+            {"text": _pick("thinking-sound", THINKING_SOUND_PHRASES)},
+            timeout=15,
+        )
+    except Exception:
+        logger.exception("thinking sound failed (turn unaffected)")
+
+
 def _set_thinking_pose() -> None:
+    """Hold eye contact with a thinking face while formulating the answer.
+
+    Changed 2026-07-14: was a look-DOWN concentrating pose (pitch 60, face
+    "sad"); the user asked him to keep looking at them with a thinking face
+    instead. A small yaw cock keeps it characterful — head tilted, visibly
+    *considering* you — rather than a flat dead-ahead stare. Pitch matches
+    his at-the-user talking pose (see LOOK_AT_USER_PITCH).
+    """
     try:
         sess = MCPSession(GATEWAY_URL)
         sess.initialize()
         sess.call_tool("set_avatar", {"face": THINKING_FACE})
-        sess.call_tool("move_head", {"yaw": -4, "pitch": 60})
+        sess.call_tool("move_head", {"yaw": -6, "pitch": LOOK_AT_USER_PITCH + 6})
     except Exception:
         logger.exception("set_thinking_pose failed")
 
@@ -746,11 +826,17 @@ def _fetch_live_status_line() -> str | None:
             pos = st.get("pos_mm")
             homed = bool(st.get("homed"))
             seg = "rail "
-            seg += (
-                f"{pos:.0f}mm from home"
-                if isinstance(pos, (int, float)) else "position unknown"
-            )
-            seg += ", homed" if homed else ", not homed"
+            if homed and isinstance(pos, (int, float)):
+                # State the rail's usable travel too, so he doesn't invent a
+                # rail length from the position number alone (2026-07-14: he
+                # told the user his rail "is 185mm").
+                seg += f"{pos:.0f}mm from home along your 896mm rail, homed"
+            else:
+                # Un-homed pos_mm is raw encoder garbage (hand-sliding the
+                # carriage desyncs it) — never quote a number he'd repeat as
+                # fact. He CAN still move: homing is how the reading resets.
+                seg += ("not homed — position reading unreliable until you "
+                        "re-home; you can still move along your 896mm rail")
             if (
                 homed
                 and isinstance(pos, (int, float))
@@ -1135,7 +1221,7 @@ def _answer_tray_question(transcript: str, session_id: str) -> None:
     try:
         sess = MCPSession(GATEWAY_URL)
         sess.initialize()
-        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
+        sess.call_tool("move_head", {"yaw": _user_yaw(), "pitch": LOOK_AT_USER_PITCH})
     except Exception:
         pass
     if not reply:
@@ -1347,7 +1433,7 @@ class _StreamSpeaker:
         try:
             sess = self._session()
             sess.call_tool("set_avatar", {"face": "idle"})
-            sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH + 6})
+            sess.call_tool("move_head", {"yaw": _user_yaw(), "pitch": LOOK_AT_USER_PITCH + 6})
         except Exception:
             logger.exception("stream finish (pose reset) failed")
 
@@ -1664,6 +1750,12 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                         "eyeball. Sorry. Ask me again?"
                     )
                 return
+
+        # Not one of the deterministic intents — this is an open chat turn, so
+        # the answer takes an LLM round-trip. Fill that gap with a spoken "hmm"
+        # so he audibly acknowledges he heard the whole question (the intents
+        # above already speak their own ack, so this is chat-path only).
+        _speak_thinking_sound()
 
         t1 = time.time()
         # Streaming path first (unless killed via STACKCHAN_VOICE_STREAMING=0):

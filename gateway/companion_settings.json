@@ -1,1 +1,4 @@
-{"upside_down": true}
+{
+  "upside_down": true,
+  "perpendicular_yaw": 25
+}

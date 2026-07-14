@@ -1484,21 +1484,28 @@ def _load_marker_registry() -> dict:
 
 
 def _detect_aruco_ids(img) -> list[int]:
-    """All DICT_4X4_50 marker ids visible in the frame (sorted). Same 4.7+/
+    """All DICT_4X4_250 marker ids visible in the frame (sorted). Same 4.7+/
     legacy API fallback as _detect_marker_rotations / find_item.py. ArUco
     detection is rotation-invariant, so the oriented frame is fine either
-    way up (find_item runs on the raw frame for the same reason)."""
+    way up (find_item runs on the raw frame for the same reason). Detects at
+    native res then on a 2x upscale (union) to recover small/distant tags on
+    the 320x240 sensor -- this is how project-tray tags (IDs 100-249, raised on
+    L-brackets) get spotted ambiently."""
     import cv2
 
-    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    try:  # OpenCV >= 4.7 API (this venv has 4.11)
-        detector = cv2.aruco.ArucoDetector(adict, cv2.aruco.DetectorParameters())
-        _corners, ids, _ = detector.detectMarkers(img)
-    except AttributeError:  # older API
-        _corners, ids, _ = cv2.aruco.detectMarkers(img, adict)
-    if ids is None:
-        return []
-    return sorted({int(i) for i in ids.flatten()})
+    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+
+    def _ids(im):
+        try:  # OpenCV >= 4.7 API (this venv has 4.11)
+            detector = cv2.aruco.ArucoDetector(adict, cv2.aruco.DetectorParameters())
+            _corners, ids, _ = detector.detectMarkers(im)
+        except AttributeError:  # older API
+            _corners, ids, _ = cv2.aruco.detectMarkers(im, adict)
+        return set() if ids is None else {int(i) for i in ids.flatten()}
+
+    found = _ids(img)
+    found |= _ids(cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC))
+    return sorted(found)
 
 
 def _rail_station_mm(sess: MCPSession) -> float | None:
@@ -2025,12 +2032,14 @@ CALIB_MIN_MARKERS = 2                       # need at least this many before dec
 
 
 def _detect_marker_rotations(img) -> list[float]:
-    """Rotation (deg, -180..180) of each DICT_4X4_50 marker's top edge in the
-    frame. ~0 = marker upright, ~±180 = rotated 180 (body inverted)."""
+    """Rotation (deg, -180..180) of each DICT_4X4_250 marker's top edge in the
+    frame. ~0 = marker upright, ~±180 = rotated 180 (body inverted). Native res
+    only -- this reads the 50mm drop-zone corners (which decode fine natively)
+    and needs true corner coordinates, so no upscale pass here."""
     import cv2
     import numpy as np
 
-    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    adict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
     try:  # OpenCV >= 4.7 API
         detector = cv2.aruco.ArucoDetector(adict, cv2.aruco.DetectorParameters())
         corners, ids, _ = detector.detectMarkers(img)
@@ -2136,7 +2145,13 @@ def _auto_orient_on_boot(detector) -> None:
         logger.info("auto-orient: no tray/face cue found in sweep; keeping previous upside_down=%s", prev)
     finally:
         try:
-            sess.call_tool("move_head", {"yaw": 0, "pitch": 45})
+            _perp = 25
+            try:
+                with open(SETTINGS_PATH, encoding="utf-8") as _f:
+                    _perp = int(json.load(_f).get("perpendicular_yaw", 25))
+            except Exception:
+                pass
+            sess.call_tool("move_head", {"yaw": _perp, "pitch": 45})
         except Exception:
             pass
         _clear_marker(ORIENTING_MARKER)
