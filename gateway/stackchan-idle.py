@@ -162,7 +162,19 @@ def _orientation_signs():
 
 PITCH_UP_SIGN, YAW_RIGHT_SIGN = _orientation_signs()
 YAW_MIN, YAW_MAX = -24, 24
-NEUTRAL_YAW = 0
+# System-wide perpendicular (companion_settings.json perpendicular_yaw, user
+# design 2026-07-14): the carriage-rotator means raw yaw 0 stares 25deg off
+# the room — "he goes to 0 any chance he gets" ends here. Read at import;
+# restart the loop after changing the setting.
+def _perpendicular_yaw() -> int:
+    try:
+        with open(_SETTINGS_PATH, encoding="utf-8") as f:
+            return int(json.load(f).get("perpendicular_yaw", 25))
+    except Exception:
+        return 25
+
+
+NEUTRAL_YAW = _perpendicular_yaw()
 
 # Resting gaze depends on which way up he is (values are the PHYSICAL pitch the
 # servo takes). A 180° roll inverts pitch, so "look toward the user" is a
@@ -281,6 +293,13 @@ BORED_PROB = 0.4
 BATTERY_CHECK_INTERVAL_S = float(os.environ.get("STACKCHAN_IDLE_BATTERY_CHECK_INTERVAL_S", "60"))
 LOW_BATTERY_THRESHOLD = int(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_THRESHOLD", "15"))
 LOW_BATTERY_COOLDOWN_S = float(os.environ.get("STACKCHAN_IDLE_LOW_BATTERY_COOLDOWN_S", str(10 * 60)))
+# Only celebrate charging ("Ahhh, that's the stuff...") when the battery had
+# genuinely sagged to/below this level before power arrived. At 100% the PMIC
+# top-up cycles (100 -> 99 -> recharge -> 100) flip `charging` false->true
+# every few minutes, which had him repeating the voltage line all day while
+# sat on USB (user 2026-07-14). Gate on the LOWEST level seen while
+# discharging, not the level at reconnect. 0 disables the announcement.
+CHARGE_ANNOUNCE_MAX_LEVEL = int(os.environ.get("STACKCHAN_IDLE_CHARGE_ANNOUNCE_MAX_LEVEL", "20"))
 
 # Head-move flag so the vision loop can avoid capturing a motion-BLURRED frame
 # (mid-move photos give missed faces / false gestures / garbage object reads).
@@ -1178,11 +1197,24 @@ def _check_battery(session, pose) -> None:
         return
 
     was_charging = pose.get("last_known_charging")
+    if not charging:
+        # Track how hungry he actually got this discharge stretch; the
+        # charge celebration below is gated on it (see
+        # CHARGE_ANNOUNCE_MAX_LEVEL — kills the 100->99->100 top-up spam).
+        low_mark = pose.get("discharge_low_mark")
+        pose["discharge_low_mark"] = level if low_mark is None else min(low_mark, level)
     if charging and was_charging is False:
-        try:
-            session.say(_pick_phrase("charging-reconnected", CHARGING_RECONNECTED_PHRASES))
-        except Exception:
-            pass
+        low_mark = pose.get("discharge_low_mark")
+        if (
+            CHARGE_ANNOUNCE_MAX_LEVEL > 0
+            and low_mark is not None
+            and low_mark <= CHARGE_ANNOUNCE_MAX_LEVEL
+        ):
+            try:
+                session.say(_pick_phrase("charging-reconnected", CHARGING_RECONNECTED_PHRASES))
+            except Exception:
+                pass
+        pose["discharge_low_mark"] = None
     pose["last_known_charging"] = charging
     pose["last_known_level"] = level
 
