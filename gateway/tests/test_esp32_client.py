@@ -729,9 +729,9 @@ def test_connection_default_protocol_version_is_one():
 async def _complete_handshake(ws, tools=None, drain_torque_calls=True):
     """Complete the full ESP32 handshake sequence.
 
-    ``drain_torque_calls`` receives and acknowledges the two automatic
-    ``self.robot.set_servo_torque`` / ``self.robot.set_auto_torque_release``
-    calls that ``ESP32Manager._disable_auto_torque_release`` fires right
+    ``drain_torque_calls`` receives and acknowledges the three automatic
+    calls (``set_servo_torque`` / ``set_auto_torque_release`` /
+    perpendicular-pose ``set_head_angles``) that the manager fires right
     after ``tools/list`` on every (re)connect, so callers that read the
     next message off the wire don't get one of those instead of their own
     request. Pass ``False`` for tests that want to observe those calls
@@ -785,7 +785,10 @@ async def _complete_handshake(ws, tools=None, drain_torque_calls=True):
     await ws.send(json.dumps(tools_resp))
 
     if drain_torque_calls:
-        for _ in range(2):
+        # 3 automatic calls after tools/list: set_servo_torque,
+        # set_auto_torque_release, and the perpendicular-pose
+        # set_head_angles (ESP32Manager._pose_perpendicular, 2026-07-14).
+        for _ in range(3):
             req_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
             req_msg = json.loads(req_raw)
             await ws.send(json.dumps({
@@ -955,4 +958,98 @@ async def test_device_driven_listen_cleanup_on_disconnect(manager_with_hook):
     assert not is_recording(), "recording slot was leaked across connections"
     # No push should have fired for the aborted capture.
     assert calls == []
+
+
+# --- Spoken wake-word acknowledgment -----------------------------------------
+
+
+def test_wake_ack_enabled_flag(monkeypatch):
+    """STACKCHAN_WAKE_ACK is off by default and opt-in via truthy values."""
+    from stackchan_mcp.esp32_client import _wake_ack_enabled
+
+    monkeypatch.delenv("STACKCHAN_WAKE_ACK", raising=False)
+    assert _wake_ack_enabled() is False
+    for off in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("STACKCHAN_WAKE_ACK", off)
+        assert _wake_ack_enabled() is False
+    for on in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("STACKCHAN_WAKE_ACK", on)
+        assert _wake_ack_enabled() is True
+
+
+class _FakeConn:
+    """Minimal ESP32Connection stand-in for _run_wake_ack unit tests."""
+
+    def __init__(self, session_id="s1"):
+        self.connected = True
+        self.session_id = session_id
+        self.listen_calls: list[tuple[str, str | None]] = []
+
+    async def send_listen_state(self, state, mode="manual"):
+        self.listen_calls.append((state, mode if state == "start" else None))
+
+
+@pytest.mark.asyncio
+async def test_run_wake_ack_greets_then_relistens(monkeypatch):
+    """A cold wake speaks a greeting, then re-opens the recording slot so the
+    actual question (not the greeting) is what gets captured."""
+    from stackchan_mcp import esp32_client
+    from stackchan_mcp.audio_stream import is_recording, stop_recording
+
+    stop_recording()  # ensure a clean slot before we start
+    spoken: list[str] = []
+
+    async def _fake_synth(arguments, gateway=None):
+        spoken.append(arguments.get("text", ""))
+        return {"ok": True}
+
+    monkeypatch.setattr("stackchan_mcp.tts.synthesize_and_send", _fake_synth)
+    monkeypatch.setattr("stackchan_mcp.gateway.get_gateway", lambda: object())
+    # arm_wake_vad pulls in audio deps; a no-op keeps the unit test hermetic
+    # (its only real side effect is a best-effort listen.stop anyway).
+    monkeypatch.setattr(esp32_client, "arm_wake_vad", lambda conn, sid: None)
+
+    mgr = esp32_client.ESP32Manager()
+    mgr._audio_hook_url = "http://test/hook"
+    conn = _FakeConn("s1")
+    mgr._connection = conn
+
+    try:
+        await mgr._run_wake_ack("s1")
+
+        # Greeted with one of the canonical phrases.
+        assert len(spoken) == 1
+        assert spoken[0] in esp32_client.WAKE_ACK_PHRASES
+        # Stopped the premature wake capture, then re-opened listening.
+        assert conn.listen_calls == [("stop", None), ("start", "manual")]
+        # The recording slot is now open for the real question.
+        assert is_recording()
+        assert mgr._device_driven_session_id == "s1"
+    finally:
+        stop_recording()
+
+
+@pytest.mark.asyncio
+async def test_run_wake_ack_bails_if_device_gone(monkeypatch):
+    """If the device dropped/changed session before the greeting, nothing is
+    spoken and no recording slot is opened."""
+    from stackchan_mcp import esp32_client
+    from stackchan_mcp.audio_stream import is_recording, stop_recording
+
+    stop_recording()
+    spoken: list[str] = []
+
+    async def _fake_synth(arguments, gateway=None):
+        spoken.append(arguments.get("text", ""))
+
+    monkeypatch.setattr("stackchan_mcp.tts.synthesize_and_send", _fake_synth)
+
+    mgr = esp32_client.ESP32Manager()
+    mgr._audio_hook_url = "http://test/hook"
+    mgr._connection = None  # device gone
+
+    await mgr._run_wake_ack("s1")
+
+    assert spoken == []
+    assert not is_recording()
 
