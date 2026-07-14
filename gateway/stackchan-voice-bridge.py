@@ -852,6 +852,7 @@ def _take_photo_via_mcp(
     question: str,
     cue_phrases: list[str] | None = None,
     cue_key: str = "photo-cue",
+    pose: tuple[int, int] | None = None,
 ) -> tuple[str, str] | None:
     """Call the gateway's take_photo tool; return (base64_jpeg, media_type) or None.
 
@@ -889,7 +890,12 @@ def _take_photo_via_mcp(
         sess.initialize()
         sess.call_tool("set_avatar", {"face": "idle"})
         sess.call_tool("set_servo_torque", {"yaw_enabled": True, "pitch_enabled": True})
-        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
+        # pose override (2026-07-14): the tray intent aims the camera DOWN at
+        # the desk (he's INVERTED on the rail now — the old "can't reach a
+        # table surface" note below predates the rail mount). Default
+        # unchanged: straight at the user.
+        p_yaw, p_pitch = pose if pose else (0, LOOK_AT_USER_PITCH)
+        sess.call_tool("move_head", {"yaw": p_yaw, "pitch": p_pitch})
         sess.call_tool(
             "say",
             {"text": _pick(cue_key, cue_phrases or PHOTO_CUE_PHRASES)},
@@ -1034,6 +1040,117 @@ _COLOUR_INTENT_RES = [
 
 def _is_colour_question(transcript: str) -> bool:
     return any(p.search(transcript) for p in _COLOUR_INTENT_RES)
+
+
+# ─── tray-contents intent ────────────────────────────────────────────────────
+# "What's in the tray?" — he looks DOWN at the scan tray (he hangs INVERTED on
+# the rail above the desk; the tray zone sits at the FAR END, bounded by four
+# ArUco corner markers) and describes each item by NAME + COLOUR (the user is
+# colour-blind — colours in words, always). Deterministic like the colour
+# intent: one photo, one vision call, one spoken answer.
+# TRAY_PITCH: physical move_head pitch that points the camera at the desk —
+# calibrated 2026-07-14 overnight (photo sweep). Override: STACKCHAN_TRAY_PITCH.
+TRAY_CHECK_ENABLED = os.environ.get(
+    "STACKCHAN_TRAY_CHECK", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+TRAY_PITCH = int(os.environ.get("STACKCHAN_TRAY_PITCH", "85"))
+TRAY_STATION_MM = int(os.environ.get("STACKCHAN_TRAY_STATION_MM", "780"))
+
+TRAY_ACK_PHRASES = [
+    "Right, let me have a look in the tray...",
+    "Tray inspection! One of my favourites. Peering down now...",
+    "Having a look at the tray, one moment...",
+]
+TRAY_VISION_FAIL_PHRASES = [
+    "I looked, but my eye's not cooperating. Try me again in a minute?",
+    "Hmm. Photo happened, brain didn't. Ask me again?",
+]
+TRAY_VISION_PROMPT = (
+    "This is a downward photo of a scan tray zone on a desk, bounded by four "
+    "small square black-and-white markers (the corners). The user is "
+    "COLOUR-BLIND and relies on you for colours. List the physical items "
+    "lying inside (or partially inside) the marker zone: for each, its NAME "
+    "and its COLOUR(S) in plain words. Ignore the markers themselves, the "
+    "desk texture, and anything clearly outside the zone. If the tray zone "
+    "is empty, say so. If no markers are visible, describe what IS on the "
+    "desk below instead and mention you couldn't see the tray corners. "
+    "Reply as ONE short spoken paragraph in Wheatley's voice (British, "
+    "chatty), no markdown, no lists."
+)
+
+_TRAY_INTENT_RES = [
+    re.compile(r"\bwhat('?s| is| do you see)?\s+(is\s+)?(in|on)\s+(the|my|your)\s+tray\b", re.I),
+    re.compile(r"\b(check|look\s+(in|at)|inspect|scan)\s+(the|my|your)\s+tray\b", re.I),
+    re.compile(r"\btray\s+(contents|check|inventory)\b", re.I),
+]
+
+
+def _is_tray_question(transcript: str) -> bool:
+    return any(p.search(transcript) for p in _TRAY_INTENT_RES)
+
+
+def _answer_tray_question(transcript: str, session_id: str) -> None:
+    """Look down into the tray zone and describe items by name + colour.
+
+    Same deterministic contract as the colour intent: once the ack is spoken
+    the turn is OWNED — failures apologise and return, never fall to chat.
+    Does NOT move the rail (rail moves stay deliberate/user-driven; if he's
+    not near the tray the vision prompt's no-markers branch says so honestly).
+    """
+    api_key = os.environ.get(ANTHROPIC_API_KEY_ENV, "").strip()
+    if not api_key:
+        _clear_thinking_marker()
+        _speak(_pick("no-key", NO_KEY_PHRASES))
+        return
+
+    photo = _take_photo_via_mcp(
+        f"Tray contents check (user asked: {transcript})",
+        cue_phrases=TRAY_ACK_PHRASES,
+        cue_key="tray-ack",
+        pose=(0, TRAY_PITCH),
+    )
+    if photo is None:
+        _clear_thinking_marker()
+        _speak(_pick("camera-fail", CAMERA_FAIL_PHRASES))
+        return
+
+    b64_data, media_type = photo
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image",
+             "source": {"type": "base64", "media_type": media_type,
+                        "data": b64_data}},
+            {"type": "text",
+             "text": f'{TRAY_VISION_PROMPT}\n\nThe user asked: "{transcript}"'},
+        ],
+    }]
+    try:
+        data = _call_claude_api(messages, api_key, system=SYSTEM_PROMPT)
+        reply = _extract_text(data.get("content", []))
+    except Exception:
+        logger.exception("session=%s tray vision call failed", session_id)
+        reply = ""
+    # restore an at-the-user pose either way (he was staring at the desk)
+    try:
+        sess = MCPSession(GATEWAY_URL)
+        sess.initialize()
+        sess.call_tool("move_head", {"yaw": 0, "pitch": LOOK_AT_USER_PITCH})
+    except Exception:
+        pass
+    if not reply:
+        _clear_thinking_marker()
+        _speak(_pick("tray-vision-fail", TRAY_VISION_FAIL_PHRASES))
+        return
+    logger.info("session=%s tray answer: %r", session_id, reply)
+    _clear_thinking_marker()
+    face, spoken = _split_emotion(reply)
+    spoken, cant = _strip_cant(spoken)
+    if cant:
+        _capture_cant(transcript, spoken, session_id)
+        if not spoken:
+            spoken = _pick("tray-vision-fail", TRAY_VISION_FAIL_PHRASES)
+    _speak(spoken, face_before=(face or "idle"))
 
 
 def _answer_colour_question(transcript: str, session_id: str) -> None:
@@ -1524,6 +1641,27 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                     _speak(
                         "Tried a colour check there and it went properly "
                         "sideways on my end. Sorry. Give it another go?"
+                    )
+                return
+
+        # Tray-contents intent — same deterministic owns-the-turn contract as
+        # colour above ("what's in the tray?" -> look down, photo, name+colour).
+        if TRAY_CHECK_ENABLED:
+            try:
+                is_tray = _is_tray_question(transcript)
+            except Exception:
+                is_tray = False
+                logger.exception("tray intent match failed; falling through to chat")
+            if is_tray:
+                logger.info("session=%s tray intent: %r", session_id, transcript)
+                try:
+                    _answer_tray_question(transcript, session_id)
+                except Exception:
+                    logger.exception("session=%s tray handler failed", session_id)
+                    _clear_thinking_marker()
+                    _speak(
+                        "Tried to check the tray and tripped over my own "
+                        "eyeball. Sorry. Ask me again?"
                     )
                 return
 
