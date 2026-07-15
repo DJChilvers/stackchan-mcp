@@ -6854,6 +6854,60 @@ private:
     }
 
 public:
+    // PMIC (AXP2101) hardware watchdog — auto-recovers a hard firmware lockup by
+    // cold-cycling power (battery-independent, no external parts). Full power-cycle
+    // action + 32 s timeout, fed every 4 s by a dedicated task. On a total wedge the
+    // scheduler stops -> the feed task stops -> the PMIC power-cycles him. Catches
+    // the bus/cache-level hangs below the ESP panic handler (CRASH_LOG A1 / #1-#6).
+    // See Documents/StackChan/PMIC_WATCHDOG_PLAN.md.
+    void InitializeWatchdog() {
+        if (pmic_ == nullptr) { ESP_LOGE(TAG, "InitializeWatchdog: pmic_ null"); return; }
+        // Start the feed task ONLY here (do NOT arm the watchdog in the ctor — that
+        // reboot-looped him, CRASH #7). The task keeps WIFI_PS_NONE asserted board-wide
+        // (item 1) from boot, and arms the PMIC watchdog itself ~60s in, once boot has
+        // settled (see WdtFeedTaskMain).
+        pmic_->FeedWatchdog();
+        BaseType_t ok = xTaskCreate(&StackChanBoard::WdtFeedTaskTrampoline,
+                                    "wdt_feed", 2048, this, 6, nullptr);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "wdt_feed task create failed — WIFI_PS_NONE keep-alive + watchdog lost");
+            return;
+        }
+        ESP_LOGI(TAG, "wdt_feed task started (WIFI_PS_NONE keep-alive; watchdog arms ~60s in)");
+    }
+
+    static void WdtFeedTaskTrampoline(void* arg) {
+        static_cast<StackChanBoard*>(arg)->WdtFeedTaskMain();
+    }
+    void WdtFeedTaskMain() {
+        uint32_t ticks = 0;
+        bool armed = false;
+        for (;;) {
+            pmic_->FeedWatchdog();
+            // Arm the PMIC watchdog ONCE, ~60s after boot (NOT in the ctor — that
+            // reboot-looped him, CRASH #7: the heavy avatar/WiFi/wake-word boot starved
+            // this task past the timeout). By 60s boot is long done and this task's 4s
+            // feed cadence is proven. 128s timeout so only a TRUE wedge (this task stops
+            // entirely) fires it; ~2min auto-recovery still beats needing a human.
+            if (!armed && ++ticks >= 15) {              // 15 * 4s = ~60s uptime
+                pmic_->ConfigWatchdog(0b11, 0b111);      // full DCDC/LDO power-cycle, 128s
+                pmic_->FeedWatchdog();
+                pmic_->EnableWatchdog();
+                armed = true;
+                ESP_LOGI(TAG, "PMIC watchdog ARMED (late, full power-cycle, 128s, fed 4s)");
+            }
+            // Item 1 (FIRMWARE_HANDOFF): keep WIFI_PS_NONE asserted BOARD-WIDE,
+            // decoupled from the rail heartbeat. mDNS discovery restores MIN_MODEM
+            // and the PowerSaveTimer can push MAX_MODEM — both starve the concurrent
+            // radar+head+camera load and drop him off the gateway (the ~5-min drop).
+            // He's USB/dock-powered, so no-modem-sleep is the correct steady state.
+            // (This overrides self.wifi.set_power_save — intentional; NONE is the
+            //  unblocker. Revisit if pure-battery running is ever wanted.)
+            esp_wifi_set_ps(WIFI_PS_NONE);
+            vTaskDelay(pdMS_TO_TICKS(4000));
+        }
+    }
+
     StackChanBoard() {
         InitializePowerSaveTimer();
         InitializeI2c();
@@ -6892,6 +6946,7 @@ public:
         // InitializeAvatar();
         InitializeMouthSequenceTask();
         RegisterMcpTools();
+        InitializeWatchdog();   // LAST: arm the PMIC watchdog once everything else is up
     }
 
     virtual AudioCodec* GetAudioCodec() override {
