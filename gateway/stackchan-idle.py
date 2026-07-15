@@ -31,6 +31,14 @@ import os
 import random
 import sys
 import time
+
+# Rail arbiter (RAIL_ARBITER.md): nothing moves the rail without the claim
+try:
+    from stackchan_mcp.rail_arbiter import claim as _rail_claim
+except Exception:      # loop may run outside the venv path — degrade open
+    def _rail_claim(owner, priority):
+        return True
+
 import urllib.request
 
 # Load the gateway .env so the STACKCHAN_* tunables below (rest pitch, idle
@@ -1015,6 +1023,8 @@ def _dock_to_charge(session, pose) -> None:
                      pose.get("p", NEUTRAL_PITCH))
     except Exception:
         pass
+    if not _rail_claim("battery", 1):
+        return
     session.rail_home()
     for _ in range(20):   # ride home; polls double as bridge keep-alives
         time.sleep(1.0)
@@ -1179,6 +1189,8 @@ def _check_return_to_dock(session, pose) -> None:
     if not isinstance(pos, (int, float)) or pos < 60:
         return                      # already home-ish
     pose["last_dock_return_ts"] = now
+    if not _rail_claim("absence-park", 2):
+        return
     session.rail_home()
 
 
@@ -1371,6 +1383,8 @@ def _v_rail_drift(session, pose):
                 YAW_MIN, YAW_MAX)
     session.move(ny, pose["p"])
     time.sleep(random.uniform(0.3, 0.6))
+    if not _rail_claim("ambient", 4):
+        return pose
     session.rail_move_mm(int(round(target)))
     if not printer_trip and random.random() < 0.35:
         try:
