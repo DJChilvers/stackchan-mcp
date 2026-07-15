@@ -483,6 +483,10 @@ BUSY_STALE_S = 30 * 60
 # count here: the gateway refreshes its marker every ~15s while a turn is
 # live, so anything older is an orphan and must not freeze captures.
 BUSY_MARKER_GLOB = os.path.join(TEMP, "stackchan-busy-*")
+# Keep detecting while look_at is tracking, so the head-mounted camera can
+# camera-verify radar tracks (personhood). Default off — enable together with
+# STACKCHAN_LOOKAT_CAMERA_VERIFY and a faster poll, then walk-test.
+TRACK_ASSIST = os.environ.get("STACKCHAN_VISION_TRACK_ASSIST", "0").strip() not in ("0", "false", "no", "")
 BUSY_GLOB_STALE_S = 120.0
 VOICE_THINKING_MARKER = os.path.join(TEMP, "stackchan-voice-thinking")
 VOICE_STALE_S = 90
@@ -516,6 +520,14 @@ def _any_recent_busy_marker() -> bool:
     """
     now = time.time()
     for path in glob.glob(BUSY_MARKER_GLOB):
+        # Camera-verify assist (STACKCHAN_VISION_TRACK_ASSIST, default off):
+        # keep detecting (and publishing vision-state) while look_at is
+        # tracking, so its head-mounted camera can grant personhood to a
+        # radar track. Without this the loop pauses on busy-lookat and
+        # verification never gets a fresh frame. Default off = unchanged.
+        if (TRACK_ASSIST
+                and os.path.basename(path) == "stackchan-busy-lookat"):
+            continue
         try:
             with open(path) as f:
                 written_at = float(f.read().strip())

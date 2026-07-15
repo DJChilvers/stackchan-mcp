@@ -306,6 +306,14 @@ def _dance_worker(intro: bool, start_delay_s: float) -> None:
         c = _McpClient()
         c.initialize()
 
+        # A commanded task (RAIL_ARBITER.md P2) outranks passive people-
+        # tracking (P3): claim the rail so look_at yields until the dance ends.
+        try:
+            from stackchan_mcp import rail_arbiter
+            rail_arbiter.claim("task", 2)
+        except Exception:
+            pass
+
         # Re-check right before moving — the ack window is long enough
         # for a crash/unlink to have happened since try_start_dance().
         if not _is_ready(_rail_status(c)):
@@ -394,3 +402,8 @@ def _dance_worker(intro: bool, start_delay_s: float) -> None:
             pass
     finally:
         _dancing = False
+        try:
+            from stackchan_mcp import rail_arbiter
+            rail_arbiter.release("task")
+        except Exception:
+            pass
