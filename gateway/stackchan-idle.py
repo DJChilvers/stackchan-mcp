@@ -34,8 +34,10 @@ import time
 
 # Rail arbiter (RAIL_ARBITER.md): nothing moves the rail without the claim
 try:
-    from stackchan_mcp.rail_arbiter import claim as _rail_claim
+    from stackchan_mcp import rail_arbiter
+    _rail_claim = rail_arbiter.claim
 except Exception:      # loop may run outside the venv path — degrade open
+    rail_arbiter = None
     def _rail_claim(owner, priority):
         return True
 
@@ -1025,6 +1027,8 @@ def _dock_to_charge(session, pose) -> None:
         pass
     if not _rail_claim("battery", 1):
         return
+    if rail_arbiter is not None:   # rescue dock also holds until charged >target
+        rail_arbiter.set_charge_lock(int(os.environ.get("STACKCHAN_CHARGE_UNTIL", "80")))
     session.rail_home()
     for _ in range(20):   # ride home; polls double as bridge keep-alives
         time.sleep(1.0)
@@ -1233,6 +1237,28 @@ def _check_battery(session, pose) -> None:
         pose["discharge_low_mark"] = None
     pose["last_known_charging"] = charging
     pose["last_known_level"] = level
+
+    # Charge-lock maintenance (RAIL_ARBITER.md): while dock-locked, HOLD the
+    # rail so tracking/drift can't pull him off; release once charged OVER the
+    # target (user 2026-07-15: "dock and charge until over 80% before leaving").
+    if rail_arbiter is not None:
+        release_over = rail_arbiter.charge_lock_release_over()
+        if release_over is not None:
+            if charging and level > release_over:
+                rail_arbiter.clear_charge_lock()
+                try:
+                    session.say("Right — topped up, over %d percent. Back to it." % release_over)
+                except Exception:
+                    pass
+            else:
+                rail_arbiter.claim("charging", 1)   # keep the dock pinned
+                if charging is False:               # docking may have failed
+                    st = session.rail_status() or {}
+                    pos = st.get("pos_mm")
+                    if (st.get("homed") and not st.get("crashed")
+                            and not st.get("moving")
+                            and isinstance(pos, (int, float)) and pos > 20):
+                        session.rail_home()
 
     # Hungry and off the charger -> drive himself home to the brass rails.
     # Sits ABOVE the panic threshold so docking happens before the drama.

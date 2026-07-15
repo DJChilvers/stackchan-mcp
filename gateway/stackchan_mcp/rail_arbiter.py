@@ -63,3 +63,44 @@ def holder() -> str:
     if not cur or time.time() - float(cur.get("ts", 0)) >= STALE_S:
         return ""
     return "%s(p%s)" % (cur.get("owner", "?"), cur.get("priority", "?"))
+
+
+# ── charge-lock ──────────────────────────────────────────────────────────
+# "Dock and charge until over 80% before leaving" (user spec 2026-07-15).
+# A persistent P1 claim owner="charging" that pins him to the dock: set when
+# he docks (voice command or the low-battery rescue), refreshed by the idle
+# loop's battery check while level is below target, released once charged.
+# Lower-priority rail movers (tracking P3, ambient drift P4) yield to it, so
+# he stays put and tops up — while his HEAD is still free to watch people.
+CHARGE_LOCK_PATH = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")),
+    "stackchan-charge-until.json",
+)
+
+
+def set_charge_lock(release_over: int = 80) -> None:
+    """Pin him to the dock until battery is OVER ``release_over`` percent."""
+    try:
+        with open(CHARGE_LOCK_PATH, "w", encoding="utf-8") as f:
+            json.dump({"release_over": int(release_over), "ts": time.time()}, f)
+    except Exception:
+        pass
+    claim("charging", 1)
+
+
+def charge_lock_release_over() -> int | None:
+    """The % to charge past before leaving, or None if not dock-locked."""
+    try:
+        with open(CHARGE_LOCK_PATH, encoding="utf-8") as f:
+            return int(json.load(f).get("release_over", 80))
+    except Exception:
+        return None
+
+
+def clear_charge_lock() -> None:
+    for path in (CHARGE_LOCK_PATH,):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    release("charging")

@@ -1652,6 +1652,37 @@ def _handle_capture(ogg_bytes: bytes, session_id: str) -> None:
                 _speak(_pick("learn-declined", LEARN_CONFIRM_DECLINED_PHRASES))
             return
 
+        # "Go to your charge dock" — dock-and-charge intent (user spec
+        # 2026-07-15: come-when-called, leave-when-told). Sets the arbiter
+        # charge-lock (pins him to the dock until >80%, so tracking/drift
+        # can't pull him off mid-charge), then homes onto the brass rails.
+        # Same NEVER-break-a-turn wrapping as the dance intent.
+        try:
+            _t = (transcript or "").lower()
+            _DOCK_TRIGGERS = (
+                "charge dock", "go to your dock", "go to the dock", "go home",
+                "go and charge", "go charge", "charge up", "back to your dock",
+                "back to the dock", "return to dock", "return to your dock",
+                "dock yourself", "go to your charge", "time to charge",
+                "go recharge", "recharge", "on your dock", "onto your dock",
+            )
+            if any(k in _t for k in _DOCK_TRIGGERS):
+                logger.info("session=%s DOCK intent: %r", session_id, transcript)
+                _clear_thinking_marker()
+                try:
+                    from stackchan_mcp import rail_arbiter
+                    rail_arbiter.set_charge_lock(int(os.environ.get("STACKCHAN_CHARGE_UNTIL", "80")))
+                    _speak("Right, heading home to top up. I'll stay put on the dock until I'm properly charged.")
+                    sess = MCPSession(GATEWAY_URL)
+                    sess.initialize()
+                    sess.call_tool("self.rail.home", {})   # dock = home end
+                except Exception:
+                    logger.exception("dock intent execution failed")
+                    _speak("I tried to head home but the rail wouldn't have it.")
+                return
+        except Exception:
+            logger.exception("dock intent hook failed; falling through to chat")
+
         # "Do a dance" — intent shortcut to the rail choreography in
         # stackchan_mcp/rail_dance.py (rebuilt 2026-07-13; the original hook
         # was lost to a git revert). Wrapped so it can NEVER break a turn.
