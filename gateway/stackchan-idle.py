@@ -1154,6 +1154,10 @@ RETURN_TO_DOCK_AFTER_S = float(os.environ.get("STACKCHAN_IDLE_DOCK_RETURN_S", st
 
 
 def _check_return_to_dock(session, pose) -> None:
+    if RETURN_TO_DOCK_AFTER_S <= 0:
+        return   # explicitly disabled (env 0) — 2026-07-15: it silently homed
+                 # him mid-tracking ('something else is pulling him'); the
+                 # charging:false-at-100%-USB quirk defeated its guard
     if not (DOCK_ENABLED and RETURN_TO_DOCK_AFTER_S > 0):
         return
     now = time.time()
