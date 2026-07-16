@@ -204,6 +204,10 @@ elseif(CONFIG_BOARD_TYPE_M5STACK_CORE_S3)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
 elseif(CONFIG_BOARD_TYPE_STACKCHAN)
     set(BOARD_TYPE "stackchan")
+    # Network identity only (HTTP User-Agent + the device's MCP serverInfo.name).
+    # BOARD_TYPE stays "stackchan" (board selection / sources); the gateway keys
+    # the device by MAC and only logs serverInfo.name, so this is purely cosmetic.
+    set(BOARD_NAME "wheatley")
     set(BUILTIN_TEXT_FONT font_puhui_basic_20_4)
     set(BUILTIN_ICON_FONT font_awesome_20_4)
     set(DEFAULT_EMOJI_COLLECTION twemoji_64)
