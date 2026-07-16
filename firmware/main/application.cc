@@ -315,10 +315,10 @@ void Application::HandleActivationDoneEvent() {
     auto& board = Board::GetInstance();
     board.SetPowerSaveLevel(PowerSaveLevel::LOW_POWER);
 
-    Schedule([this]() {
-        // Play the success sound to indicate the device is ready
-        audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
-    });
+    // Wheatley: upstream "device ready" success chime silenced. It is a generic
+    // xiaozhi jingle that fired on EVERY boot — including dock-contact reboots and
+    // WDT self-recoveries — which is off-character and noisy for an always-on robot.
+    // (Was: Schedule([this]{ audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS); });)
 }
 
 void Application::ActivationTask() {
