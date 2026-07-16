@@ -174,6 +174,62 @@ The old `POST /api/motor` 501 stub + companion app L/R buttons are DROPPED as th
 (the bridge owns drive). If still wanted, the app could relay to Wheatley's ESP-NOW MCP action
 instead — optional, not required.
 
+## RailDriver TX isolation + peripheral coexistence — the rail-follow lockup fix (added 2026-07-16)
+
+**This is the fix that lifts WHEATLEY_LIMITS rule 2 ("rail-follow shelved").** Rail-follow
+tracking HARD-LOCKS him (blank screen, USB wedged, physical power-cycle only) within minutes —
+crashes #4 / #8 / #9. Confirmed **power-independent** (#9: full battery on the clean dock, still
+dead in ~8 min; he never left the dock, so it's the rail TX *traffic itself* concurrent with
+radar+camera, not travel/brownout). The LINK-stability fix (rail_hb heartbeat + `WIFI_PS_NONE`)
+is DONE and works — this is a **different, unaddressed** concurrency path. Until it's done +
+flashed, `look_at.py` must run head-only (`STACKCHAN_LOOKAT_RAIL=0`).
+
+**Concrete defect in the current source** (`main/boards/stackchan/rail_driver.cc`):
+`RailDriver::Send()` (L119) calls `esp_now_send()` (L129) and does `++seq_` (L128) with **NO
+mutex, from TWO task contexts**: the `rail_hb` heartbeat task (`HeartbeatLoop`, L95 — a PING every
+250 ms) AND the MCP command path (`Home/MoveMm/NudgeMm/Stop/Jog` L139-144, called from the MCP
+tool handler task via `rail_mcp.cc`). So during rail-follow, command TX interleaves with the 4 Hz
+heartbeat TX, both racing `seq_` and hitting the shared WiFi radio — on top of radar UART
+(256000 baud), camera DMA (gc0308), and the servo/LVGL. That is the bus/interrupt-level collision
+that wedges the chip *below* the task-WDT (so no panic, no auto-reboot — see CRASH_LOG A1).
+
+### Part A — funnel ALL rail TX through one task (removes the race, serializes TX)
+- Add a FreeRTOS queue `tx_q_` + one dedicated task `rail_tx` that is the **only** code that ever
+  calls `esp_now_send` and the **only** owner of `seq_`.
+- Rewrite `Send()` to just `xQueueSend(tx_q_, &{cmd,arg}, 0)` (drop-on-full — the rail is already
+  fire-and-forget; a lost nudge is re-sent next tick). Command methods + the heartbeat both enqueue.
+- `rail_tx` loop: `xQueueReceive` (block) → `pkt.seq = ++seq_` → `esp_now_send` → minimal log.
+  Enforce a small **min-gap between sends** (e.g. ≥20–50 ms) so a burst of nudges + heartbeat can't
+  machine-gun the radio. The heartbeat task becomes a pure 250 ms timer that enqueues a PING (or the
+  tx task self-pings when the queue's been idle 250 ms).
+- Net: exactly one ESP-NOW TX context; `seq_` race gone; TX cadence controllable in one place.
+
+### Part B — coexistence audit (the real root cause; Part A alone may not be enough)
+- **Core affinity.** WiFi/ESP-NOW runs on core 0 (PRO_CPU). Find which cores the camera task,
+  radar UART reader, and servo/LVGL run on. Try pinning `rail_tx` deliberately (core 1 to keep TX
+  off the WiFi core, vs core 0 to serialize with WiFi) — measure both. Check camera-DMA ↔ WiFi bus
+  contention specifically (the camera path was live in #8/#9's final seconds).
+- **`esp_now_send` blocking / callback context.** Confirm it doesn't block the caller under WiFi
+  load; the funnel task can absorb any blocking without stalling callers. Keep `OnRecvStatic`
+  (WiFi-task ctx, L152) tiny — it already is.
+- **Interrupt/DMA priorities.** Audit radar UART @256000 ISR load, camera DMA channel, and WiFi
+  for priority inversion / starvation while all three run.
+- **Firmware-side TX pacer** during concurrent camera/radar activity (belt-and-braces with the
+  gateway's head-move pacer): back off rail TX rate when a photo/scan is in flight.
+
+### Verification (staged, serial-attached — do NOT skip)
+1. **Coredump partition FIRST** (see the coredump TODO / CRASH_LOG blind-spot): today the wedge is
+   below the panic handler, so nothing is captured. Get a coredump or JTAG on the wedge to see
+   *where* it dies before assuming Part A fixed it.
+2. Serial cap attached (`cap2.py`, DTR/RTS low = no reset). One variable at a time from a known
+   baseline: rail nudges alone → +radar 2 Hz → +camera photos → +head moves.
+3. **Success bar:** the full `look_at.py` rail-follow cadence (radar + head + rail nudges + camera)
+   runs **30+ min with zero lockups**. ONLY THEN flip `look_at.py`'s `RAIL_ENABLED` default back to
+   `1` and update WHEATLEY_LIMITS rule 2 + TRACKING_PLAN. Until then rail-follow stays opt-in.
+
+Cross-refs: WHEATLEY_LIMITS rule 2 · CRASH_LOG A1 (#4/#8/#9) · `look_at.py` `STACKCHAN_LOOKAT_RAIL`
+· the coredump-partition item · `rail_driver.cc` Send()/HeartbeatLoop.
+
 ## Live camera stream (companion "live" view)
 
 The companion app's Camera screen shows face-recognition results "live", but the firmware only
