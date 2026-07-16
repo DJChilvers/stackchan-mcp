@@ -53,7 +53,9 @@ std::optional<std::vector<MdnsGatewayCandidate>> DiscoverStackchanGateway(uint32
         return std::nullopt;
     }
 
-    wifi_ps_type_t previous_ps_mode = WIFI_PS_MIN_MODEM;
+    // Fallback if the get fails: restore PS_NONE, not upstream's MIN_MODEM — the
+    // stackchan board pins WIFI_PS_NONE board-wide and never wants modem-sleep.
+    wifi_ps_type_t previous_ps_mode = WIFI_PS_NONE;
     esp_err_t ps_get_err = esp_wifi_get_ps(&previous_ps_mode);
     if (ps_get_err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to read WiFi power-save mode before mDNS browse: %s",
