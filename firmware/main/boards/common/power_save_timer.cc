@@ -30,7 +30,9 @@ PowerSaveTimer::~PowerSaveTimer() {
 void PowerSaveTimer::SetEnabled(bool enabled) {
     if (enabled && !enabled_) {
         Settings settings("wifi", false);
-        if (!settings.GetBool("sleep_mode", true)) {
+        // stackchan-mcp fork: default OFF (was true). A factory/NVS reset must
+        // not silently re-enable sleeping; boards that want it set sleep_mode=1.
+        if (!settings.GetBool("sleep_mode", false)) {
             ESP_LOGI(TAG, "Power save timer is disabled by settings");
             return;
         }

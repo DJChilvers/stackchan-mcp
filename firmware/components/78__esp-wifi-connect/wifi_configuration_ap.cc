@@ -241,7 +241,7 @@ void WifiConfigurationAp::StartAccessPoint()
         if (err == ESP_OK) {
             sleep_mode_ = sleep_mode != 0;
         } else {
-            sleep_mode_ = true; // 默认值
+            sleep_mode_ = false; // stackchan-mcp fork default: sleep OFF (was true)
         }
 
         nvs_close(nvs);
