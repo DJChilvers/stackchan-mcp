@@ -7,6 +7,8 @@
 #
 #   Report only (no changes):   powershell -File stackchan-loops-check.ps1 -CheckOnly
 #   Report + heal (default):    powershell -File stackchan-loops-check.ps1
+#   Pause auto-heal:            create  %TEMP%\stackchan-loops-supervisor-paused
+#                               (supervisor then only reports; delete the file to resume)
 #
 param([switch]$CheckOnly)
 
@@ -24,13 +26,20 @@ $loops = @(
 $procs = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='pythonw.exe'"
 $healed = @()
 
+# Pause switch: if this marker exists, only REPORT — never heal. Lets you (or an agent)
+# deliberately stop a loop during a crash hunt without the scheduled task reviving it.
+$pauseMarker = Join-Path $env:TEMP 'stackchan-loops-supervisor-paused'
+$paused = [bool](Test-Path $pauseMarker)
+$heal = (-not $CheckOnly) -and (-not $paused)
+if ($paused) { Write-Output '(PAUSED — report only; delete the pause marker to resume healing)' }
+
 # --- Gateway: identified by the daemon listening on 8767, healed via its own task ---
 $gwUp = [bool](Get-NetTCPConnection -LocalPort 8767 -State Listen)
 if ($gwUp) {
   Write-Output ('{0,-14} UP' -f 'GATEWAY')
 } else {
   Write-Output ('{0,-14} DOWN' -f 'GATEWAY')
-  if (-not $CheckOnly) {
+  if ($heal) {
     schtasks /Run /TN "StackChan Gateway" | Out-Null
     $healed += 'GATEWAY'
   }
@@ -42,7 +51,7 @@ foreach ($l in $loops) {
   $n = $running.Count
   if ($n -eq 0) {
     Write-Output ('{0,-14} DOWN' -f $l.Name)
-    if (-not $CheckOnly) {
+    if ($heal) {
       Start-Process wscript.exe -ArgumentList ('"' + $base + $l.Vbs + '"') -WindowStyle Hidden
       $healed += $l.Name
     }
