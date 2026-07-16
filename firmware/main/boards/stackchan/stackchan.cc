@@ -542,7 +542,6 @@ private:
     LcdDisplay* display_;
     EspVideo* camera_;
     esp_timer_handle_t touchpad_timer_;
-    PowerSaveTimer* power_save_timer_;
     ScsBus scs_bus_;
     std::unique_ptr<Py32IoExpander> io_expander_;
 
@@ -2148,31 +2147,7 @@ private:
         AxisServo pitch_axis_;
     };
 
-    void InitializePowerSaveTimer() {
-        power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
-        power_save_timer_->OnEnterSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(10);
-        });
-        power_save_timer_->OnExitSleepMode([this]() {
-            GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness();
-        });
-        power_save_timer_->OnShutdownRequest([this]() {
-            // NEVER power off (2026-07-13). This fired repeatedly with power
-            // attached: at 100% the charger IC rests, IsDischarging() flips
-            // true, the battery handler armed this timer, and 5 idle minutes
-            // later a fully-charged, plugged-in Wheatley shut himself down.
-            // He lives on powered infrastructure (dock/USB) — log and refuse.
-            ESP_LOGW(TAG, "PowerSaveTimer shutdown request IGNORED (auto power-off disabled)");
-        });
-        // Start DISABLED so Wheatley never sleeps on USB power. The battery
-        // handler re-enables it only on a discharging transition (GetBatteryLevel),
-        // so on USB (discharging always false) it stays off; on battery it still
-        // sleeps. Fixes the old bug where the init `true` + change-only handler
-        // left sleep enabled forever on USB. See firmware/TODO.md "No sleep mode".
-        power_save_timer_->SetEnabled(false);
-    }
+    // InitializePowerSaveTimer() DELETED 2026-07-16 — see the ctor comment.
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -6924,7 +6899,13 @@ public:
     }
 
     StackChanBoard() {
-        InitializePowerSaveTimer();
+        // PowerSaveTimer REMOVED entirely (2026-07-16, user decision): Wheatley
+        // lives on powered infrastructure (dock/USB) and the rail lifecycle owns
+        // battery safety (self-docks at low battery, bridge dead-man rescue,
+        // charges even while off). The timer had already been neutered piecemeal
+        // (07-13: shutdown refused, discharge re-arm removed) and its remnants +
+        // stale comments kept misleading crash forensics — so it's gone, not
+        // just disabled. Sleep = a problem he doesn't have; naps are for cats.
         InitializeI2c();
         InitializePortAI2c();
         InitializeAxp2101();
@@ -7005,9 +6986,8 @@ public:
     }
 
     virtual void SetPowerSaveLevel(PowerSaveLevel level) override {
-        if (level != PowerSaveLevel::LOW_POWER) {
-            power_save_timer_->WakeUp();
-        }
+        // PowerSaveTimer removed (see ctor) — nothing to wake; WiFi PS is
+        // separately pinned to PS_NONE by the feed task + RailDriver anyway.
         WifiBoard::SetPowerSaveLevel(level);
     }
 
