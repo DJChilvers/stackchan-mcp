@@ -6882,28 +6882,43 @@ public:
     void WdtFeedTaskMain() {
         uint32_t ticks = 0;
         bool armed = false;
+        bool warned_down = false;
         for (;;) {
-            pmic_->FeedWatchdog();
-            // Arm the PMIC watchdog ONCE, ~60s after boot (NOT in the ctor — that
-            // reboot-looped him, CRASH #7: the heavy avatar/WiFi/wake-word boot starved
-            // this task past the timeout). By 60s boot is long done and this task's 4s
-            // feed cadence is proven. 128s timeout so only a TRUE wedge (this task stops
-            // entirely) fires it; ~2min auto-recovery still beats needing a human.
-            if (!armed && ++ticks >= 15) {              // 15 * 4s = ~60s uptime
-                pmic_->ConfigWatchdog(0b11, 0b111);      // full DCDC/LDO power-cycle, 128s
-                pmic_->FeedWatchdog();
-                pmic_->EnableWatchdog();
-                armed = true;
-                ESP_LOGI(TAG, "PMIC watchdog ARMED (late, full power-cycle, 128s, fed 4s)");
-            }
-            // Item 1 (FIRMWARE_HANDOFF): keep WIFI_PS_NONE asserted BOARD-WIDE,
-            // decoupled from the rail heartbeat. mDNS discovery restores MIN_MODEM
-            // and the PowerSaveTimer can push MAX_MODEM — both starve the concurrent
-            // radar+head+camera load and drop him off the gateway (the ~5-min drop).
-            // He's USB/dock-powered, so no-modem-sleep is the correct steady state.
-            // (This overrides self.wifi.set_power_save — intentional; NONE is the
-            //  unblocker. Revisit if pure-battery running is ever wanted.)
+            // Device-level WiFi liveness (same check rail_driver uses). This GATES the
+            // feed: a wedge that keeps the CPU/this-task alive but kills WiFi (the
+            // "network-wedge" lockup — host-unreachable, feed-task-still-running, which
+            // the plain watchdog MISSED on 2026-07-15 22:40) now stops the petting →
+            // the PMIC cold-cycles him. Deliberately WiFi-only (NOT the gateway WS):
+            // gating on the gateway link would reboot-loop him during a gateway restart.
+            wifi_ap_record_t ap;
+            bool wifi_ok = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK);
+
+            // Item 1: keep WIFI_PS_NONE asserted board-wide (mDNS/PowerSaveTimer
+            // otherwise restore modem-sleep and starve the concurrent radar+head+camera
+            // load → the old ~5-min drop). USB/dock-powered, so no-modem-sleep is right.
             esp_wifi_set_ps(WIFI_PS_NONE);
+
+            if (!armed) {
+                // Arm ONCE, after boot settles (~60s) AND WiFi is up — a slow-to-
+                // associate boot can't trip it, and arming in the ctor reboot-looped him
+                // (CRASH #7). Keep the reg fresh meanwhile (harmless while disabled).
+                pmic_->FeedWatchdog();
+                if (++ticks >= 15 && wifi_ok) {           // 15 * 4s = ~60s uptime
+                    pmic_->ConfigWatchdog(0b11, 0b111);    // full DCDC/LDO power-cycle, 128s
+                    pmic_->FeedWatchdog();
+                    pmic_->EnableWatchdog();
+                    armed = true;
+                    ESP_LOGI(TAG, "PMIC watchdog ARMED (connectivity-gated, full power-cycle, 128s)");
+                }
+            } else if (wifi_ok) {
+                pmic_->FeedWatchdog();                     // healthy → pet
+                if (warned_down) { ESP_LOGI(TAG, "wdt: WiFi back — feeding resumed"); warned_down = false; }
+            } else {
+                // WiFi down: WITHHOLD the feed. The 128s timeout is the grace — a brief
+                // reassociation resumes before it fires (no false reboot); a persistent
+                // WiFi-death cold-cycles him (auto-recovery, no human).
+                if (!warned_down) { ESP_LOGW(TAG, "wdt: WiFi DOWN — withholding feed (cold-cycle in ~128s if it persists)"); warned_down = true; }
+            }
             vTaskDelay(pdMS_TO_TICKS(4000));
         }
     }
