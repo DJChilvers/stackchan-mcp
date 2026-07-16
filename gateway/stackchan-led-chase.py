@@ -125,6 +125,12 @@ def _any_busy() -> bool:
     marker. One marker file per session_id — see module docstring."""
     any_active = False
     for path in glob.glob(BUSY_MARKER_GLOB):
+        # stackchan-busy-lookat is the radar tracker's QUIESCE marker — it
+        # asks the loops to go QUIET; it is not Claude activity. Animating
+        # the strip on it is exactly the concurrent LED traffic the tracker
+        # is trying to eliminate (2026-07-14, CRASH_LOG A1 lockups).
+        if os.path.basename(path) == "stackchan-busy-lookat":
+            continue
         stale_s = (
             DEVICECHAT_STALE_S
             if os.path.basename(path) == DEVICECHAT_MARKER_NAME
@@ -239,6 +245,16 @@ def main():
 
     while True:
         time.sleep(STEP_S)
+
+        # FULL LED QUIET while the radar tracker runs (CRASH #11, 2026-07-16):
+        # ignoring busy-lookat for ANIMATION (below in _any_busy) wasn't
+        # enough — idle repaints + state paints still wrote frames mid-track,
+        # and an LED write was part of the serial-captured death burst
+        # (tracker swing + rail TX + hook pose + set_all_leds in one instant).
+        # While the tracker's marker is fresh, write NOTHING to the strip.
+        if _marker_active(os.path.join(TEMP, "stackchan-busy-lookat"), 120.0):
+            have_session = False  # re-init cleanly when tracking ends
+            continue
 
         # Priority order: needs-attention > voice-thinking > busy. A session
         # going busy or another session's chase must not be able to bury the

@@ -150,6 +150,27 @@ elif isinstance(resp, list):
 
 BUSY_MARKER = os.path.join(TEMP, f"stackchan-busy-{session_id}")
 
+# ── CRASH #11 guard (2026-07-16): no device flourishes while he's TRACKING ──
+# The serial-captured hard wedge was THIS HOOK's say-done release pose
+# (move_head yaw=0 + IDLE_LED (0,25,90)) landing in the same instant as the
+# tracker's head-swing + rail TX (CRASH_LOG A1 #11; same fingerprint as #4).
+# While look_at's busy marker is fresh, the hook keeps its DEVICE actions
+# (avatar/pose/LED/talking-bob) to itself. SPEECH still happens — it's the
+# audio path, not a command burst, and it's the part the user actually needs.
+_LOOKAT_MARKER = os.path.join(TEMP, "stackchan-busy-lookat")
+
+
+def _lookat_active(stale_s: float = 120.0) -> bool:
+    try:
+        with open(_LOOKAT_MARKER) as f:
+            ts = float(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return time.time() - ts < stale_s
+
+
+TRACKING_QUIET = _lookat_active()
+
 # Rate-limit the urgent head-wobble + red-blink flourish — user reported it's
 # annoying when several Notifications fire close together while they're
 # already working (permission prompts etc. can repeat quickly). The physical
@@ -719,7 +740,7 @@ class TalkingBob:
 try:
     session = MCPSession(GATEWAY_URL)
     session.initialize()
-    if not skip_avatar:
+    if not skip_avatar and not TRACKING_QUIET:
         session.call_tool("set_avatar", {"face": face})
         run_head_moves(session, face)
     # Note: the busy LED itself (amber Cylon-style chase) is owned by the
@@ -728,7 +749,7 @@ try:
     # supersedes any static/blip LED set from this script while a turn is
     # in progress. This hook only writes/clears the marker (above) and
     # renders face/head/eye.
-    if mode == "busy-continue" and not error_detected:
+    if mode == "busy-continue" and not error_detected and not TRACKING_QUIET:
         # Eye does a fast upward flutter into the top lid on each completed
         # tool call ("Neo learning kung fu" download-look) via
         # set_mouth_sequence — a firmware-local step queue, so this is one
@@ -759,9 +780,11 @@ try:
             session.call_tool("set_avatar", {"face": "sad"})
         except Exception:
             pass
-    if mode == "say-done":
+    if mode == "say-done" and not TRACKING_QUIET:
         # Release the held busy look-down pose (if any) back to a relaxed
-        # look-at-the-user idle pose now that the turn is over.
+        # look-at-the-user idle pose now that the turn is over. Skipped
+        # entirely while tracking — THIS exact pose+LED pair, fired into a
+        # mid-track head-swing + rail TX, was the serial-captured CRASH #11.
         _y, _p = _orient(0, LOOK_UP_PITCH + 6)
         session.call_tool("move_head", {"yaw": _y, "pitch": _p})
         _set_leds(session, IDLE_LED)
@@ -772,8 +795,8 @@ try:
         # feel like nagging. Speech (below) still fires every time
         # regardless, since that's what actually says what he wants.
         flourish = _urgent_flourish_due()
-        _log(f"urgent-say: flourish_due={flourish} message_to_say={message_to_say!r}")
-        if flourish:
+        _log(f"urgent-say: flourish_due={flourish} tracking_quiet={TRACKING_QUIET} message_to_say={message_to_say!r}")
+        if flourish and not TRACKING_QUIET:
             run_head_moves(session, "urgent")
             # Blink red a few times to catch the eye, then HOLD solid red —
             # do not revert to idle blue here. A notification means work is
@@ -789,10 +812,17 @@ try:
                 _set_leds(session, (0, 0, 0))
                 time.sleep(0.12)
             _mark_urgent_flourish()
-        _set_leds(session, URGENT_LED)
+        if not TRACKING_QUIET:
+            _set_leds(session, URGENT_LED)
     if should_say and message_to_say:
-        with TalkingBob():
+        # While tracking, speak WITHOUT the TalkingBob head-bob thread — the
+        # bob is a ~2 Hz move_head stream that would fight the tracker's own
+        # swings (the multi-actor collision class of CRASH #11).
+        if TRACKING_QUIET:
             session.call_tool("say", {"text": message_to_say}, timeout=30)
+        else:
+            with TalkingBob():
+                session.call_tool("say", {"text": message_to_say}, timeout=30)
     elif should_say and not message_to_say:
         _log(f"should_say=True but message_to_say is empty — nothing spoken (mode={mode})")
 except Exception:

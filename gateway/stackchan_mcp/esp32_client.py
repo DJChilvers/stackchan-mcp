@@ -82,6 +82,39 @@ _TOOL_MIN_INTERVAL_S: dict[str, float] = {
     ),
 }
 
+# ── cross-actor DEVICE-COMMAND FUNNEL (CRASH #11, 2026-07-16) ──────────────
+# The lanes above serialize calls WITHIN one peripheral, but different lanes
+# dispatch CONCURRENTLY — and the serial-captured wedge shows exactly that
+# killing him: tracker head-swing + rail TX + a second actor's avatar change +
+# yaw-0 pose + LED write all landing in the same instant (same fingerprint as
+# crashes #3/#4; min free SRAM hit 12.9 KB in the same trace). No marker
+# discipline can fully prevent it (hooks/reactors are fire-and-forget), so the
+# gateway — the single point EVERY actor already goes through — enforces a
+# small global minimum gap between MUTATING dispatch STARTS, across all lanes
+# and all clients. Reads, safety calls (stop/torque), audio streaming, and the
+# camera are exempt. Calls are paced (briefly delayed), never dropped, and the
+# gap applies between starts only — a slow call does not serialize the world.
+_MUTATE_MIN_INTERVAL_S = float(os.environ.get("STACKCHAN_MUTATE_MIN_INTERVAL_S", "0.15"))
+_MUTATING_PREFIXES = ("self.display.", "self.led.", "self.port_b.ws2812.")
+_MUTATING_TOOLS = {
+    "self.robot.set_head_angles",
+    "self.rail.home",
+    "self.rail.move_mm",
+    "self.rail.nudge_mm",
+    "self.rail.jog",
+    "self.screen.set_brightness",
+    "self.screen.set_theme",
+}
+
+
+def _is_mutating(tool_name: str) -> bool:
+    """True for device-state-changing tools that join the global funnel.
+    Deliberately NOT included: reads (get_*/status/presence/imu/light),
+    safety calls (self.rail.stop, set_servo_torque, set_auto_torque_release —
+    must never wait), audio frames/TTS (streamed, not a command burst), and
+    take_photo (heavy but paced by its own loop, paused during tracking)."""
+    return tool_name in _MUTATING_TOOLS or tool_name.startswith(_MUTATING_PREFIXES)
+
 
 def _retrieve_future_exception(future: asyncio.Future[Any]) -> None:
     """Mark a completed Future exception as observed, if it has one."""
@@ -648,6 +681,12 @@ class ESP32Manager:
         # _TOOL_MIN_INTERVAL_S. Accessed only while holding the tool's lane
         # lock, so no extra synchronisation is needed.
         self._tool_last_dispatch: dict[str, float] = {}
+        # Cross-actor device-command funnel (CRASH #11): one gate + one global
+        # last-mutating-dispatch stamp shared by ALL lanes/clients. The gate is
+        # held only while computing/sleeping the gap, never across the actual
+        # device call, so a slow tool can't serialize unrelated calls.
+        self._mutate_gate = asyncio.Lock()
+        self._mutate_last_dispatch: float = float("-inf")
         self._tool_lane_locks = {
             "servo": asyncio.Lock(),
             "wifi": asyncio.Lock(),
@@ -1495,6 +1534,18 @@ class ESP32Manager:
                 if wait > 0.0:
                     await asyncio.sleep(wait)
                 self._tool_last_dispatch[name] = time.monotonic()
+            # Cross-actor funnel (CRASH #11): enforce a small global gap between
+            # mutating dispatch STARTS across ALL lanes, so simultaneous bursts
+            # from independent actors (tracker + hook + reactor + LED loop)
+            # physically cannot land on the device in the same instant. The gate
+            # is released before the actual call — gap between starts only.
+            if _MUTATE_MIN_INTERVAL_S > 0.0 and _is_mutating(name):
+                async with self._mutate_gate:
+                    now = time.monotonic()
+                    wait = self._mutate_last_dispatch + _MUTATE_MIN_INTERVAL_S - now
+                    if wait > 0.0:
+                        await asyncio.sleep(wait)
+                    self._mutate_last_dispatch = time.monotonic()
             return await connection.call_tool(name, arguments)
 
     async def send_avatar_set_fetch(
