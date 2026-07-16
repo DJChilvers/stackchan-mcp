@@ -1873,7 +1873,36 @@ class Handler(BaseHTTPRequestHandler):
         ).start()
 
 
+# ── single-instance lock (same pattern as stackchan-idle.py / -led-chase.py) ──
+# The intended guard was "bind port 8768 fails if already running" — but on WINDOWS
+# ThreadingHTTPServer's default allow_reuse_address=True lets a SECOND instance bind
+# the same port silently (SO_REUSEADDR ≠ Linux semantics), so duplicates slipped
+# through (two bridges both grabbing touch/mic → double-talk + reboot dogpile load).
+# Use the file lock the other loops use instead: first instance holds byte 0 of the
+# lock file for its lifetime; any second instance hits OSError and exits silently.
+import atexit
+import msvcrt
+
+_LOCK_FILE = os.path.join(
+    os.environ.get("TEMP", os.environ.get("TMP", ".")), "stackchan-voice-bridge.lock"
+)
+_lock_fh = None
+
+def _acquire_lock() -> None:
+    global _lock_fh
+    try:
+        _lock_fh = open(_LOCK_FILE, "a+b")
+        msvcrt.locking(_lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        if _lock_fh:
+            _lock_fh.close()
+        sys.exit(0)   # another instance holds the lock — back off silently
+
+atexit.register(lambda: _lock_fh.close() if _lock_fh else None)
+
+
 def main():
+    _acquire_lock()   # exit now if a voice bridge is already running
     logger.info(
         "starting voice bridge on %s:%d (whisper=%s, claude_model=%s)",
         LISTEN_HOST, LISTEN_PORT, WHISPER_MODEL_NAME, ANTHROPIC_MODEL,
