@@ -74,65 +74,124 @@ bool RailDriver::Init() {
              kBridgeMac[0], kBridgeMac[1], kBridgeMac[2], kBridgeMac[3], kBridgeMac[4], kBridgeMac[5],
              WifiChannel());
 
-    // Heartbeat: ping the bridge at 4 Hz so its channel-scanner locks onto our
-    // WiFi channel and stays locked (bridge link timeout is 10 s). Started once
-    // per boot; Init() is idempotent so this can't run twice.
-    if (hb_task_ == nullptr) {
-        BaseType_t ok = xTaskCreate(&RailDriver::HeartbeatTaskTrampoline, "rail_hb",
-                                    3072, this, tskIDLE_PRIORITY + 1, &hb_task_);
+    // TX ISOLATION (2026-07-16, firmware/TODO.md "RailDriver TX isolation"):
+    // ONE task owns esp_now_send. The old design had TWO unsynchronised send
+    // contexts (rail_hb 4 Hz pings + the MCP command path), racing ++seq_ and
+    // hitting the shared radio concurrently with radar UART + camera DMA —
+    // implicated in the hard lockups (CRASH_LOG A1 #4/#9). Now commands are
+    // queued and rail_tx serialises everything with a min gap. Pinned to core
+    // 1 (APP_CPU) to keep our part of TX churn off the WiFi core; flip to 0
+    // when measuring the Part-B coexistence matrix. Started once per boot;
+    // Init() is idempotent so this can't run twice.
+    if (tx_q_ == nullptr) {
+        tx_q_ = xQueueCreate(8, sizeof(TxItem));
+        if (tx_q_ == nullptr) {
+            ESP_LOGE(TAG, "failed to create rail tx queue");
+            return false;
+        }
+    }
+    if (tx_task_ == nullptr) {
+        BaseType_t ok = xTaskCreatePinnedToCore(&RailDriver::TxTaskTrampoline, "rail_tx",
+                                                3072, this, tskIDLE_PRIORITY + 1, &tx_task_, 1);
         if (ok != pdPASS) {
-            ESP_LOGE(TAG, "failed to create rail_hb task (bridge may unlock after idle)");
-            hb_task_ = nullptr;
+            ESP_LOGE(TAG, "failed to create rail_tx task (rail TX dead this boot)");
+            tx_task_ = nullptr;
         }
     }
     return true;
 }
 
-void RailDriver::HeartbeatTaskTrampoline(void* arg) {
-    static_cast<RailDriver*>(arg)->HeartbeatLoop();
+void RailDriver::TxTaskTrampoline(void* arg) {
+    static_cast<RailDriver*>(arg)->TxLoop();
 }
 
-void RailDriver::HeartbeatLoop() {
-    uint32_t ticks = 0;
+void RailDriver::TxLoop() {
+    // Enforced quiet time between consecutive sends: a burst of nudges + pings
+    // can never machine-gun the radio. 25 ms still allows ~40 pkt/s, far above
+    // anything the rail legitimately does (heartbeat 4 Hz, nudges ~0.25 Hz).
+    static constexpr uint32_t kMinGapMs = 25;
+    uint32_t last_ps_ms = 0;
     uint32_t last_fail_log_ms = 0;
     bool     fail_logged_once = false;
     for (;;) {
-        // Re-assert WIFI_PS_NONE every ~40 ticks (~10 s): mdns discovery
-        // restore and power-save transitions can silently put modem sleep
-        // back, which deafens ESP-NOW RX (see Init()).
-        if ((ticks++ % 40) == 0) {
+        // Re-assert WIFI_PS_NONE every ~10 s: mdns discovery restore and
+        // power-save transitions can silently put modem sleep back, which
+        // deafens ESP-NOW RX (see Init()).
+        uint32_t now = now_ms();
+        if (now - last_ps_ms >= 10000) {
             esp_wifi_set_ps(WIFI_PS_NONE);
+            last_ps_ms = now;
         }
-        // Quiet ping: no per-send logging at 4 Hz; failures at most every ~10 s.
-        if (!Send(RCMD_PING, 0, /*quiet=*/true)) {
-            uint32_t now = now_ms();
-            if (!fail_logged_once || now - last_fail_log_ms >= 10000) {
-                ESP_LOGW(TAG, "heartbeat ping not sending (wifi down or esp-now error)");
-                last_fail_log_ms = now;
-                fail_logged_once = true;
+
+        TxItem item{};
+        if (xQueueReceive(tx_q_, &item, pdMS_TO_TICKS(250)) != pdTRUE) {
+            // Idle 250 ms with nothing queued -> heartbeat ping so the bridge's
+            // channel-scanner stays locked (link timeout 10 s). Real commands
+            // bump the bridge's lastRxMs too, so pings only need to fill
+            // SILENCE — during a command burst no extra ping traffic is added
+            // (net LESS TX during rail-follow than the old always-4 Hz ping).
+            item.pkt.magic = RAIL_MAGIC_CMD;
+            item.pkt.cmd   = RCMD_PING;
+            item.pkt.arg   = 0;
+            portENTER_CRITICAL(&seq_mux_);
+            item.pkt.seq = ++seq_;
+            portEXIT_CRITICAL(&seq_mux_);
+            item.quiet = true;
+        }
+
+        if (!TransmitNow(item)) {
+            if (item.quiet) {
+                // Quiet (ping) failures rate-limit to one log per ~10 s.
+                now = now_ms();
+                if (!fail_logged_once || now - last_fail_log_ms >= 10000) {
+                    ESP_LOGW(TAG, "heartbeat ping not sending (wifi down or esp-now error)");
+                    last_fail_log_ms = now;
+                    fail_logged_once = true;
+                }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(250));
+        vTaskDelay(pdMS_TO_TICKS(kMinGapMs));
     }
 }
 
+bool RailDriver::TransmitNow(const TxItem& item) {
+    // rail_tx task context ONLY — the single esp_now_send call site.
+    esp_err_t err = esp_now_send(kBridgeMac, (const uint8_t*)&item.pkt, sizeof(item.pkt));
+    if (err != ESP_OK) {
+        if (!item.quiet) {
+            ESP_LOGW(TAG, "esp_now_send cmd=%u arg=%ld failed: %s",
+                     item.pkt.cmd, (long)item.pkt.arg, esp_err_to_name(err));
+        }
+        return false;
+    }
+    if (!item.quiet) {
+        ESP_LOGI(TAG, "TX cmd=%u arg=%ld seq=%u", item.pkt.cmd, (long)item.pkt.arg, item.pkt.seq);
+    }
+    return true;
+}
+
 bool RailDriver::Send(uint8_t cmd, int32_t arg, bool quiet) {
-    if (!initialized_) {
+    if (!initialized_ || tx_q_ == nullptr) {
         if (!quiet) ESP_LOGW(TAG, "Send(%u) before Init()", cmd);
         return false;
     }
-    RailCmdPacket pkt{};
-    pkt.magic = RAIL_MAGIC_CMD;
-    pkt.cmd   = cmd;
-    pkt.arg   = arg;
-    pkt.seq   = ++seq_;
-    esp_err_t err = esp_now_send(kBridgeMac, (const uint8_t*)&pkt, sizeof(pkt));
-    if (err != ESP_OK) {
-        // quiet (heartbeat) sends rate-limit their own failure logging.
-        if (!quiet) ESP_LOGW(TAG, "esp_now_send cmd=%u arg=%ld failed: %s", cmd, (long)arg, esp_err_to_name(err));
+    TxItem item{};
+    item.pkt.magic = RAIL_MAGIC_CMD;
+    item.pkt.cmd   = cmd;
+    item.pkt.arg   = arg;
+    item.quiet     = quiet;
+    // Stamp seq at enqueue (not at TX) so the MCP reply's last_seq equals the
+    // command just issued — the harness verifies delivery by ack_seq >= that.
+    // FIFO queue + single consumer keeps wire order == seq order.
+    portENTER_CRITICAL(&seq_mux_);
+    item.pkt.seq = ++seq_;
+    portEXIT_CRITICAL(&seq_mux_);
+    // Drop-on-full: the rail is fire-and-forget by design (a lost nudge is
+    // re-sent by the next tracking tick; MCP callers verify via ack_seq).
+    if (xQueueSend(tx_q_, &item, 0) != pdTRUE) {
+        if (!quiet) ESP_LOGW(TAG, "tx queue full — dropped cmd=%u seq=%u", cmd, item.pkt.seq);
         return false;
     }
-    if (!quiet) ESP_LOGI(TAG, "TX cmd=%u arg=%ld seq=%u", cmd, (long)arg, pkt.seq);
     return true;
 }
 

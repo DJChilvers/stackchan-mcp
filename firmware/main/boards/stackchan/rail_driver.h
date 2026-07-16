@@ -25,6 +25,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_now.h"   // esp_now_recv_info_t (5.x recv-callback signature)
 
 class RailDriver {
@@ -55,8 +56,10 @@ public:
     bool Init();
     bool initialized() const { return initialized_; }
 
-    // Commands. Each returns true if the packet was handed to esp_now_send OK
-    // (NOT that the bridge acted on it — check GetStatus() for that).
+    // Commands. Each returns true if the packet was QUEUED for transmission OK
+    // (NOT that it hit the air, and NOT that the bridge acted on it — verify
+    // delivery via GetStatus().ack_seq >= the reply's last_seq, as ever). All
+    // actual esp_now_send calls happen on the single rail_tx task — see TxLoop.
     bool Home();
     bool MoveMm(float mm);      // ABSOLUTE target from home (needs the bridge homed)
     bool NudgeMm(float mm);     // RELATIVE delta, clamped bridge-side to +/-100mm
@@ -68,22 +71,41 @@ public:
     uint8_t WifiChannel();     // current associated STA channel, or 0 if not connected
 
 private:
+    // One queued outbound packet. seq is stamped at ENQUEUE time (under
+    // seq_mux_) so the MCP tool reply's last_seq still equals the command it
+    // just issued — the ack-verify harness contract (ack_seq >= last_seq).
+    struct TxItem {
+        RailCmdPacket pkt;
+        bool          quiet;   // heartbeat pings: no per-send logging
+    };
+
     RailDriver() = default;
     bool Send(uint8_t cmd, int32_t arg, bool quiet = false);
     static void OnRecvStatic(const esp_now_recv_info_t* info, const uint8_t* data, int len);
     void OnRecv(const uint8_t* src_mac, const uint8_t* data, int len);
-    // Heartbeat: 4 Hz RCMD_PING so the bridge's channel-scanner locks onto us
-    // and stays locked (its link timeout is 10 s). Started once by Init().
-    static void HeartbeatTaskTrampoline(void* arg);
-    void HeartbeatLoop();
+    // TX ISOLATION (2026-07-16, the rail-follow lockup fix — firmware/TODO.md
+    // "RailDriver TX isolation"): rail_tx is the ONLY code that ever calls
+    // esp_now_send. Commands enqueue; the task drains the queue with a min gap
+    // between sends, and fills idle 250 ms gaps with a quiet RCMD_PING so the
+    // bridge's channel-scanner stays locked (its link timeout is 10 s; ANY
+    // valid packet — command or ping — bumps its lastRxMs, so commands
+    // themselves keep the link alive and pings only fill silence). Replaces
+    // the old rail_hb task, which raced Send() from the MCP task context
+    // (two unsynchronised esp_now_send callers + a shared ++seq_) — the
+    // concurrency implicated in the hard lockups (CRASH_LOG A1 #4/#9).
+    static void TxTaskTrampoline(void* arg);
+    void TxLoop();
+    bool TransmitNow(const TxItem& item);   // rail_tx task context ONLY
 
     bool             initialized_ = false;
     SemaphoreHandle_t lock_ = nullptr;    // guards last_status_/last_rx_ms_
     RailStatusPacket last_status_{};      // most recent packet from the bridge
     bool             have_status_ = false;
     uint32_t         last_rx_ms_ = 0;     // esp_timer ms of last status
-    uint16_t         seq_ = 0;            // outgoing command sequence
-    TaskHandle_t     hb_task_ = nullptr;  // heartbeat task (never deleted)
+    uint16_t         seq_ = 0;            // outgoing command sequence (seq_mux_)
+    portMUX_TYPE     seq_mux_ = portMUX_INITIALIZER_UNLOCKED;
+    QueueHandle_t    tx_q_ = nullptr;     // TxItem queue -> rail_tx task
+    TaskHandle_t     tx_task_ = nullptr;  // the single TX task (never deleted)
 };
 
 // Registers the self.rail.* MCP tools (implemented in rail_mcp.cc). Call once
