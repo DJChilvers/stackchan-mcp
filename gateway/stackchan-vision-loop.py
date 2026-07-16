@@ -368,30 +368,25 @@ def _clear_marker(path: str) -> None:
 # is currently visible.
 MOTION_DIFF_THRESHOLD = float(os.environ.get("STACKCHAN_VISION_MOTION_THRESHOLD", "12.0"))
 
-# "Lights out" detection: there's no ambient light sensor exposed via any
-# MCP tool (checked live 2026-07-03 — the LTR-553ALS may exist on the chip
-# but nothing reads it), so this approximates one using the camera itself —
-# reuses the SAME downscaled grayscale frame already computed for motion-
-# diff, no extra capture/compute. Tracks a short rolling history and fires
-# only when a reasonably-lit baseline transitions to GENUINELY dark frames
-# (two consecutive, in absolute terms — see LIGHTS_OUT_MAX_DARK), so it
-# doesn't fire on gradual dusk, a single noisy frame, or a mere exposure
-# drop in a room that's still clearly lit.
+# "Lights out" detection — SENSOR ONLY (2026-07-16). Previously approximated
+# from the camera's mean brightness, which false-fired on auto-exposure dips /
+# a hand over the lens / a dark corner, AND needed a photo (so once the radar
+# gate stopped ambient photos it couldn't work in an empty room). Now it reads
+# the LTR-553 ambient-light sensor directly (self.light.read, firmware
+# 2026-07-12+) on a slow independent poll — no camera involved. Fires on a real
+# lit->dark transition: a lit baseline (ch0 >= LUX_LIT_MIN_CH0) then two
+# consecutive genuinely-dark reads (ch0 <= LUX_DARK_MAX_CH0), once per cooldown.
+# Sensor missing / old firmware / any error -> no lights-out (silent, no guess).
 LIGHTS_OUT_HISTORY_LEN = 5
-LIGHTS_OUT_MIN_BASELINE = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_MIN_BASELINE", "60.0"))
-# The frame must now be genuinely DARK in absolute terms (grayscale mean,
-# 0-255), not merely a big drop from baseline — the old drop-only rule fired
-# in broad daylight (2026-07-06: 11:33/12:28/13:15) on auto-exposure shifts,
-# a hand near the lens, or the idle wander pointing him at a dark corner.
-# ~12 is "lights off at night" territory; a dim evening room reads 25-40.
-# Two consecutive dark ticks are required, so a one-frame transient (hand
-# over lens) can't trigger it. Superseded STACKCHAN_VISION_LIGHTS_OUT_DROP_
-# THRESHOLD, which is gone — with a lit baseline and a truly-dark now, the
-# drop is implied. NOTE: the real fix is the LTR-553 ambient light sensor,
-# unlocked in the next firmware flash (see firmware/TODO.md) — prefer lux
-# over this camera approximation once it exists.
-LIGHTS_OUT_MAX_DARK = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_MAX_DARK", "12.0"))
 LIGHTS_OUT_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_LIGHTS_OUT_COOLDOWN_S", str(30 * 60)))
+LIGHTS_LUX_ENABLED = os.environ.get("STACKCHAN_VISION_LIGHTS_LUX", "1").strip() not in ("0", "false", "no", "")
+# How often to poll the lux sensor (a device I2C read). Slow on purpose —
+# lights-out needs no fine resolution, and this keeps peripheral load off him.
+LIGHTS_LUX_POLL_S = float(os.environ.get("STACKCHAN_VISION_LIGHTS_LUX_POLL_S", "30"))
+# ch0 (visible) thresholds. Calibrate once real dark/lit samples exist (an
+# evening-lit bench read ch0 ~= 4-6; lights fully off should read ~0-1).
+LUX_LIT_MIN_CH0 = float(os.environ.get("STACKCHAN_VISION_LUX_LIT_MIN", "3"))
+LUX_DARK_MAX_CH0 = float(os.environ.get("STACKCHAN_VISION_LUX_DARK_MAX", "1"))
 
 # Set when an unrecognized face triggers the "who are you?" prompt (see
 # sensor_reactor.py's _behavior_recognize unknown branch); stackchan-voice-
@@ -505,6 +500,18 @@ CAMERA_RECHECK_S = float(os.environ.get("STACKCHAN_VISION_CAMERA_RECHECK_S", "45
 IDLE_POLL_S = float(os.environ.get("STACKCHAN_VISION_IDLE_POLL_S", "6"))
 CAMERA_REQUEST_MARKER = os.path.join(TEMP, "stackchan-vision-request")
 
+# ── Idle ambient scans (2026-07-16) ───────────────────────────────────────
+# While the room is EMPTY (radar healthy + no target), occasionally spend ONE
+# photo on a passive, no-face, no-speech pass — ArUco tool/tag locations into
+# object_locations.json + keep object-novelty warm — so passive tool-location
+# learning survives the radar gate (which otherwise means zero photos, hence
+# zero looking-around, whenever nobody is in front of him). Deliberately SLOW
+# (default 180s) and head-settle gated, so it can't recreate the #36 photo-flood
+# lockup; skipped entirely when radar is UNAVAILABLE (a radar error usually
+# means the device is offline, and take_photo would just stall on its timeout).
+AMBIENT_SCAN_ENABLED = os.environ.get("STACKCHAN_VISION_AMBIENT_SCAN", "1").strip() not in ("0", "false", "no", "")
+AMBIENT_SCAN_S = float(os.environ.get("STACKCHAN_VISION_AMBIENT_SCAN_S", "180"))
+
 
 def _marker_active(path: str, stale_s: float) -> bool:
     try:
@@ -608,19 +615,42 @@ class MCPSession:
         )
 
 
-def _radar_person_present(sess: MCPSession) -> bool:
-    """True if the LD2450 radar currently sees a target. Cheap — no camera. Fail-safe:
-    on ANY error return False, so a flaky radar read means NO photo (fail toward no
-    load), never a spurious camera burst."""
+_RADAR_WARN = {"ts": 0.0}
+RADAR_WARN_COOLDOWN_S = float(os.environ.get("STACKCHAN_VISION_RADAR_WARN_COOLDOWN_S", "300"))
+
+
+def _warn_radar(msg: str) -> None:
+    """Throttled WARNING when the radar read fails / reports not-ok — so a dead
+    radar (which silently pauses all presence-gated camera work) is
+    distinguishable in the log from a genuinely empty room. A clean empty read
+    never warns. At most once per RADAR_WARN_COOLDOWN_S."""
+    now = time.time()
+    if now - _RADAR_WARN["ts"] >= RADAR_WARN_COOLDOWN_S:
+        _RADAR_WARN["ts"] = now
+        logger.warning("radar unavailable (%s) — presence-gated camera paused until it recovers", msg)
+
+
+def _radar_read(sess: MCPSession) -> tuple[bool, bool]:
+    """Read the LD2450 radar. Cheap — no camera. Returns (ok, present):
+      ok=False      = radar unavailable (error / ok:false / no content),
+      present=True  = at least one target in view.
+    Fail-safe: ANY problem -> (False, False), so a flaky radar means NO photo
+    (fail toward no load), never a spurious burst. An error (as opposed to a
+    clean empty read) additionally logs a throttled warning via _warn_radar."""
     try:
         result = sess.call_tool("self.presence.read", {}, timeout=5)
         content = ((result or {}).get("result") or {}).get("content", [])
         if not content:
-            return False
+            _warn_radar("no content")
+            return (False, False)
         info = json.loads(content[0].get("text", "") or "{}")
-        return bool(info.get("ok")) and len(info.get("targets") or []) > 0
-    except Exception:
-        return False
+        if not info.get("ok"):
+            _warn_radar("presence.read ok=false")
+            return (False, False)
+        return (True, len(info.get("targets") or []) > 0)
+    except Exception as exc:
+        _warn_radar(f"presence.read failed: {exc}")
+        return (False, False)
 
 
 def _camera_request_fresh() -> bool:
@@ -638,17 +668,30 @@ def _camera_request_fresh() -> bool:
     return False
 
 
-def _camera_needed(sess: MCPSession, last_photo_ts: float, once: bool) -> bool:
-    """Radar-gated camera decision (TRACKING_PLAN §0.5). Fire a photo ONLY when:
-    single-run / gate disabled, OR an explicit request, OR radar sees a person AND
-    we're due to (re)identify. Empty room or a fresh identity → no camera."""
+def _camera_decision(sess: MCPSession, last_photo_ts: float,
+                     last_ambient_ts: float, once: bool) -> str | None:
+    """Radar-gated camera decision (TRACKING_PLAN §0.5), extended with idle
+    ambient scans. Returns one of:
+      "identify" — take a full face/greeting photo (person present & due, an
+                   explicit request, or gate disabled / single-run).
+      "ambient"  — take a passive no-face scan (room empty, radar healthy, and
+                   AMBIENT_SCAN_S elapsed): learn tool/tag locations, no speech.
+      None       — no photo this cycle (present but identity still fresh, radar
+                   down, or not yet due) — caller just does the cheap radar poll.
+    """
     if once or not RADAR_GATE:
-        return True
+        return "identify"
     if _camera_request_fresh():
-        return True
-    if not _radar_person_present(sess):
-        return False
-    return (time.time() - last_photo_ts) >= CAMERA_RECHECK_S
+        return "identify"
+    ok, present = _radar_read(sess)
+    if present:
+        return "identify" if (time.time() - last_photo_ts) >= CAMERA_RECHECK_S else None
+    # Room empty. Passive ambient scan only when radar is HEALTHY — a radar
+    # error usually means the device is offline, and we must not stall on a
+    # take_photo timeout every cycle chasing tags nobody can see.
+    if ok and AMBIENT_SCAN_ENABLED and (time.time() - last_ambient_ts) >= AMBIENT_SCAN_S:
+        return "ambient"
+    return None
 
 
 def _take_photo(sess: MCPSession, question: str) -> str | None:
@@ -1076,58 +1119,59 @@ def _motion_score(prev_small, cur_small) -> float:
     return float(diff.mean())
 
 
-def _brightness(small_gray) -> float:
-    return float(small_gray.mean())
-
-
-def _check_lights_out(brightness: float, history: list, last_lights_out_ts: dict) -> bool:
-    """Returns True if this looks like a sudden lights-out transition —
-    caller decides what to do with that (fire the reaction, apply the
-    cooldown). `history` is a mutable list used as an out-param (oldest
-    first, capped at LIGHTS_OUT_HISTORY_LEN) so the caller doesn't need to
-    thread more state through _tick's already-long parameter list.
-    """
-    triggered = False
-    if len(history) >= 3:
-        # history[-1] is LAST tick's frame; the baseline deliberately
-        # excludes it so the "was the room lit before?" check isn't dragged
-        # down by the first dark frame of the transition we're confirming.
-        prev = history[-1]
-        older = history[:-1]
-        baseline = sum(older) / len(older)
-        now = time.time()
-        if (
-            brightness <= LIGHTS_OUT_MAX_DARK
-            and prev <= LIGHTS_OUT_MAX_DARK
-            and baseline >= LIGHTS_OUT_MIN_BASELINE
-            and now - last_lights_out_ts.get("ts", 0.0) >= LIGHTS_OUT_COOLDOWN_S
-        ):
-            last_lights_out_ts["ts"] = now
-            triggered = True
-    history.append(brightness)
-    del history[:-LIGHTS_OUT_HISTORY_LEN]
-    return triggered
-
-
-# Real-lux veto for lights-out (2026-07-12): the camera's mean-brightness guess
-# false-triggers (auto-exposure dips, hand over lens, dark corners). When the
-# camera THINKS the lights went out, ask the LTR-553 (self.light.read, firmware
-# 2026-07-12+) before firing. ch0 counts >= this = room actually lit -> veto.
-# Calibrate once real dark/lit samples exist (evening lit bench read ch0≈4-6).
-LUX_LIT_MIN_CH0 = float(os.environ.get("STACKCHAN_VISION_LUX_LIT_MIN", "3"))
-
-
-def _lux_says_lit(sess: "MCPSession") -> bool:
-    """True when the ambient-light sensor says the room is LIT (veto a camera
-    lights-out). Sensor missing / old firmware / any error -> False (fall back
-    to trusting the camera, i.e. today's behaviour)."""
+def _read_lux_ch0(sess: "MCPSession") -> float | None:
+    """The LTR-553's ch0 (visible) count, or None if the sensor is missing /
+    firmware too old / any error — the caller treats None as 'no reading',
+    never as dark, so a missing sensor can never fire a false lights-out."""
     try:
         resp = sess.call_tool("self.light.read", {}, timeout=6)
         text = (((resp or {}).get("result") or {}).get("content") or [{}])[0].get("text", "{}")
         d = json.loads(text)
-        return bool(d.get("ok")) and float(d.get("ch0", 0)) >= LUX_LIT_MIN_CH0
+        if not d.get("ok"):
+            return None
+        return float(d.get("ch0", 0))
     except Exception:
-        return False
+        return None
+
+
+def _check_lights_out_lux(sess: "MCPSession", lux_state: dict) -> None:
+    """Sensor-only lights-out: on a slow LIGHTS_LUX_POLL_S cadence, read the lux
+    ch0 and fire /react/lights_out on a genuine lit->dark transition — a lit
+    baseline then two consecutive dark reads, at most once per
+    LIGHTS_OUT_COOLDOWN_S. `lux_state` = {"history": [...], "ts": last_fire,
+    "poll_ts": last_poll}. Independent of the camera, so it works in an empty
+    (dark) room too. Never raises out to the loop."""
+    if not LIGHTS_LUX_ENABLED or LIGHTS_OUT_COOLDOWN_S <= 0:
+        return
+    now = time.time()
+    if now - lux_state.get("poll_ts", 0.0) < LIGHTS_LUX_POLL_S:
+        return
+    lux_state["poll_ts"] = now
+    ch0 = _read_lux_ch0(sess)
+    if ch0 is None:
+        return
+    hist = lux_state.setdefault("history", [])
+    triggered = False
+    if len(hist) >= 3:
+        # hist[-1] is the previous read; the baseline excludes it so the "was
+        # it lit before?" check isn't dragged down by the first dark read of
+        # the transition we're confirming (mirrors the old camera logic).
+        prev = hist[-1]
+        older = hist[:-1]
+        baseline = sum(older) / len(older)
+        if (
+            ch0 <= LUX_DARK_MAX_CH0
+            and prev <= LUX_DARK_MAX_CH0
+            and baseline >= LUX_LIT_MIN_CH0
+            and now - lux_state.get("ts", 0.0) >= LIGHTS_OUT_COOLDOWN_S
+        ):
+            lux_state["ts"] = now
+            triggered = True
+    hist.append(ch0)
+    del hist[:-LIGHTS_OUT_HISTORY_LEN]
+    if triggered:
+        logger.info("lights-out (lux): ch0=%.1f fell from a lit baseline (>= %.1f)", ch0, LUX_LIT_MIN_CH0)
+        _fire_lights_out()
 
 
 def _fire_lights_out() -> None:
@@ -1624,10 +1668,13 @@ def _save_locations(mem: dict) -> None:
     os.replace(tmp, OBJECT_LOCATIONS_PATH)
 
 
-def _ambient_marker_pass(sess: MCPSession, img, aruco_state: dict) -> None:
+def _ambient_marker_pass(sess: MCPSession, img, aruco_state: dict,
+                         every_n_gate: bool = True) -> None:
     """Ambient object-location memory: upsert object_locations.json for every
     registry-known ArUco marker visible in this tick's frame (see the ARUCO_*
-    config comment). Runs every ARUCO_EVERY_N-th executed tick, and re-checks
+    config comment). On the per-tick identify path it runs every ARUCO_EVERY_N-th
+    executed tick; the slow idle ambient scan passes every_n_gate=False (it's
+    already rate-limited by AMBIENT_SCAN_S, so every scan should count). Re-checks
     the busy/head-moved markers at pass time (they can appear mid-tick).
     Upserts bump seen_count and refresh ts/station/method (find_item.py's
     remember() semantics, method="ambient"); a NEW or MOVED (>
@@ -1639,9 +1686,10 @@ def _ambient_marker_pass(sess: MCPSession, img, aruco_state: dict) -> None:
     if not ARUCO_ENABLED:
         return
     try:
-        aruco_state["tick"] = aruco_state.get("tick", 0) + 1
-        if aruco_state["tick"] % ARUCO_EVERY_N:
-            return
+        if every_n_gate:
+            aruco_state["tick"] = aruco_state.get("tick", 0) + 1
+            if aruco_state["tick"] % ARUCO_EVERY_N:
+                return
         if _should_skip_tick() or _head_settling():
             return
         registry = _load_marker_registry()
@@ -1688,24 +1736,76 @@ def _ambient_marker_pass(sess: MCPSession, img, aruco_state: dict) -> None:
                            "further failures logged at DEBUG)", exc_info=True)
 
 
+def _ambient_scan(sess: MCPSession, object_model, object_last_seen: dict,
+                  aruco_state: dict) -> bool:
+    """Idle empty-room scan (radar healthy + no person): ONE photo, no face, no
+    speech. Learns tool/tag locations (ArUco -> object_locations.json) and keeps
+    object-novelty warm so a returning user doesn't get a stale 'new object!'
+    burst. Head-settle gated (never a moving/blurred frame); returns True only if
+    a photo was actually captured (a still-moving head returns False so the
+    caller retries next cycle rather than burning the whole slow AMBIENT_SCAN_S).
+    Never raises out to the loop."""
+    import cv2
+
+    # Same "don't shoot mid-move" gate as _tick — wait briefly for the head to
+    # settle, else bail (the idle wander moves it; a blurred tag won't decode).
+    _settle_waited = 0.0
+    while _head_settling() and _settle_waited < HEAD_SETTLE_MAX_WAIT_S:
+        time.sleep(0.1)
+        _settle_waited += 0.1
+    if _head_settling():
+        return False
+
+    path = _take_photo(sess, "idle ambient scan")
+    if path is None:
+        return False
+    img = cv2.imread(path)
+    if img is None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return False
+    if _is_upside_down():
+        img = cv2.rotate(img, cv2.ROTATE_180)
+
+    # The point of the idle scan: tags -> object-location memory, on EVERY scan
+    # (not gated by ARUCO_EVERY_N — AMBIENT_SCAN_S already paces it).
+    _ambient_marker_pass(sess, img, aruco_state, every_n_gate=False)
+    # Keep object novelty fresh without speaking to an empty room, so the first
+    # tick after the user returns doesn't re-announce a desk that never changed.
+    if object_model is not None:
+        try:
+            detected_objects, _ = _detect_objects(object_model, img)
+            _pick_new_object(detected_objects, object_last_seen, time.time())
+        except Exception:
+            logger.debug("ambient object pass failed", exc_info=True)
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return True
+
+
 # ─── main polling loop ──────────────────────────────────────────────────────
 
 def _tick(
     detector, recognizer, sess: MCPSession, known: dict,
     last_reaction_ts: dict, last_learn_ts: dict, prev_small_box: list,
-    brightness_history: list, last_lights_out_ts: dict,
     last_seen_ts: dict, missed_looks: dict, last_encourage: dict,
     object_model, object_last_seen: dict, last_object_comment: list,
     messy_state: dict, gesture_model, gesture_state: dict, guard_state: dict,
     aruco_state: dict,
-) -> None:
+) -> bool:
     """One perception step: capture, detect/classify, write state, maybe react.
+    Returns True if a photo was actually captured & processed (so the caller
+    advances the identify clock only on a real capture), False on an early skip
+    (head still moving, or the capture/decode failed).
 
     No servo calls here — see module docstring. `prev_small_box` is a
     single-element list used as a mutable "out param" so motion-diff has
     the previous tick's downscaled frame to compare against.
-    `brightness_history`/`last_lights_out_ts` are similar out-params for
-    _check_lights_out.
 
     Three-band classification (2026-07-02, arbiter design): SFace's cosine
     score alone has no middle ground, so scores are split into confidently-
@@ -1725,11 +1825,11 @@ def _tick(
         time.sleep(0.1)
         _settle_waited += 0.1
     if _head_settling():
-        return
+        return False
 
     path = _take_photo(sess, "ambient scan")
     if path is None:
-        return
+        return False
     img = cv2.imread(path)
     if img is None:
         logger.warning("could not decode captured image at %s", path)
@@ -1737,7 +1837,7 @@ def _tick(
             os.remove(path)
         except OSError:
             pass
-        return
+        return False
 
     # When hung upside-down the raw frame is rotated 180 — undo it so YuNet
     # sees an upright face and dx/dy come out in world-upright coordinates
@@ -1745,6 +1845,15 @@ def _tick(
     # the companion server + idle loop. See SETTINGS_PATH above.
     if _is_upside_down():
         img = cv2.rotate(img, cv2.ROTATE_180)
+        # Keep the on-disk frame consistent with the corrected in-memory one:
+        # the arbiter (_call_arbiter), the pending-learn marker, and
+        # _confirm_learn all reference this file BY PATH and need the upright
+        # orientation (Claude AND YuNet both fail on an inverted face). Only
+        # pay this write when actually inverted — the common upright path is free.
+        try:
+            cv2.imwrite(path, img)
+        except Exception:
+            logger.debug("failed to rewrite oriented frame to %s", path, exc_info=True)
 
     # Ambient object-location memory: every Nth tick, a near-free ArUco pass
     # on this same frame updates the shared object map (never raises — see
@@ -1795,14 +1904,8 @@ def _tick(
     # the face branch, so every return path below carries it. Read by _loop.
     gesture_state["hot"] = motion_detected or bool(gesture_fired)
 
-    brightness = _brightness(small)
-    if _check_lights_out(brightness, brightness_history, last_lights_out_ts):
-        if _lux_says_lit(sess):
-            logger.info("tick: camera thought lights-out (brightness=%.1f) but lux says LIT - vetoed", brightness)
-        else:
-            logger.info("tick: lights-out transition detected (brightness=%.1f, lux agrees/unavailable)", brightness)
-            _fire_lights_out()
-
+    # Lights-out is now sensor-only (LTR-553 lux) and handled in the loop's
+    # _check_lights_out_lux poll — the camera no longer guesses it here.
     face = _detect_largest_face(detector, img)
     if face is None:
         logger.info(
@@ -1826,7 +1929,7 @@ def _tick(
             os.remove(path)
         except OSError:
             pass
-        return
+        return True
 
     frame_h, frame_w = img.shape[:2]
     fx = face[0] + face[2] / 2
@@ -1982,6 +2085,7 @@ def _tick(
             os.remove(path)
         except OSError:
             pass
+    return True
 
 
 def _loop(once: bool) -> None:
@@ -1993,8 +2097,6 @@ def _loop(once: bool) -> None:
     last_reaction_ts: dict = {}
     last_learn_ts: dict = {}
     prev_small_box: list = [None]
-    brightness_history: list = []
-    last_lights_out_ts: dict = {}
     last_seen_ts: dict = {}
     missed_looks: dict = {}
     object_last_seen: dict = {}
@@ -2025,10 +2127,13 @@ def _loop(once: bool) -> None:
     # Ambient ArUco object-location memory: executed-tick counter (the pass
     # runs every ARUCO_EVERY_N-th) + one-shot failure-warned flag.
     aruco_state: dict = {"tick": 0}
+    # Sensor-only lights-out state: rolling lux history + last-fire + last-poll.
+    lux_state: dict = {"history": [], "ts": 0.0, "poll_ts": 0.0}
     logger.info(
         "starting vision loop (poll=%.0fs unknown_cooldown=%.0fs absence_greet=%.0fs "
         "encourage=%.0fs objects=%s obj_cooldown=%.0fs clutter=%s edge_thr=%.3f "
         "gestures=%s guard=%s(away=%.0fs cd=%.0fs) aruco=%s(every_n=%d) "
+        "radar_gate=%s recheck=%.0fs ambient_scan=%s(%.0fs) lux_lightsout=%s(%.0fs) "
         "threshold=%.3f uncertain=%.2f-%.2f)",
         POLL_INTERVAL_S, COOLDOWN_S, ABSENCE_GREET_S, ENCOURAGE_COOLDOWN_S,
         object_model is not None, OBJECT_COOLDOWN_S,
@@ -2036,6 +2141,8 @@ def _loop(once: bool) -> None:
         gesture_model is not None,
         GUARD_ENABLED, GUARD_OWNER_AWAY_S, GUARD_COOLDOWN_S,
         ARUCO_ENABLED, ARUCO_EVERY_N,
+        RADAR_GATE, CAMERA_RECHECK_S, AMBIENT_SCAN_ENABLED, AMBIENT_SCAN_S,
+        LIGHTS_LUX_ENABLED, LIGHTS_LUX_POLL_S,
         MATCH_THRESHOLD, UNCERTAIN_LOW, UNCERTAIN_HIGH,
     )
     # Boot-time orientation auto-detect: figure out which way up he is now
@@ -2046,7 +2153,8 @@ def _loop(once: bool) -> None:
         except Exception:
             logger.exception("auto-orient on boot failed")
     hot_ticks = 0  # >0 = poll fast (recent motion/gesture); decays each tick
-    last_photo_ts = 0.0  # radar-gate: when we last actually took a photo
+    last_photo_ts = 0.0    # radar-gate: when we last took an IDENTIFY photo
+    last_ambient_ts = 0.0  # when we last took an idle AMBIENT scan photo
     while True:
         if _should_skip_tick():
             time.sleep(POLL_INTERVAL_S)
@@ -2056,25 +2164,44 @@ def _loop(once: bool) -> None:
         sess = MCPSession(GATEWAY_MCP)
         try:
             sess.initialize()
-            # Radar gate (TRACKING_PLAN §0.5): spend a photo ONLY when radar sees
-            # someone AND we're due to (re)identify, or on a tracker/behaviour request.
-            # Empty room / fresh identity → cheap radar poll, no camera. This is the
-            # #36 camera-load hard-lockup fix at SOURCE — the old every-8s photo poll
-            # dropped his ping to 2567 ms and crash-looped him (2026-07-16).
-            if not _camera_needed(sess, last_photo_ts, once):
+            # Sensor-only lights-out (moved off the camera 2026-07-16): a slow,
+            # independent lux poll so it works even in an empty dark room.
+            _check_lights_out_lux(sess, lux_state)
+            # Radar gate (TRACKING_PLAN §0.5) + idle ambient scans: a full identify
+            # photo only when radar sees someone AND we're due (or on request); a
+            # passive no-face tag/item scan when the room's empty but radar's healthy
+            # (slow, head-settle gated); otherwise just the cheap radar poll. This is
+            # the #36 camera-load hard-lockup fix at SOURCE — the old every-8s photo
+            # poll dropped his ping to 2567 ms and crash-looped him (2026-07-16).
+            mode = _camera_decision(sess, last_photo_ts, last_ambient_ts, once)
+            if mode is None:
                 time.sleep(IDLE_POLL_S)
                 continue
+            if mode == "ambient":
+                # Empty-room passive scan: learn tool/tag locations, no face, no
+                # speech. Stamp last_ambient_ts only on a real capture (a
+                # head-moving skip retries next cycle) so the slow cadence holds.
+                if _ambient_scan(sess, object_model, object_last_seen, aruco_state):
+                    last_ambient_ts = time.time()
+                time.sleep(IDLE_POLL_S)
+                continue
+            # mode == "identify": full face/greeting tick.
             # Reloaded every tick (cheap) so `--enroll` mid-run takes effect next tick.
             known = _load_known_faces()
-            _tick(
+            # Advance the identify clock only on a REAL capture — a head-settle
+            # skip / take_photo failure returns False and is retried promptly
+            # rather than costing a full CAMERA_RECHECK_S of blindness.
+            if _tick(
                 detector, recognizer, sess, known, last_reaction_ts, last_learn_ts,
-                prev_small_box, brightness_history, last_lights_out_ts,
+                prev_small_box,
                 last_seen_ts, missed_looks, last_encourage,
                 object_model, object_last_seen, last_object_comment,
                 messy_state, gesture_model, gesture_state, guard_state,
                 aruco_state,
-            )
-            last_photo_ts = time.time()
+            ):
+                now_ts = time.time()
+                last_photo_ts = now_ts
+                last_ambient_ts = now_ts  # a full identify tick also refreshes tags
         except Exception:
             logger.exception("tick failed")
         if once:
@@ -2374,6 +2501,11 @@ def _enroll(name: str, samples: int, interval: float) -> None:
             pass
         if img is None:
             continue
+        # Orientation-correct before detection (same as the live loop) so
+        # enrolling while inverted (e.g. on the rail) still finds the face and
+        # stores an upright reference crop / arbiter comparison.
+        if _is_upside_down():
+            img = cv2.rotate(img, cv2.ROTATE_180)
 
         face = _detect_largest_face(detector, img)
         if face is None:
