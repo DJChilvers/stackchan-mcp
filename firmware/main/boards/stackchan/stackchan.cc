@@ -6858,6 +6858,7 @@ public:
         uint32_t ticks = 0;
         bool armed = false;
         bool warned_down = false;
+        bool avatar_shown = false;   // audit item 1: show his face once networked
         for (;;) {
             // Device-level WiFi liveness (same check rail_driver uses). This GATES the
             // feed: a wedge that keeps the CPU/this-task alive but kills WiFi (the
@@ -6872,6 +6873,17 @@ public:
             // otherwise restore modem-sleep and starve the concurrent radar+head+camera
             // load → the old ~5-min drop). USB/dock-powered, so no-modem-sleep is right.
             esp_wifi_set_ps(WIFI_PS_NONE);
+
+            // Audit item 1 (avatar): show Wheatley's baked-in idle face the moment
+            // he is actually on the network — and never before. esp_wifi_sta_get_ap_info
+            // == ESP_OK <=> associated as a station, so this cannot fire during a failed
+            // connect or during SoftAP config mode (the first-boot "connect to
+            // Wheatley-XXXX" UI stays visible while unprovisioned). Fires once; the
+            // gateway's matrix-avatar push on the WS hello overrides it once up.
+            if (wifi_ok && !avatar_shown) {
+                InitializeAvatar();
+                avatar_shown = true;
+            }
 
             if (!armed) {
                 // Arm ONCE, after boot settles (~60s) AND WiFi is up — a slow-to-
@@ -6937,9 +6949,10 @@ public:
         InitializeRadar();
 #endif
         I2cDetect();
-        // Avatar auto-display disabled: WiFi config UI needs to be visible.
-        // Avatar is shown on-demand via MCP set_avatar command.
-        // InitializeAvatar();
+        // Avatar is NOT initialized here (the ctor runs before the network is up,
+        // and the first-boot SoftAP config UI must stay visible while unprovisioned).
+        // Instead InitializeAvatar() fires from WdtFeedTaskMain the moment Wi-Fi
+        // associates (audit item 1), plus on-demand via the MCP set_avatar command.
         InitializeMouthSequenceTask();
         RegisterMcpTools();
         InitializeWatchdog();   // LAST: arm the PMIC watchdog once everything else is up
