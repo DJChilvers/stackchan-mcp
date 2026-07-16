@@ -494,6 +494,17 @@ VOICE_STALE_S = 90
 # killing the process (e.g. for privacy), remove it to resume.
 PAUSE_MARKER = os.path.join(TEMP, "stackchan-vision-paused")
 
+# ── Radar-gated camera (2026-07-16, TRACKING_PLAN "vision/camera architecture") ──
+# The camera fires ONLY when radar sees a person AND we're due to (re)identify — NOT
+# every POLL_INTERVAL_S. Empty room → zero camera, which kills the #36 camera-load
+# hard-lockup at SOURCE (the old every-8s poll dropped his ping 2567ms→8ms and crash-
+# looped him). While someone's present: identify once, re-check every CAMERA_RECHECK_S;
+# a tracker/behaviour request (CAMERA_REQUEST_MARKER, fresh) forces an immediate shot.
+RADAR_GATE = os.environ.get("STACKCHAN_VISION_RADAR_GATE", "1").strip() not in ("0", "false", "no", "")
+CAMERA_RECHECK_S = float(os.environ.get("STACKCHAN_VISION_CAMERA_RECHECK_S", "45"))
+IDLE_POLL_S = float(os.environ.get("STACKCHAN_VISION_IDLE_POLL_S", "6"))
+CAMERA_REQUEST_MARKER = os.path.join(TEMP, "stackchan-vision-request")
+
 
 def _marker_active(path: str, stale_s: float) -> bool:
     try:
@@ -595,6 +606,49 @@ class MCPSession:
              "params": {"name": name, "arguments": arguments}},
             timeout=timeout,
         )
+
+
+def _radar_person_present(sess: MCPSession) -> bool:
+    """True if the LD2450 radar currently sees a target. Cheap — no camera. Fail-safe:
+    on ANY error return False, so a flaky radar read means NO photo (fail toward no
+    load), never a spurious camera burst."""
+    try:
+        result = sess.call_tool("self.presence.read", {}, timeout=5)
+        content = ((result or {}).get("result") or {}).get("content", [])
+        if not content:
+            return False
+        info = json.loads(content[0].get("text", "") or "{}")
+        return bool(info.get("ok")) and len(info.get("targets") or []) > 0
+    except Exception:
+        return False
+
+
+def _camera_request_fresh() -> bool:
+    """A tracker/behaviour request for a fresh identify shot: CAMERA_REQUEST_MARKER
+    touched within the last 30 s. Consumed (deleted) on read so it fires once."""
+    try:
+        if time.time() - os.path.getmtime(CAMERA_REQUEST_MARKER) < 30.0:
+            try:
+                os.remove(CAMERA_REQUEST_MARKER)
+            except OSError:
+                pass
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def _camera_needed(sess: MCPSession, last_photo_ts: float, once: bool) -> bool:
+    """Radar-gated camera decision (TRACKING_PLAN §0.5). Fire a photo ONLY when:
+    single-run / gate disabled, OR an explicit request, OR radar sees a person AND
+    we're due to (re)identify. Empty room or a fresh identity → no camera."""
+    if once or not RADAR_GATE:
+        return True
+    if _camera_request_fresh():
+        return True
+    if not _radar_person_present(sess):
+        return False
+    return (time.time() - last_photo_ts) >= CAMERA_RECHECK_S
 
 
 def _take_photo(sess: MCPSession, question: str) -> str | None:
@@ -1992,19 +2046,26 @@ def _loop(once: bool) -> None:
         except Exception:
             logger.exception("auto-orient on boot failed")
     hot_ticks = 0  # >0 = poll fast (recent motion/gesture); decays each tick
+    last_photo_ts = 0.0  # radar-gate: when we last actually took a photo
     while True:
         if _should_skip_tick():
             time.sleep(POLL_INTERVAL_S)
             if once:
                 return
             continue
-        # Reloaded every tick (cheap — a small JSON file) rather than once
-        # at startup, so `--enroll` while the loop is already running takes
-        # effect on the next tick instead of needing a restart.
-        known = _load_known_faces()
         sess = MCPSession(GATEWAY_MCP)
         try:
             sess.initialize()
+            # Radar gate (TRACKING_PLAN §0.5): spend a photo ONLY when radar sees
+            # someone AND we're due to (re)identify, or on a tracker/behaviour request.
+            # Empty room / fresh identity → cheap radar poll, no camera. This is the
+            # #36 camera-load hard-lockup fix at SOURCE — the old every-8s photo poll
+            # dropped his ping to 2567 ms and crash-looped him (2026-07-16).
+            if not _camera_needed(sess, last_photo_ts, once):
+                time.sleep(IDLE_POLL_S)
+                continue
+            # Reloaded every tick (cheap) so `--enroll` mid-run takes effect next tick.
+            known = _load_known_faces()
             _tick(
                 detector, recognizer, sess, known, last_reaction_ts, last_learn_ts,
                 prev_small_box, brightness_history, last_lights_out_ts,
@@ -2013,6 +2074,7 @@ def _loop(once: bool) -> None:
                 messy_state, gesture_model, gesture_state, guard_state,
                 aruco_state,
             )
+            last_photo_ts = time.time()
         except Exception:
             logger.exception("tick failed")
         if once:
