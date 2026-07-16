@@ -82,6 +82,19 @@ esp_err_t Ota::CheckVersion() {
     current_version_ = app_desc->version;
     ESP_LOGI(TAG, "Current version: %s", current_version_.c_str());
 
+#ifdef CONFIG_DISABLE_OTA_VERSION_CHECK
+    // Wheatley/stackchan-mcp: OTA is owned by the gateway push path
+    // (self.upgrade_firmware + the gateway /firmware/ image server), so the
+    // upstream boot version-check against CONFIG_OTA_URL (api.tenclass.net) is a
+    // redundant per-boot phone-home. Return early: current_version_ is set above
+    // so the boot version notification still shows, and has_new_version_ /
+    // activation stay false so CheckNewVersion() marks the running image valid
+    // and proceeds straight to the gateway. Rollback self-confirm also fires on
+    // the gateway hello (Application::MarkFirmwareValidOnGatewayConnected).
+    ESP_LOGI(TAG, "OTA boot version-check disabled (CONFIG_DISABLE_OTA_VERSION_CHECK); gateway owns OTA");
+    return ESP_OK;
+#endif
+
     std::string url = GetCheckVersionUrl();
     if (url.length() < 10) {
         ESP_LOGE(TAG, "Check version URL is not properly set");

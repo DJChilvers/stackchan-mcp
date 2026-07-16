@@ -29,6 +29,26 @@ config DISABLE_OTA_WEBSOCKET_CONFIG
         The MQTT / firmware-version / activation / server-time sections
         of the OTA response are unaffected by this option.
 
+config DISABLE_OTA_VERSION_CHECK
+    bool "Skip the boot-time OTA firmware-version check"
+    default n
+    help
+        When enabled, the firmware skips the boot-time version check against
+        CONFIG_OTA_URL entirely (Ota::CheckVersion returns early right after
+        recording the running firmware version). Use this for a build whose OTA
+        is owned out-of-band.
+
+        The stackchan-mcp / Wheatley build updates over the gateway push path
+        (the self.upgrade_firmware MCP tool + the gateway's /firmware/ image
+        server), so the upstream check is a redundant per-boot phone-home to
+        CONFIG_OTA_URL (api.tenclass.net) that also leaks the device id/version
+        and delays the LAN gateway connect. Rollback self-confirm for a freshly
+        OTA'd image is handled instead by the gateway WebSocket hello (see
+        Application::MarkFirmwareValidOnGatewayConnected). Device activation and
+        the OTA server_time clock-set are skipped too (both are cloud-only).
+
+        Leave disabled to keep the stock xiaozhi-esp32 boot version check.
+
 config DEFAULT_WEBSOCKET_URL
     string "Default WebSocket gateway URL (fallback when NVS is empty)"
     default ""
