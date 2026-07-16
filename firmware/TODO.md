@@ -386,14 +386,18 @@ here since that file isn't committed; the mk2 archive captures it):
 - `CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n` — drop the unused Chinese wakenet model.
 - `CONFIG_DISABLE_OTA_VERSION_CHECK=y` — enable the no-phone-home flag above.
 
-**Still PENDING — needs sign-off, NOT done:**
-- **Baked-in avatar (audit item 1).** The compiled-in face set is a 1×1
-  black-pixel placeholder (`avatar_images.cc`) and `InitializeAvatar()` is disabled
-  (`stackchan.cc` ~L6940), so boot / gateway-down shows the generic xiaozhi UI +
-  twemoji, not Wheatley. Fix = generate `avatar_images.local.cc` from real Wheatley
-  art (`scripts/avatar_convert`) + re-enable an initial avatar, **guarded** so the
-  Wi-Fi provisioning UI still shows when unprovisioned. Being prepared as a diff for
-  review — do not auto-enable.
+**DONE 2026-07-16 (audit item 1 — baked-in avatar):**
+- Real Wheatley `avatar_images.local.{cc,h}` generated from the gateway's 14
+  `wheatley_*.png` frames (160×120, ~525 KB) via `scripts/avatar_convert` — replaces
+  the 1×1 black-pixel placeholder as the compiled-in layered art. Files are
+  gitignored; PNG sources also staged in `~/.stackchan/avatar/` for a future
+  re-convert (mk2).
+- `InitializeAvatar()` re-enabled from `WdtFeedTaskMain` on Wi-Fi-up (Option A): his
+  idle face shows the moment he associates as a station, never during a failed
+  connect or SoftAP config mode; the gateway matrix-avatar push overrides on the WS
+  hello. **Not compile-verified yet** — do it in the `build-audit` pass on flash-day.
+
+**Still PENDING:**
 - Default emoji collection is `twemoji_64` (`CMakeLists.txt` ~L209) — generic;
   revisit together with the avatar art.
 
