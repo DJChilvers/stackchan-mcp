@@ -2001,8 +2001,8 @@ def create_server(notify_config: NotifyConfig | None = None) -> StackChanServer:
                                 "Relative distance in mm (signed; "
                                 "+=away from home)."
                             ),
-                            "minimum": -100,
-                            "maximum": 100,
+                            "minimum": -600,
+                            "maximum": 600,
                         },
                     },
                     "required": ["mm"],
