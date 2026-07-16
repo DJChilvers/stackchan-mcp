@@ -92,14 +92,20 @@ Possible real fixes, to weigh once doing a reflash anyway:
   shielding. Cheapest thing to try first, and rules the software fix in
   or out.
 
-## English wake word ("Hey Wheatley")
+## English wake word ("Hey Wheatley") — ✅ DONE (flash #2, 2026-07-12)
 
-Currently the wake-word model baked into `sdkconfig.defaults.esp32s3` is
-`CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y` — a fixed, pre-trained Chinese
-acoustic model ("你好小智" / "Nihao Xiaozhi"), not overridden anywhere in
-`main/boards/stackchan/config.json`. (Medium confidence this is what's
-actually flashed — there's no generated `sdkconfig` checked in to confirm
-the live binary matches the defaults file.)
+**SHIPPED + validated on-device.** `CONFIG_USE_CUSTOM_WAKE_WORD=y` +
+`CONFIG_CUSTOM_WAKE_WORD="hey wheatley"` + `CONFIG_SR_MN_EN_MULTINET7_QUANT`
+(MultiNet7-en) are live in `sdkconfig.defaults.local`. The Chinese wakenet
+(`CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS`) is compiled OUT for a custom-wake-word
+build and, as of the 2026-07-16 audit, pinned `=n` locally so the stray `=y`
+can't mislead. The historical planning notes below are retained for context
+but are DONE.
+
+_Original note (now stale):_ the wake-word model baked into
+`sdkconfig.defaults.esp32s3` was `CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y` — a fixed,
+pre-trained Chinese acoustic model ("你好小智" / "Nihao Xiaozhi"), not overridden
+anywhere in `main/boards/stackchan/config.json`.
 
 ESP-IDF's speech-recognition component also exposes a `USE_CUSTOM_WAKE_WORD`
 Kconfig option, which is MultiNet-based (matches phoneme text like
@@ -349,3 +355,46 @@ its servo signs (PITCH_UP_SIGN/YAW_RIGHT_SIGN) from it. The IMU tool would
 still be strictly better (no tray required, instant, works mid-air while
 being remounted), so keep it on this list — but the ArUco path removes the
 urgency. Batch the IMU tool with the other reflash items.
+
+## Firmware audit 2026-07-16 — upstream-leftover cleanup (feature/companion-app)
+
+Sweep for xiaozhi/StackChan defaults that don't belong in Wheatley — the same
+class the removed idle power-off timer belonged to. All edits are committed on
+`feature/companion-app` as small per-item commits; **NOT flashed** — bundle into
+the next flash-day batch (alongside the RailDriver TX-isolation section above).
+
+**Committed code changes:**
+- SoftAP provisioning SSID prefix `Xiaozhi` → `Wheatley` (`wifi_board.cc`).
+- Silenced the upstream boot "success" chime (`application.cc`
+  `HandleActivationDoneEvent`) — it fired on every boot / dock-reboot / WDT reboot.
+- New `CONFIG_DISABLE_OTA_VERSION_CHECK` (`Kconfig.projbuild` + `ota.cc`): skips the
+  per-boot phone-home to `api.tenclass.net`. OTA stays owned by the gateway push
+  path (`self.upgrade_firmware` + the gateway `/firmware/` server); rollback
+  self-confirm is via the gateway hello (`MarkFirmwareValidOnGatewayConnected`).
+  ⚠️ `ota_update.py`'s header comment (~lines 36-41, StackChan repo) about the
+  "tenclass-200 confirms the image / keep the internet up" behaviour is now STALE —
+  fix it separately.
+- `sleep_mode` NVS default flipped `true`→`false` in PowerSaveTimer / SleepTimer /
+  the config-portal prefill (belt-and-braces; Wheatley reads neither timer now).
+  Note: also changes the fork's other boards' compiled default.
+- Board network identity `stackchan` → `wheatley` (`BOARD_NAME`; `BOARD_TYPE`
+  unchanged, gateway keys the device by MAC).
+- mDNS PS-restore fallback `WIFI_PS_MIN_MODEM` → `WIFI_PS_NONE`.
+
+**Config flips — live in the gitignored `sdkconfig.defaults.local`** (breadcrumb
+here since that file isn't committed; the mk2 archive captures it):
+- `CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=n` — drop the unused Chinese wakenet model.
+- `CONFIG_DISABLE_OTA_VERSION_CHECK=y` — enable the no-phone-home flag above.
+
+**Still PENDING — needs sign-off, NOT done:**
+- **Baked-in avatar (audit item 1).** The compiled-in face set is a 1×1
+  black-pixel placeholder (`avatar_images.cc`) and `InitializeAvatar()` is disabled
+  (`stackchan.cc` ~L6940), so boot / gateway-down shows the generic xiaozhi UI +
+  twemoji, not Wheatley. Fix = generate `avatar_images.local.cc` from real Wheatley
+  art (`scripts/avatar_convert`) + re-enable an initial avatar, **guarded** so the
+  Wi-Fi provisioning UI still shows when unprovisioned. Being prepared as a diff for
+  review — do not auto-enable.
+- Default emoji collection is `twemoji_64` (`CMakeLists.txt` ~L209) — generic;
+  revisit together with the avatar art.
+
+Verify-build (if run) uses `D:\wheatley\build-audit` — never `D:\wheatley\build`.
