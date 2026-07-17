@@ -75,7 +75,7 @@ std::unique_ptr<Http> Ota::SetupHttp() {
  * Specification: https://ccnphfhqs21z.feishu.cn/wiki/FjW6wZmisimNBBkov6OcmfvknVd
  */
 esp_err_t Ota::CheckVersion() {
-    auto& board = Board::GetInstance();
+    [[maybe_unused]] auto& board = Board::GetInstance();  // used only post-guard; unused when CONFIG_DISABLE_OTA_VERSION_CHECK
     auto app_desc = esp_app_get_description();
 
     // Check if there is a new firmware version available
