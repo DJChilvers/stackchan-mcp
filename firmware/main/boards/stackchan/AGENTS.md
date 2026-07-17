@@ -77,7 +77,7 @@ In `application.cc`, a touch during `kDeviceStateListening` calls `CloseAudioCha
 
 ### LCD display initial state
 
-The avatar is **not shown at boot** — it only appears after a `set_avatar(<face>)` call. Default post-boot/reconnect state is a blank screen. This is tracked as Issue #77 (enhancement: auto-show idle avatar on connect).
+The baked-in **idle avatar is auto-shown once Wi-Fi associates** (audit item 1, 2026-07: `InitializeAvatar()` fires from `WdtFeedTaskMain` on `esp_wifi_sta_get_ap_info()==ESP_OK`), so boot / gateway-down shows Wheatley's face instead of a blank screen. It stays blank during first-boot SoftAP config (unprovisioned) so the Wi-Fi-config UI remains visible. The gateway's matrix-avatar push on the WS hello overrides the idle face once connected, and `set_avatar(<face>)` still sets it on demand. (Closes Issue #77.) NOTE: because the avatar backdrop is opaque and covers the status bar, a gateway-down error (`cloud_slash`) now renders *behind* the idle face — see the open review item on masking the native error UI.
 
 ## 3.5. Layer architecture (xiaozhi standard vs stackchan overrides)
 
