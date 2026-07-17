@@ -360,8 +360,11 @@ urgency. Batch the IMU tool with the other reflash items.
 
 Sweep for xiaozhi/StackChan defaults that don't belong in Wheatley — the same
 class the removed idle power-off timer belonged to. All edits are committed on
-`feature/companion-app` as small per-item commits; **NOT flashed** — bundle into
-the next flash-day batch (alongside the RailDriver TX-isolation section above).
+`feature/companion-app` as small per-item commits. **FLASHED ~2026-07-17 07:46**
+(device now reports serverInfo.name `wheatley`) — but a follow-up code review then
+found real issues in that flashed build (see "Code review of the audit batch"
+below). Those review fixes are committed and **NOT yet flashed**; the next
+flash-day batch must carry them (alongside the RailDriver TX-isolation section above).
 
 **Committed code changes:**
 - SoftAP provisioning SSID prefix `Xiaozhi` → `Wheatley` (`wifi_board.cc`).
@@ -395,10 +398,67 @@ here since that file isn't committed; the mk2 archive captures it):
 - `InitializeAvatar()` re-enabled from `WdtFeedTaskMain` on Wi-Fi-up (Option A): his
   idle face shows the moment he associates as a station, never during a failed
   connect or SoftAP config mode; the gateway matrix-avatar push overrides on the WS
-  hello. **Not compile-verified yet** — do it in the `build-audit` pass on flash-day.
+  hello. Compiled + flashed 2026-07-17 (device runs it).
 
 **Still PENDING:**
 - Default emoji collection is `twemoji_64` (`CMakeLists.txt` ~L209) — generic;
   revisit together with the avatar art.
+
+## Code review of the audit batch (2026-07-17) — feature/companion-app
+
+A max-effort review of the flashed audit build (+ log-based crash triage) found 9
+issues. **5 are fixed + committed on `feature/companion-app`, NOT yet flashed —
+carry them into the next flash:**
+- **#1 OTA rollback (was a LIVE regression):** the disabled version-check still let
+  `CheckNewVersion()` cancel rollback at boot before the gateway hello, so a bad
+  OTA-pushed image wouldn't roll back. Guarded — gateway hello owns the confirm now.
+  (`application.cc`, `ota.cc`)
+- **#3 wall clock:** SNTP on Wi-Fi-up (`stackchan.cc`) — the audit had removed the
+  only `settimeofday()` (OTA server_time), leaving the clock unset (no status-bar
+  clock, TLS-DR-tunnel risk). Network-only; TZ defaults UK, change if not.
+- **#2 offline glyph:** small red dot on the LVGL top layer when the gateway WS is
+  down (`board.h` new `OnGatewayConnectionChanged` hook, `application.cc`,
+  `stackchan.cc`) — the auto-avatar was masking the native `cloud_slash` error.
+- **#4 build hygiene:** `[[maybe_unused]]` on `board` in the disabled-check path
+  (`ota.cc`) so a future `-Werror` build can't break.
+- **#8 doc:** stale avatar section un-staled (`AGENTS.md`).
+
+**⚠️ COMPILE-VERIFY BEFORE FLASHING:** none of the 5 fixes are built yet. The SNTP
+(`esp_netif_sntp_init`) and LVGL-glyph (`lv_layer_top`) APIs were confirmed against
+the tree + match existing idioms, but only a full `build-audit` compile proves it.
+Fold into the flash-day build-audit pass.
+
+**Optional cleanups still pending (do if worthwhile):**
+- #5 replace `ESP_ERROR_CHECK` on `esp_timer_create` in `InitializeAvatar` with
+  soft-fail+retry (avoid a reboot on a Wi-Fi-up ENOMEM at the peak-memory moment).
+- #6 gate the 500 ms idle-avatar timer on "gateway hasn't set an avatar yet" so it
+  can't clobber a gateway-pushed expression in the first ~500 ms.
+- #7 the `sleep_mode` default flip touches two shared timer files that are INERT for
+  stackchan (timers removed) — consider dropping those two edits / a board-scoped
+  Kconfig instead of mutating ~30 other boards' compiled default.
+- #9 the avatar trigger lives in the `wdt_feed` watchdog task — revisit if a proper
+  network-up event hook is ever exposed.
+
+## Task-stack + internal-SRAM headroom (added 2026-07-17)
+
+Complements the RailDriver TX/coexistence section above — do in the same window.
+(The broader radio-coexistence + peripheral-access-serializer angle the 2026-07-17
+crash triage pointed to is ALREADY covered by that section's Part B; this adds only
+the stack/SRAM-floor angle it doesn't.) #11 hit a **12.9 KB internal-SRAM floor**
+(nominal ~45 KB free → ~35 KB transient spikes under multi-actor bursts); the camera
+"Explain" task runs at **~4.9 KB stack headroom** (WHEATLEY_LIMITS rule 4). Review
+task stack sizes (camera, `wdt_feed` 2048 B, radar, avatar_fetch) and bound the
+scheduled-command burst depth so a multi-actor burst can't bottom internal RAM in a
+context that wedges below the panic handler. Low-risk and capture-independent — the
+one crash-relevant firmware item that doesn't need the serial capture first.
+
+## Serial capture helper (added 2026-07-17)
+
+`Documents/StackChan/wheatley_capture.py` — durable no-reset (DTR/RTS-low) COM5
+capture + live triage: boot/reset-reason, panic+backtrace (auto-decoded), low-SRAM,
+and silence-after-activity = the A1 hard-wedge verdict. Replaces the ephemeral
+scratchpad `cap.py`/`cap2.py`. Run via the IDF python; defaults the decode ELF to
+`build-audit` (matches the running fw) and prints the boot-banner SHA to verify.
+Use it for this section's + the RailDriver section's serial-capture verification.
 
 Verify-build (if run) uses `D:\wheatley\build-audit` — never `D:\wheatley\build`.
