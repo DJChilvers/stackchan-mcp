@@ -97,6 +97,11 @@ public:
     // StackChanBoard overrides to spawn a worker task that performs the
     // HTTP fetch via AvatarSetFetcher and loads the result into avatar_set_.
     virtual void OnAvatarSetFetch(const cJSON* root) { (void)root; }
+
+    // Gateway WebSocket connection state changed (connected=false on drop/error).
+    // Default no-op; a board may surface it on-screen (e.g. an offline glyph over
+    // an opaque avatar that otherwise hides the native connection status).
+    virtual void OnGatewayConnectionChanged(bool connected) { (void)connected; }
 };
 
 #define DECLARE_BOARD(BOARD_CLASS_NAME) \

@@ -526,6 +526,7 @@ void Application::InitializeProtocol() {
 
     protocol_->OnConnected([this]() {
         DismissAlert();
+        Board::GetInstance().OnGatewayConnectionChanged(true);   // review #2: hide offline glyph
         // OTA self-confirm repoint: a freshly OTA'd image must call
         // esp_ota_mark_app_valid_cancel_rollback() or the bootloader rolls
         // back to the previous image on the next reboot. The original (and
@@ -543,6 +544,7 @@ void Application::InitializeProtocol() {
 
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
+        Board::GetInstance().OnGatewayConnectionChanged(false);  // review #2: show offline glyph
         xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
     });
     

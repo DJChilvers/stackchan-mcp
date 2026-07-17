@@ -562,6 +562,7 @@ private:
     // stock xiaozhi status UI ("standby" label etc.) whenever the avatar or
     // the boot splash is showing. Created/hidden in lockstep with avatar_img_.
     lv_obj_t* avatar_bg_ = nullptr;
+    lv_obj_t* disconnect_glyph_ = nullptr;  // review #2: offline dot on the LVGL top layer
     esp_timer_handle_t avatar_init_timer_ = nullptr;
     std::string current_avatar_face_ = "idle";
 
@@ -7115,6 +7116,41 @@ public:
 
     virtual void OnTtsStop() override {
         StopTtsLipSync();
+    }
+
+    // Review #2: surface a gateway-down state on-screen. The opaque avatar
+    // backdrop covers the native status bar, so the cloud_slash error hides
+    // behind Wheatley's face; this puts a small red "offline" dot on the LVGL
+    // TOP LAYER (always above the avatar, no re-raise) so a disconnect stays
+    // visible while he keeps his face. Driven by application.cc's WS
+    // OnConnected/OnNetworkError (protocol task) -> all LVGL work under
+    // DisplayLockGuard. One lazily-created object (only on the first drop),
+    // shown/hidden thereafter: zero per-frame cost, nothing added to the
+    // render-collision path.
+    virtual void OnGatewayConnectionChanged(bool connected) override {
+        if (display_ == nullptr) return;
+        DisplayLockGuard lock(display_);
+        if (disconnect_glyph_ == nullptr) {
+            if (connected) return;  // nothing to hide yet — don't allocate until the first drop
+            lv_obj_t* top = lv_layer_top();
+            if (top == nullptr) return;
+            disconnect_glyph_ = lv_obj_create(top);
+            if (disconnect_glyph_ == nullptr) return;
+            lv_obj_set_size(disconnect_glyph_, 18, 18);
+            lv_obj_align(disconnect_glyph_, LV_ALIGN_TOP_RIGHT, -6, 6);
+            lv_obj_set_style_radius(disconnect_glyph_, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(disconnect_glyph_, lv_color_hex(0xE02020), 0);  // red = offline
+            lv_obj_set_style_bg_opa(disconnect_glyph_, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(disconnect_glyph_, 2, 0);
+            lv_obj_set_style_border_color(disconnect_glyph_, lv_color_white(), 0);  // ring for contrast on any face
+            lv_obj_clear_flag(disconnect_glyph_, LV_OBJ_FLAG_SCROLLABLE);
+            // created during a disconnect -> leave visible below
+        }
+        if (connected) {
+            lv_obj_add_flag(disconnect_glyph_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(disconnect_glyph_, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     // Phase 4.5 avatar (saiverse-stackchan-addon): handle the gateway's
