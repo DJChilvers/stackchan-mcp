@@ -30,6 +30,10 @@ using ScsBus = SCSCL;
 static inline bool ServoWritePosOk(int r) { return r > 0; }
 #endif
 #include "avatar_images.h"
+#include <ssid_manager.h>
+#if __has_include("boot_splash.local.h")
+#include "boot_splash.local.h"
+#endif
 #include "avatar_set.h"
 #include "avatar_set_fetcher.h"
 #include "rail_driver.h"
@@ -551,6 +555,10 @@ private:
     // board's constructor completes. avatar_init_timer_ retries every 500 ms
     // until the screen is ready, then stops itself.
     lv_obj_t* avatar_img_ = nullptr;
+    // Full-screen white backdrop under avatar_img_ (2026-07-17): buries the
+    // stock xiaozhi status UI ("standby" label etc.) whenever the avatar or
+    // the boot splash is showing. Created/hidden in lockstep with avatar_img_.
+    lv_obj_t* avatar_bg_ = nullptr;
     esp_timer_handle_t avatar_init_timer_ = nullptr;
     std::string current_avatar_face_ = "idle";
 
@@ -4303,6 +4311,17 @@ private:
         if (dsc == nullptr) return false;
         if (!EnsureAvatarObject()) return false;
         lv_image_set_src(avatar_img_, dsc);
+        // Scale PER SOURCE (2026-07-17): one hardcoded 512 (2.0x) was right for
+        // the 160x120 matrix frames but rendered the 120x90 baked-in boot art
+        // at 240x180 — "his eye, not full screen". 256 = 1.0x; fill the LCD
+        // width from whatever the current source actually is.
+        if (dsc->header.w > 0) {
+            lv_image_set_scale(avatar_img_,
+                               (uint32_t)LV_HOR_RES * 256 / dsc->header.w);
+        }
+        if (avatar_bg_ != nullptr) {
+            lv_obj_move_foreground(avatar_bg_);
+        }
         lv_obj_move_foreground(avatar_img_);
         return true;
     }
@@ -4427,21 +4446,63 @@ private:
         if (screen == nullptr) {
             return false;
         }
+        // White full-screen backdrop first, so the stock status UI ("standby"
+        // label, clock) can never peek around the avatar/splash art.
+        avatar_bg_ = lv_obj_create(screen);
+        if (avatar_bg_ != nullptr) {
+            lv_obj_set_size(avatar_bg_, LV_HOR_RES, LV_VER_RES);
+            lv_obj_align(avatar_bg_, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_bg_color(avatar_bg_, lv_color_white(), 0);
+            lv_obj_set_style_bg_opa(avatar_bg_, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(avatar_bg_, 0, 0);
+            lv_obj_set_style_radius(avatar_bg_, 0, 0);
+            lv_obj_set_style_pad_all(avatar_bg_, 0, 0);
+            lv_obj_clear_flag(avatar_bg_, LV_OBJ_FLAG_SCROLLABLE);
+        }
         avatar_img_ = lv_image_create(screen);
         if (avatar_img_ == nullptr) {
             return false;
         }
-        // Center on the 320x240 LCD and upscale 160x120 -> ~320x240 (2x).
-        // lv_image_set_scale uses 256 = 1.0x; 512 = 2.0x.
-        lv_image_set_scale(avatar_img_, 512);
+        // Scale is set PER SOURCE at render time (matrix frames and baked art
+        // have different native sizes). lv_image_set_scale: 256 = 1.0x.
         lv_obj_align(avatar_img_, LV_ALIGN_CENTER, 0, 0);
         lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_SCROLLABLE);
         // Keep the avatar visually on top of the chat UI's emoji_label_,
         // chat bubbles, etc. The status bar (clock/battery) lives on a
         // separate sibling and is moved to foreground later if needed.
+        if (avatar_bg_ != nullptr) {
+            lv_obj_move_foreground(avatar_bg_);
+        }
         lv_obj_move_foreground(avatar_img_);
         ESP_LOGI(TAG, "Avatar lv_image created on active screen");
         return true;
+    }
+
+    // Aperture boot splash (2026-07-17): white screen + the shutter mark from
+    // power-on until the first real face replaces it (the WiFi-associate boot
+    // avatar, or the gateway matrix push on attach). The art is generated
+    // pre-rotated 180 for the inverted mount (gen_splash.py; source PNG staged
+    // in ~/.stackchan/avatar/). Shown ONLY when WiFi is already provisioned —
+    // an unprovisioned first boot keeps the stock SoftAP config UI visible.
+    void ShowBootSplash() {
+#if __has_include("boot_splash.local.h")
+        if (SsidManager::GetInstance().GetSsidList().empty()) {
+            ESP_LOGI(TAG, "Boot splash skipped: WiFi unprovisioned (config UI stays visible)");
+            return;
+        }
+        DisplayLockGuard lock(display_);
+        if (!EnsureAvatarObject()) {
+            ESP_LOGW(TAG, "Boot splash: avatar object unavailable");
+            return;
+        }
+        lv_image_set_src(avatar_img_, &boot_splash_img);
+        if (boot_splash_img.header.w > 0) {
+            lv_image_set_scale(avatar_img_,
+                               (uint32_t)LV_HOR_RES * 256 / boot_splash_img.header.w);
+        }
+        ESP_LOGI(TAG, "Boot splash shown (aperture, %dx%d)",
+                 (int)boot_splash_img.header.w, (int)boot_splash_img.header.h);
+#endif
     }
 
     // Apply the requested face to avatar_img_. Returns false if the face is
@@ -4481,6 +4542,9 @@ private:
                 // Restore visibility if a previous SetAvatarOff() hid the
                 // layer. Cheap no-op when the flag is already clear.
                 lv_obj_clear_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (avatar_bg_ != nullptr) {
+                lv_obj_clear_flag(avatar_bg_, LV_OBJ_FLAG_HIDDEN);
             }
             ok = SetAvatarExpressionLocked(face);
         }
@@ -4526,6 +4590,9 @@ private:
             DisplayLockGuard lock(display_);
             if (avatar_img_ != nullptr) {
                 lv_obj_add_flag(avatar_img_, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (avatar_bg_ != nullptr) {
+                lv_obj_add_flag(avatar_bg_, LV_OBJ_FLAG_HIDDEN);
             }
         }
         current_avatar_face_ = "off";
@@ -6874,6 +6941,13 @@ public:
             // load → the old ~5-min drop). USB/dock-powered, so no-modem-sleep is right.
             esp_wifi_set_ps(WIFI_PS_NONE);
 
+            // CRASH #11 peak-shaving: cap WiFi TX power to ~13 dBm (units of
+            // 0.25 dBm → 52). Default ~20 dBm TX bursts are 300-400 mA spikes
+            // that stack on servo start-current + camera mid-track; he sits
+            // metres from the AP so the headroom is free. Re-asserted with the
+            // PS mode each pass — cheap, idempotent, survives reconnects.
+            esp_wifi_set_max_tx_power(52);
+
             // Audit item 1 (avatar): show Wheatley's baked-in idle face the moment
             // he is actually on the network — and never before. esp_wifi_sta_get_ap_info
             // == ESP_OK <=> associated as a station, so this cannot fire during a failed
@@ -6935,6 +7009,9 @@ public:
         InitializeCamera();
         InitializeFt6336TouchPad();
         GetBacklight()->RestoreBrightness();
+        // Aperture splash the moment the panel is lit (provisioned boots only;
+        // replaced by the baked face on WiFi-associate / matrix on attach).
+        ShowBootSplash();
         InitializeIOExpander();
         InitializeServo();
         InitializeTouchSettings();

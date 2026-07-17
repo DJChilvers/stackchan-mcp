@@ -43,6 +43,8 @@ firmware/sdkconfig.old
 firmware/sdkconfig.defaults.local
 firmware/main/boards/stackchan/avatar_images.local.cc
 firmware/main/boards/stackchan/avatar_images.local.h
+firmware/main/boards/stackchan/boot_splash.local.cc
+firmware/main/boards/stackchan/boot_splash.local.h
 
 # uv lockfile is OK to commit
 # (allow-listed by absence of uv.lock entry above)
