@@ -543,6 +543,26 @@ def read_vision_state() -> dict | None:
         return None
 
 
+# Radar presence (user 2026-07-17): look_at.py writes this while a plausibly-
+# human radar track sits within 3 m (score-gated). A fresh file = he has
+# company even if the camera never caught a face — so the worried/bored/
+# left-alone/search "I'm all alone" behaviours must not fire. Stale/absent
+# file = genuinely alone; those behaviours proceed as before.
+RADAR_PRESENCE_PATH = os.path.join(_TEMP, "stackchan-radar-presence.json")
+RADAR_PRESENCE_STALE_S = 15.0
+
+
+def read_radar_presence() -> dict | None:
+    try:
+        with open(RADAR_PRESENCE_PATH, encoding="utf-8") as f:
+            state = json.load(f)
+        if time.time() - float(state.get("ts", 0)) > RADAR_PRESENCE_STALE_S:
+            return None
+        return state
+    except Exception:
+        return None
+
+
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -1452,12 +1472,51 @@ def _v_rail_drift(session, pose):
 
 
 # (function, weight) — weights are relative, don't need to sum to 1.
+def _v_did_i_hear_that(session, pose):
+    """Wheatley "did I hear that?!" — a quick dart to one side, a beat of
+    frozen listening, then (usually) drift back to roughly where he was.
+    Nothing was ever there; that's the joke. Drifts from the current pose
+    (see module note above VIGNETTES)."""
+    oy, op = pose["y"], pose["p"]
+    ny  = _clamp(oy + random.choice([-1, 1]) * random.randint(14, 24), YAW_MIN, YAW_MAX)
+    np_ = _clamp(op + random.randint(-4, 4), PITCH_MIN, PITCH_MAX)
+    session.move(ny, np_)
+    time.sleep(random.uniform(0.9, 1.6))        # frozen: ...listening...
+    if random.random() < 0.8:                   # ...nothing. As you were.
+        by = _clamp(oy + random.randint(-4, 4), YAW_MIN, YAW_MAX)
+        bp = _clamp(op + random.randint(-3, 3), PITCH_MIN, PITCH_MAX)
+        session.move(by, bp)
+        pose.update(y=by, p=bp)
+    else:                                       # stays suspicious over there
+        pose.update(y=ny, p=np_)
+    return pose
+
+
+def _v_head_cock(session, pose):
+    """Curious head-cock. No roll axis, so fake the tilt: a small yaw one
+    way with a pitch lean the other (a diagonal), hold the quizzical beat,
+    then settle halfway back. Drifts from the current pose."""
+    s = random.choice([-1, 1])
+    oy, op = pose["y"], pose["p"]
+    ny  = _clamp(oy + s * random.randint(5, 10), YAW_MIN, YAW_MAX)
+    np_ = _clamp(op - s * PITCH_UP_SIGN * random.randint(3, 7), PITCH_MIN, PITCH_MAX)
+    session.move(ny, np_)
+    time.sleep(random.uniform(1.0, 1.8))
+    my = _clamp((ny + oy) // 2, YAW_MIN, YAW_MAX)
+    mp = _clamp((np_ + op) // 2, PITCH_MIN, PITCH_MAX)
+    session.move(my, mp)
+    pose.update(y=my, p=mp)
+    return pose
+
+
 VIGNETTES = [
     (_v_nudge,            0.25),
     (_v_look_up_center,   0.20),
     (_v_diagonal_peek,    0.28),
     (_v_ponder_down,      0.17),
     (_v_big_examine,      0.10),   # the rare "big" one — used to be the ONLY one
+    (_v_did_i_hear_that,  0.10),   # "more Wheatley" 2026-07-17: dart + listen + return
+    (_v_head_cock,        0.12),   # "more Wheatley" 2026-07-17: quizzical diagonal tilt
     (_v_mutter,           0.07),   # rarest — also gated by MUTTER_COOLDOWN_S
     (_v_rail_drift,       0.06),   # rail glide — rarest of all; RAIL_COOLDOWN_S-gated + linked/homed-gated
 ]
@@ -1486,9 +1545,11 @@ def wander(session, pose, busy=False):
     # ── still settled: tiny in-place jiggle only, no face change ────────────
     if dwell > 0:
         pose["dwell"] = dwell - 1
-        if random.random() < 0.40:
-            ny  = _clamp(pose["y"] + random.randint(-4, 4), YAW_MIN, YAW_MAX)
-            np_ = _clamp(pose["p"] + random.randint(-3, 3), PITCH_MIN, PITCH_MAX)
+        # "more Wheatley" 2026-07-17: rarely fully still — the between-gesture
+        # jiggle fires more often and a touch bigger (was 0.40 / ±4/±3).
+        if random.random() < 0.60:
+            ny  = _clamp(pose["y"] + random.randint(-6, 6), YAW_MIN, YAW_MAX)
+            np_ = _clamp(pose["p"] + random.randint(-4, 4), PITCH_MIN, PITCH_MAX)
             session.move(ny, np_)
             pose.update(y=ny, p=np_)
         return pose
@@ -1503,6 +1564,13 @@ def wander(session, pose, busy=False):
     # trip the search / left-alone / worried behaviours. Face TRACKING below
     # still needs an actual face; this only governs "are they here at all".
     if vs and vs.get("present"):
+        pose["last_face_seen_ts"] = now
+
+    # RADAR presence resets the absence clock too (user 2026-07-17): a
+    # plausibly-human radar ping within 3 m means he's NOT alone, even if
+    # the camera never caught a face (turned away / mis-aimed). Distance
+    # + score gating happens at the writer (look_at.py).
+    if read_radar_presence() is not None:
         pose["last_face_seen_ts"] = now
 
     if vs and vs.get("face_visible"):
@@ -1593,7 +1661,10 @@ def wander(session, pose, busy=False):
 
     pose = vignette(session, pose)
     pose["last_vignette"] = vignette
-    pose["dwell"] = random.randint(3, 6)
+    # "more Wheatley" 2026-07-17: shorter settles between vignettes (was 3-6)
+    # so the repertoire actually shows — he read as inactive mostly because
+    # the good gestures were buried under long dwells.
+    pose["dwell"] = random.randint(1, 3)
     return pose
 
 
