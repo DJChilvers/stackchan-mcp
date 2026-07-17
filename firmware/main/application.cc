@@ -440,8 +440,19 @@ void Application::CheckNewVersion() {
             // If upgrade failed, continue to normal operation
         }
 
-        // No new version, mark the current version as valid
+        // No new version, mark the current version as valid.
+#ifndef CONFIG_DISABLE_OTA_VERSION_CHECK
         ota_->MarkCurrentVersionValid();
+#else
+        // Wheatley: do NOT cancel rollback here. With the boot version-check
+        // disabled this ran EVERY boot, marking a freshly-OTA'd (PENDING_VERIFY)
+        // image valid before it had proved it can reach the gateway — which
+        // defeated MarkFirmwareValidOnGatewayConnected() (the partition was
+        // already VALID by the time the WS hello fired, so its rollback-cancel
+        // was dead code). Rollback self-confirm is now owned SOLELY by the
+        // gateway WS hello (InitializeProtocol), so a pushed image that
+        // boots-then-wedges before the hello still rolls back on the next boot.
+#endif
         if (!ota_->HasActivationCode() && !ota_->HasActivationChallenge()) {
             // Exit the loop if done checking new version
             break;

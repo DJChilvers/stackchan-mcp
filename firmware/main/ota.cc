@@ -88,9 +88,11 @@ esp_err_t Ota::CheckVersion() {
     // upstream boot version-check against CONFIG_OTA_URL (api.tenclass.net) is a
     // redundant per-boot phone-home. Return early: current_version_ is set above
     // so the boot version notification still shows, and has_new_version_ /
-    // activation stay false so CheckNewVersion() marks the running image valid
-    // and proceeds straight to the gateway. Rollback self-confirm also fires on
-    // the gateway hello (Application::MarkFirmwareValidOnGatewayConnected).
+    // activation stay false so CheckNewVersion() breaks out and proceeds straight
+    // to the gateway. Rollback self-confirm is owned SOLELY by the gateway WS
+    // hello (Application::MarkFirmwareValidOnGatewayConnected); CheckNewVersion's
+    // own MarkCurrentVersionValid() is compiled out under this flag so a pushed
+    // image cannot be marked valid before it proves it can reach the gateway.
     ESP_LOGI(TAG, "OTA boot version-check disabled (CONFIG_DISABLE_OTA_VERSION_CHECK); gateway owns OTA");
     return ESP_OK;
 #endif
