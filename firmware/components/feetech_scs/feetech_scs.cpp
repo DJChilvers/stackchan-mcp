@@ -103,18 +103,20 @@ int FeetechScs::write_reg(uint8_t id, uint8_t addr, const uint8_t* data, uint8_t
     // surface as spurious bus errors.
     if (uart_wait_tx_done(_uart, pdMS_TO_TICKS(100)) != ESP_OK) return -1;
 
-    // Wait for status reply (0xFF 0xFF ID LEN ERR CHK = 6 bytes total) when
-    // not broadcasting. Broadcast (id=0xFE) does not get a reply.
-    if (id == 0xFE) return 0;
-
-    uint8_t reply[6] = {};
-    int got          = uart_read_bytes(_uart, reply, sizeof(reply), RX_TIMEOUT);
-    if (got != (int)sizeof(reply))                  return -1;
-    if (reply[0] != 0xFF || reply[1] != 0xFF)       return -1;
-    if (reply[2] != id)                             return -1;
-    if (reply[3] != 2)                              return -1;
-    uint8_t exp_chk = static_cast<uint8_t>(~(reply[2] + reply[3] + reply[4]) & 0xFF);
-    if (reply[5] != exp_chk)                        return -1;
+    // WRITES ARE FIRE-AND-FORGET (2026-07-17, the "3,027 WritePos failures a
+    // night" fix — CRASH_LOG #12 investigation / firmware-todo-list top item).
+    // SCS servos are commonly configured RESPONSE-LEVEL 0 (silent): WRITE
+    // instructions get NO status reply, while READ instructions always answer.
+    // The stock SCServo_lib models this with its `Level` member (Ack() skips
+    // the reply read when Level==0); this driver instead demanded a write-ACK
+    // unconditionally — so on silent servos EVERY write burned the 20 ms
+    // RX_TIMEOUT and "failed" with -1 (~13-16/min all evening, both servos,
+    // while motion visibly worked and ReadPos succeeded — the exact measured
+    // signature). Mirror stock Level-0 semantics: don't read a write ACK at
+    // all. If a servo IS at response-level 1, its 6-byte ACK lands in the RX
+    // FIFO and the flush-before-next-op (line above) discards it — safe both
+    // ways. Delivery verification stays available via the strict read paths
+    // (ReadPos / feedback regs), which is how the callers actually verify.
     return 0;
 }
 
