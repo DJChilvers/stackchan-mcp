@@ -48,6 +48,9 @@ static inline bool ServoWritePosOk(int r) { return r > 0; }
 #include <smooth_ui_toolkit.hpp>
 #include <esp_log.h>
 #include <esp_wifi.h>
+#include <esp_netif_sntp.h>   // wall-clock sync on Wi-Fi-up (review #3)
+#include <time.h>             // tzset (review #3)
+#include <stdlib.h>           // setenv (review #3)
 #include <driver/i2c_master.h>
 #include <driver/gpio.h>
 #include <driver/uart.h>
@@ -6926,6 +6929,7 @@ public:
         bool armed = false;
         bool warned_down = false;
         bool avatar_shown = false;   // audit item 1: show his face once networked
+        bool sntp_started = false;   // review #3: start wall-clock sync once networked
         for (;;) {
             // Device-level WiFi liveness (same check rail_driver uses). This GATES the
             // feed: a wedge that keeps the CPU/this-task alive but kills WiFi (the
@@ -6957,6 +6961,27 @@ public:
             if (wifi_ok && !avatar_shown) {
                 InitializeAvatar();
                 avatar_shown = true;
+            }
+
+            // Review #3 (wall clock): start SNTP the first time we're networked.
+            // The audit disabled the upstream OTA server_time clock-set (a cloud
+            // phone-home), which left CLOCK_REALTIME unset — no status-bar clock,
+            // and any TLS (e.g. the remote DR tunnel) would reject certs as "not
+            // yet valid". SNTP is network-only (NOT a device peripheral, so it adds
+            // nothing to the multi-actor collision surface), fires once, and
+            // self-retries until DHCP/IP is up. TZ is display-only — UTC drives TLS
+            // regardless; default is UK GMT/BST, change the TZ string if not UK.
+            if (wifi_ok && !sntp_started) {
+                sntp_started = true;  // one-shot regardless of outcome
+                esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+                esp_err_t serr = esp_netif_sntp_init(&sntp_cfg);
+                if (serr == ESP_OK) {
+                    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0", 1);
+                    tzset();
+                    ESP_LOGI(TAG, "SNTP started (pool.ntp.org); clock syncs once IP is up");
+                } else {
+                    ESP_LOGW(TAG, "esp_netif_sntp_init failed: %s", esp_err_to_name(serr));
+                }
             }
 
             if (!armed) {
