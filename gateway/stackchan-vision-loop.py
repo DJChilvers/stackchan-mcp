@@ -1051,6 +1051,7 @@ OWNER_NAME = os.environ.get("STACKCHAN_OWNER_NAME", "Dominic")
 def _write_vision_state(
     face_visible: bool, person: str | None, name: str | None,
     dx: float, dy: float, motion_detected: bool, present: bool = False,
+    person_visible: bool = False,
 ) -> None:
     # is_owner is derived here (not passed in) so BOTH call sites populate it for
     # free: true only when a recognised name equals OWNER_NAME. Guarded str ops
@@ -1075,6 +1076,13 @@ def _write_vision_state(
         # your face turned away. (Raw motion is NOT used — his own head
         # movement between snapshots dominates the frame diff.)
         "present": present,
+        # PURE-VISUAL person (2026-07-17, user: "confirmed human in photo
+        # rather than face, so chest or arm"): a YOLO 'person' box (or a
+        # face) actually IN THIS FRAME. Unlike `present`, keyboard/mouse
+        # input can never set it — the tracker's human/ghost verdict keys
+        # off this, so a torso/arm confirms a human but typing can't bless
+        # a wall-ghost.
+        "person_visible": bool(person_visible or face_visible),
     }
     try:
         tmp = VISION_STATE_PATH + ".tmp"
@@ -1919,7 +1927,8 @@ def _tick(
         # empty bench lets the 60s episode reset tick down.
         _guard_note_tick(guard_state, obj_now, person_visible=person_present,
                          known_seen=False)
-        _write_vision_state(False, None, None, 0.0, 0.0, motion_detected, present=user_present)
+        _write_vision_state(False, None, None, 0.0, 0.0, motion_detected,
+                            present=user_present, person_visible=person_present)
         # Nobody's here to greet, but a new object / a fridge-hallucination /
         # a cluttered desk still earns a remark — unless a gesture already
         # fired this tick (that takes the reactor).
@@ -1986,7 +1995,8 @@ def _tick(
                     ):
                         propose_learn = True
 
-    _write_vision_state(True, person, name, dx, dy, False, present=True)
+    _write_vision_state(True, person, name, dx, dy, False, present=True,
+                        person_visible=True)
 
     now = time.time()
     reacted = False
