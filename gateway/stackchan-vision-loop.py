@@ -1862,6 +1862,14 @@ def _tick(
             cv2.imwrite(path, img)
         except Exception:
             logger.debug("failed to rewrite oriented frame to %s", path, exc_info=True)
+    # Debug: keep a copy of the latest (orientation-corrected) identify frame
+    # so "what does he actually see?" is answerable — 2026-07-17 the tracker
+    # kept getting NOT-human with the user in view and nobody could tell if
+    # the person was even in frame.
+    try:
+        cv2.imwrite(os.path.join(TEMP, "stackchan-last-shot.jpg"), img)
+    except Exception:
+        pass
 
     # Ambient object-location memory: every Nth tick, a near-free ArUco pass
     # on this same frame updates the shared object map (never raises — see
