@@ -37,7 +37,10 @@ OCC_THRESHOLD: Final[float] = 15.0   # mean abs-diff (0-255) above which zone re
 
 MARKER_IDS: Final[tuple[int, ...]] = (0, 1, 2, 3)  # TL, TR, BR, BL
 
-_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+# DICT_4X4_250 is a superset of _50 (IDs 0-49 identical), so the 0-3 zone
+# corners decode exactly as before; native res only, since detect_markers'
+# centres feed rectify() and must be in true image coordinates.
+_DICT = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
 _DETECTOR = cv2.aruco.ArucoDetector(_DICT, cv2.aruco.DetectorParameters())
 
 

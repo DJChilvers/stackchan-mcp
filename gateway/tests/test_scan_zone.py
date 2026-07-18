@@ -12,7 +12,7 @@ from stackchan_mcp import scan_zone
 def _frame_with_markers(item: bool = False, size: int = 400, mk: int = 60) -> bytes:
     """White frame with the 4 corner markers; optionally a dark item in the middle."""
     img = np.full((size, size, 3), 255, np.uint8)
-    d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+    d = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
     gen = getattr(cv2.aruco, "generateImageMarker", None) or cv2.aruco.drawMarker
     # ID0=TL, ID1=TR, ID2=BR, ID3=BL
     spots = {0: (10, 10), 1: (size - mk - 10, 10),
